@@ -50,6 +50,7 @@ import {
   handleSwitchTerminalTab
 } from '../hooks/ipc-tab-switch'
 import TabGroupSplitLayout from './tab-group/TabGroupSplitLayout'
+import AiVaultSessionDropLayer from './tab-group/AiVaultSessionDropLayer'
 import { shouldAutoCreateInitialTerminal } from './terminal/initial-terminal'
 import { shouldRepairActiveTerminalTab } from './terminal/active-terminal-repair'
 import { addBackgroundMountedTerminalWorktree } from './terminal/background-terminal-worktree-mount'
@@ -1868,6 +1869,7 @@ const WorktreeSplitSurface = React.memo(function WorktreeSplitSurface({
         activityTerminalPortals={activityTerminalPortals}
       />
       <BrowserPaneOverlayLayer worktreeId={worktreeId} isWorktreeActive={isVisible} />
+      <AiVaultSessionDropLayer worktreeId={worktreeId} enabled={isVisible} />
     </div>
   )
 })

@@ -335,6 +335,8 @@ export default function TabGroupPanel({
 
       <div
         ref={setBodyDropRef}
+        data-tab-group-body-id={groupId}
+        data-worktree-id={worktreeId}
         className="relative flex-1 min-h-0 overflow-hidden"
         style={bodyAnchorStyle}
       >

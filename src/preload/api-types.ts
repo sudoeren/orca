@@ -289,6 +289,7 @@ import type {
   OpenCodeUsageSessionRow,
   OpenCodeUsageSummary
 } from '../shared/opencode-usage-types'
+import type { AiVaultListArgs, AiVaultListResult } from '../shared/ai-vault-types'
 import type { TelemetryConsentState } from '../shared/telemetry-consent-types'
 import type { AgentKind, LaunchSource, RequestKind } from '../shared/telemetry-events'
 import type { AppStarSource } from '../shared/gh-star-source'
@@ -597,6 +598,10 @@ export type OpenCodeUsageApi = {
     range: OpenCodeUsageRange
     limit?: number
   }) => Promise<OpenCodeUsageSessionRow[]>
+}
+
+export type AiVaultApi = {
+  listSessions: (args?: AiVaultListArgs) => Promise<AiVaultListResult>
 }
 
 export type AppApi = {
@@ -1632,6 +1637,7 @@ export type PreloadApi = {
   claudeUsage: ClaudeUsageApi
   codexUsage: CodexUsageApi
   openCodeUsage: OpenCodeUsageApi
+  aiVault: AiVaultApi
   fs: {
     readDir: (args: { dirPath: string; connectionId?: string }) => Promise<DirEntry[]>
     readFile: (args: {
