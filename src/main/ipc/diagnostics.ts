@@ -36,6 +36,10 @@ import {
 } from '../observability'
 import type { CollectedBundle } from '../observability/bundle'
 import type { UploadBundleResult } from '../observability/diagnostic-bundle-upload'
+import {
+  resolveDiagnosticOrcaChannel,
+  resolveDiagnosticTokenEndpoint
+} from '../observability/diagnostic-upload-endpoint'
 
 export type DiagnosticsBundlePreview = Omit<CollectedBundle, 'payload'>
 
@@ -50,56 +54,6 @@ type PendingBundle = {
 }
 
 const pendingBundles = new Map<string, PendingBundle>()
-
-// Build-time constant for the diagnostic-token endpoint. Substituted by
-// electron-vite at compile time. Local / contributor builds get `null`,
-// at which point the upload path returns a clear "endpoint not configured"
-// error rather than POSTing to a placeholder.
-//
-// The dev escape hatch is `ORCA_DIAGNOSTICS_TOKEN_URL` — set this env var
-// to point at a local server during development. Mirrors the
-// `ORCA_OTLP_TRACES_URL` env-var pattern for OTLP.
-function resolveBuildTokenEndpoint(): string | null {
-  const endpoint =
-    typeof ORCA_DIAGNOSTICS_TOKEN_URL !== 'undefined'
-      ? ORCA_DIAGNOSTICS_TOKEN_URL
-      : ((globalThis as { ORCA_DIAGNOSTICS_TOKEN_URL?: string | null })
-          .ORCA_DIAGNOSTICS_TOKEN_URL ?? null)
-  return typeof endpoint === 'string' && endpoint.length > 0 ? endpoint : null
-}
-
-function resolveBuildIdentity(): 'stable' | 'rc' | null {
-  const ident =
-    typeof ORCA_BUILD_IDENTITY !== 'undefined'
-      ? ORCA_BUILD_IDENTITY
-      : ((globalThis as { ORCA_BUILD_IDENTITY?: 'stable' | 'rc' | null }).ORCA_BUILD_IDENTITY ??
-        null)
-  return ident === 'stable' || ident === 'rc' ? ident : null
-}
-
-function resolveTokenEndpoint(): string | null {
-  const buildEndpoint = resolveBuildTokenEndpoint()
-  // Official builds must stay pinned to the CI-substituted endpoint; the
-  // upload confirmation says "Orca support", so env cannot redirect it.
-  if (resolveBuildIdentity()) {
-    return buildEndpoint
-  }
-  // Env wins only for dev / unofficial builds so contributors can point a
-  // local packaged app at staging without re-running a release pipeline.
-  const fromEnv = process.env.ORCA_DIAGNOSTICS_TOKEN_URL
-  if (fromEnv && fromEnv.length > 0) {
-    return fromEnv
-  }
-  return buildEndpoint
-}
-
-function resolveOrcaChannel(): 'stable' | 'rc' | 'dev' {
-  const ident = resolveBuildIdentity()
-  if (ident === 'stable' || ident === 'rc') {
-    return ident
-  }
-  return 'dev'
-}
 
 function prunePendingBundles(now = Date.now()): void {
   for (const [id, pending] of pendingBundles) {
@@ -293,7 +247,7 @@ export function registerDiagnosticsHandlers(): void {
         platform: osPlatform(),
         arch: osArch(),
         osRelease: osRelease(),
-        orcaChannel: resolveOrcaChannel(),
+        orcaChannel: resolveDiagnosticOrcaChannel(),
         ...(lookbackMinutes !== undefined ? { lookbackMinutes } : {})
       })
       rememberBundle(bundle)
@@ -320,7 +274,7 @@ export function registerDiagnosticsHandlers(): void {
       if (!getDiagnosticsStatus().bundleEnabled) {
         throw new Error('diagnostic bundle collection is disabled')
       }
-      const tokenEndpoint = resolveTokenEndpoint()
+      const tokenEndpoint = resolveDiagnosticTokenEndpoint()
       if (!tokenEndpoint) {
         throw new Error('diagnostic upload endpoint is not configured for this build')
       }
@@ -358,7 +312,7 @@ export function registerDiagnosticsHandlers(): void {
     if (!isTicketId(ticketId)) {
       throw new Error('ticketId has invalid format')
     }
-    const tokenEndpoint = resolveTokenEndpoint()
+    const tokenEndpoint = resolveDiagnosticTokenEndpoint()
     if (!tokenEndpoint) {
       throw new Error('diagnostic upload endpoint is not configured for this build')
     }

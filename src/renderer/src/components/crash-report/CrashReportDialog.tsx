@@ -106,7 +106,7 @@ export function CrashReportDialog(): React.JSX.Element {
 
   const handleCopy = async (): Promise<void> => {
     const result = await window.api.crashReports.copyLatestDiagnostics(
-      report ? { reportId: report.id, notes } : {}
+      report ? { reportId: report.id, notes } : { notes }
     )
     if (!result.ok) {
       toast.error(result.error)
@@ -128,13 +128,10 @@ export function CrashReportDialog(): React.JSX.Element {
   }
 
   const handleSubmit = async (): Promise<void> => {
-    if (!report) {
-      return
-    }
     setSubmitting(true)
     try {
       const result = await window.api.crashReports.submit({
-        reportId: report.id,
+        ...(report ? { reportId: report.id } : {}),
         notes,
         // Why: crash reporting must degrade to anonymous if gh is unavailable;
         // identity lookup is best-effort and never blocks report creation.
@@ -143,9 +140,19 @@ export function CrashReportDialog(): React.JSX.Element {
         githubEmail: null
       })
       if (!result.ok) {
-        throw new Error(result.error)
+        if (result.diagnosticBundle?.status === 'uploaded') {
+          toast.error(
+            `Failed to send crash report. Diagnostic ticket ${result.diagnosticBundle.ticketId} was uploaded but not linked.`
+          )
+        } else {
+          toast.error('Failed to send crash report.')
+        }
+        console.error('Failed to submit crash report:', result.error)
+        return
       }
-      setReport(result.report)
+      if (result.report) {
+        setReport(result.report)
+      }
       setNotes('')
       toast.success('Crash report sent.')
       setOpen(false)
@@ -182,8 +189,8 @@ export function CrashReportDialog(): React.JSX.Element {
           </DialogDescription>
         </DialogHeader>
 
-        {report ? (
-          <div className="space-y-3">
+        <div className="space-y-3">
+          {report ? (
             <div className="rounded-md border border-border/70 bg-muted/30 p-3 text-xs">
               <div className="font-medium text-foreground">{formatSummary(report)}</div>
               <div className="mt-1 text-muted-foreground">
@@ -191,28 +198,26 @@ export function CrashReportDialog(): React.JSX.Element {
                 Orca {report.appVersion}
               </div>
             </div>
-            <textarea
-              value={notes}
-              onChange={(event) => setNotes(event.target.value)}
-              rows={4}
-              placeholder="Optional: what were you doing before Orca closed?"
-              className="min-h-24 w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-none ring-offset-background placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-            />
+          ) : null}
+          <textarea
+            value={notes}
+            onChange={(event) => setNotes(event.target.value)}
+            rows={4}
+            placeholder="Optional: what were you doing before Orca closed?"
+            className="min-h-24 w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-none ring-offset-background placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+          />
+          {report ? (
             <div className="space-y-1.5">
               <div className="text-[11px] font-medium text-muted-foreground">Diagnostic text</div>
               <pre className="max-h-44 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/20 p-3 font-mono text-[11px] leading-5 text-muted-foreground scrollbar-sleek">
                 {diagnosticText}
               </pre>
             </div>
-          </div>
-        ) : (
-          <div className="rounded-md border border-border/70 bg-muted/30 p-3 text-xs text-muted-foreground">
-            {loading ? 'Checking for crash reports...' : 'No crash report is available.'}
-          </div>
-        )}
+          ) : null}
+        </div>
 
         <DialogFooter className="gap-2">
-          <Button type="button" variant="outline" size="sm" onClick={handleCopy} disabled={!report}>
+          <Button type="button" variant="outline" size="sm" onClick={handleCopy} disabled={loading}>
             <Clipboard className="size-3.5" />
             Copy Details
           </Button>
@@ -225,7 +230,7 @@ export function CrashReportDialog(): React.JSX.Element {
           >
             Don&apos;t Send
           </Button>
-          <Button type="button" size="sm" onClick={handleSubmit} disabled={!report || submitting}>
+          <Button type="button" size="sm" onClick={handleSubmit} disabled={loading || submitting}>
             <Send className="size-3.5" />
             Send Report
           </Button>
