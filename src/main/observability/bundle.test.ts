@@ -485,6 +485,45 @@ describe('uploadBundle and deleteBundle', () => {
     ).rejects.toThrow(/^diagnostic response exceeded size limit$/)
   })
 
+  it('returns diagnostic blob links from successful uploads', async () => {
+    const baseUrl = await listen((req, res) => {
+      res.setHeader('content-type', 'application/json')
+      if (req.url === '/token') {
+        res.end(
+          JSON.stringify({
+            token: 'test-token',
+            expires_at: new Date(Date.now() + 60_000).toISOString(),
+            upload_url: `${baseUrl}/upload`,
+            max_bytes: _internalsForTests.MAX_BUNDLE_BYTES
+          })
+        )
+        return
+      }
+      const downloadUrl = `${baseUrl}/diagnostics/download/ticketabcdefghijklmnop?token=signed`
+      res.statusCode = 201
+      res.end(
+        JSON.stringify({
+          ticket_id: 'ticketabcdefghijklmnop',
+          blob_url: 'https://blob.vercel-storage.com/diagnostics/ticket.ndjson',
+          blob_download_url: downloadUrl,
+          blob_pathname: 'diagnostics/ticket.ndjson'
+        })
+      )
+    })
+
+    await expect(
+      uploadBundle({
+        tokenEndpoint: `${baseUrl}/token`,
+        payload: '{}\n',
+        bundleSubmissionId: generateBundleSubmissionId()
+      })
+    ).resolves.toEqual({
+      ticketId: 'ticketabcdefghijklmnop',
+      blobDownloadUrl: `${baseUrl}/diagnostics/download/ticketabcdefghijklmnop?token=signed`,
+      blobPathname: 'diagnostics/ticket.ndjson'
+    })
+  })
+
   it('posts deletion requests to the diagnostics delete endpoint for a ticket', async () => {
     const ticketId = generateBundleSubmissionId()
     const seen: string[] = []

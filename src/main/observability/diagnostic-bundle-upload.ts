@@ -16,6 +16,9 @@ export type UploadBundleOptions = {
 
 export type UploadBundleResult = {
   readonly ticketId: string
+  readonly blobUrl?: string
+  readonly blobDownloadUrl?: string
+  readonly blobPathname?: string
 }
 
 export type DeleteBundleOptions = {
@@ -32,6 +35,44 @@ type TokenResponse = {
 
 type UploadResponse = {
   readonly ticket_id: string
+  readonly blob_url?: unknown
+  readonly blob_download_url?: unknown
+  readonly blob_pathname?: unknown
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  return (
+    hostname === 'localhost' ||
+    hostname === '127.0.0.1' ||
+    hostname === '[::1]' ||
+    hostname === '::1'
+  )
+}
+
+function optionalTrustedDiagnosticUrl(value: unknown, tokenEndpoint: string): string | undefined {
+  if (typeof value !== 'string' || value.length === 0) {
+    return undefined
+  }
+  try {
+    const parsed = new URL(value)
+    const token = new URL(tokenEndpoint)
+    if (parsed.host !== token.host) {
+      return undefined
+    }
+    if (token.protocol === 'https:') {
+      return parsed.protocol === 'https:' ? value : undefined
+    }
+    if (token.protocol === 'http:') {
+      return parsed.protocol === 'http:' && isLoopbackHostname(parsed.hostname) ? value : undefined
+    }
+    return undefined
+  } catch {
+    return undefined
+  }
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
 /**
@@ -90,7 +131,18 @@ export async function uploadBundle(opts: UploadBundleOptions): Promise<UploadBun
   if (typeof uploadRes.ticket_id !== 'string' || uploadRes.ticket_id.length === 0) {
     throw new Error('malformed upload response: missing ticket_id')
   }
-  return { ticketId: uploadRes.ticket_id }
+  const blobUrl = optionalTrustedDiagnosticUrl(uploadRes.blob_url, opts.tokenEndpoint)
+  const blobDownloadUrl = optionalTrustedDiagnosticUrl(
+    uploadRes.blob_download_url,
+    opts.tokenEndpoint
+  )
+  const blobPathname = optionalString(uploadRes.blob_pathname)
+  return {
+    ticketId: uploadRes.ticket_id,
+    ...(blobUrl ? { blobUrl } : {}),
+    ...(blobDownloadUrl ? { blobDownloadUrl } : {}),
+    ...(blobPathname ? { blobPathname } : {})
+  }
 }
 
 export async function deleteBundle(opts: DeleteBundleOptions): Promise<void> {

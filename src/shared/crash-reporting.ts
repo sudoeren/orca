@@ -1,3 +1,10 @@
+import {
+  appendDiagnosticBundleLines,
+  type CrashReportDiagnosticBundle
+} from './crash-reporting-diagnostic-bundle'
+
+export type { CrashReportDiagnosticBundle } from './crash-reporting-diagnostic-bundle'
+
 export type CrashReportStatus = 'pending' | 'sent' | 'dismissed'
 export type CrashReportSource = 'renderer' | 'child'
 
@@ -33,22 +40,6 @@ export type CrashReportRecord = {
   details: Record<string, CrashReportDetailValue>
   breadcrumbs?: CrashReportBreadcrumb[]
 }
-
-export type CrashReportDiagnosticBundle =
-  | {
-      status: 'uploaded'
-      ticketId: string
-      bundleSubmissionId: string
-      bytes: number
-      spanCount: number
-    }
-  | {
-      status: 'not_uploaded'
-      reason: string
-      bundleSubmissionId?: string
-      bytes?: number
-      spanCount?: number
-    }
 
 export type UncapturedCrashReportContext = {
   createdAt: string
@@ -106,7 +97,6 @@ const PATH_PATTERNS = [
   /[A-Za-z]:\\(?:(?!\s+(?:\/|[A-Za-z]:\\|\\\\|gh[pousr]_|sk-|(?:token|api[_-]?key|secret|password)=))[^"'`<>\n\r)])+/gi,
   /\\\\[^\\\s"'`<>\n\r)]+\\(?:(?!\s+(?:\/|[A-Za-z]:\\|\\\\|gh[pousr]_|sk-|(?:token|api[_-]?key|secret|password)=))[^"'`<>\n\r)])+/gi
 ]
-
 export function isCrashReportReason(reason: string): boolean {
   return [
     'abnormal-exit',
@@ -219,7 +209,7 @@ export function formatCrashReportText(
     }
   }
 
-  appendDiagnosticBundleLines(lines, diagnosticBundle)
+  appendDiagnosticBundleLines(lines, diagnosticBundle, sanitizeCrashReportString)
 
   const trimmedNotes = notes?.trim()
   if (trimmedNotes) {
@@ -254,7 +244,7 @@ export function formatUncapturedCrashReportText(
     '- report_source: help_menu'
   ]
 
-  appendDiagnosticBundleLines(lines, diagnosticBundle)
+  appendDiagnosticBundleLines(lines, diagnosticBundle, sanitizeCrashReportString)
 
   const trimmedNotes = notes?.trim()
   if (trimmedNotes) {
@@ -262,41 +252,6 @@ export function formatUncapturedCrashReportText(
   }
 
   return truncateFormattedCrashReport(lines.join('\n'))
-}
-
-function appendDiagnosticBundleLines(
-  lines: string[],
-  diagnosticBundle: CrashReportDiagnosticBundle | undefined
-): void {
-  if (!diagnosticBundle) {
-    return
-  }
-  lines.push('', 'Diagnostic log:')
-  if (diagnosticBundle.status === 'uploaded') {
-    lines.push(
-      '- Status: uploaded',
-      `- Ticket ID: ${sanitizeCrashReportString(diagnosticBundle.ticketId)}`,
-      `- Bundle submission ID: ${sanitizeCrashReportString(diagnosticBundle.bundleSubmissionId)}`,
-      `- Spans: ${diagnosticBundle.spanCount}`,
-      `- Bytes: ${diagnosticBundle.bytes}`
-    )
-    return
-  }
-  lines.push(
-    '- Status: not uploaded',
-    `- Reason: ${sanitizeCrashReportString(diagnosticBundle.reason)}`
-  )
-  if (diagnosticBundle.bundleSubmissionId) {
-    lines.push(
-      `- Bundle submission ID: ${sanitizeCrashReportString(diagnosticBundle.bundleSubmissionId)}`
-    )
-  }
-  if (typeof diagnosticBundle.spanCount === 'number') {
-    lines.push(`- Spans: ${diagnosticBundle.spanCount}`)
-  }
-  if (typeof diagnosticBundle.bytes === 'number') {
-    lines.push(`- Bytes: ${diagnosticBundle.bytes}`)
-  }
 }
 
 function truncateFormattedCrashReport(text: string): string {

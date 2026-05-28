@@ -129,7 +129,10 @@ async function collectAndUploadCrashDiagnosticBundle(): Promise<CrashDiagnosticB
         ticketId: result.ticketId,
         bundleSubmissionId: bundle.bundleSubmissionId,
         bytes: bundle.bytes,
-        spanCount: bundle.spanCount
+        spanCount: bundle.spanCount,
+        ...(result.blobUrl ? { blobUrl: result.blobUrl } : {}),
+        ...(result.blobDownloadUrl ? { blobDownloadUrl: result.blobDownloadUrl } : {}),
+        ...(result.blobPathname ? { blobPathname: result.blobPathname } : {})
       },
       tokenEndpoint
     }

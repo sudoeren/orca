@@ -96,7 +96,11 @@ describe('crash-reporting shared helpers', () => {
       ticketId: 'ticketabcdefghijklmnop',
       bundleSubmissionId: 'bundleabcdefghijklmnop',
       bytes: 1024,
-      spanCount: 12
+      spanCount: 12,
+      blobUrl: 'https://blob.vercel-storage.com/diagnostics/ticketabcdefghijklmnop.ndjson',
+      blobDownloadUrl:
+        'https://blob.vercel-storage.com/diagnostics/ticketabcdefghijklmnop.ndjson?download=1',
+      blobPathname: 'diagnostics/ticketabcdefghijklmnop.ndjson'
     })
 
     expect(text).toContain('[Crash Report]')
@@ -104,10 +108,13 @@ describe('crash-reporting shared helpers', () => {
     expect(text).toContain('agent_state_changed')
     expect(text).toContain('Diagnostic log:')
     expect(text).toContain('ticketabcdefghijklmnop')
+    expect(text).toContain('Blob URL: https://blob.vercel-storage.com')
+    expect(text).toContain('Blob download URL: https://blob.vercel-storage.com')
+    expect(text).toContain('Blob path: diagnostics/ticketabcdefghijklmnop.ndjson')
     expect(text).toContain('User notes:')
     expect(text).toContain('[redacted-path]')
     expect(text).not.toContain('Route:')
-    expect(text).not.toContain('URL:')
+    expect(text).not.toContain('\nURL:')
   })
 
   it('caps formatted reports to the crash endpoint limit', () => {
