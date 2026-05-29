@@ -15,6 +15,50 @@ type LinearIssueTextEditorProps = {
   fields?: 'all' | 'title' | 'description'
 }
 
+type LinearIssueTextDraftState = {
+  issueId: string
+  sourceTitle: string
+  sourceDescription: string
+  title: string
+  description: string
+}
+
+function getLinearIssueDescription(issue: LinearIssue): string {
+  return issue.description ?? ''
+}
+
+function createLinearIssueTextDraftState(issue: LinearIssue): LinearIssueTextDraftState {
+  const description = getLinearIssueDescription(issue)
+  return {
+    issueId: issue.id,
+    sourceTitle: issue.title,
+    sourceDescription: description,
+    title: issue.title,
+    description
+  }
+}
+
+function resolveLinearIssueTextDraftState(
+  state: LinearIssueTextDraftState,
+  issue: LinearIssue
+): LinearIssueTextDraftState {
+  const sourceDescription = getLinearIssueDescription(issue)
+  if (state.issueId !== issue.id) {
+    return createLinearIssueTextDraftState(issue)
+  }
+  if (state.sourceTitle === issue.title && state.sourceDescription === sourceDescription) {
+    return state
+  }
+  return {
+    issueId: state.issueId,
+    sourceTitle: issue.title,
+    sourceDescription,
+    title: state.title === state.sourceTitle ? issue.title : state.title,
+    description:
+      state.description === state.sourceDescription ? sourceDescription : state.description
+  }
+}
+
 function useAutosizeTextArea(value: string): React.RefObject<HTMLTextAreaElement | null> {
   const ref = useRef<HTMLTextAreaElement>(null)
 
@@ -38,49 +82,44 @@ export function LinearIssueTextEditor({
 }: LinearIssueTextEditorProps): React.JSX.Element {
   const settings = useAppStore((s) => s.settings)
   const patchLinearIssue = useAppStore((s) => s.patchLinearIssue)
-  const [titleDraft, setTitleDraft] = useState(issue.title)
-  const [descriptionDraft, setDescriptionDraft] = useState(issue.description ?? '')
+  const [draftState, setDraftState] = useState(() => createLinearIssueTextDraftState(issue))
+  const resolvedDraftState = resolveLinearIssueTextDraftState(draftState, issue)
+  if (resolvedDraftState !== draftState) {
+    // Why: Linear can push updated title/description while another field has
+    // unsaved edits; reconcile only untouched drafts before the next paint.
+    setDraftState(resolvedDraftState)
+  }
+  const titleDraft = resolvedDraftState.title
+  const descriptionDraft = resolvedDraftState.description
   const [savingField, setSavingField] = useState<'title' | 'description' | null>(null)
   const submitShortcutLabel = getScreenSubmitShortcutLabel()
   const titleRef = useAutosizeTextArea(titleDraft)
   const descriptionRef = useAutosizeTextArea(descriptionDraft)
-  const lastIssueIdRef = useRef(issue.id)
-  const lastSyncedTitleRef = useRef(issue.title)
-  const lastSyncedDescriptionRef = useRef(issue.description ?? '')
-
-  useEffect(() => {
-    const nextDescription = issue.description ?? ''
-    if (issue.id !== lastIssueIdRef.current) {
-      lastIssueIdRef.current = issue.id
-      lastSyncedTitleRef.current = issue.title
-      lastSyncedDescriptionRef.current = nextDescription
-      setTitleDraft(issue.title)
-      setDescriptionDraft(nextDescription)
-      return
-    }
-
-    const previousTitle = lastSyncedTitleRef.current
-    const previousDescription = lastSyncedDescriptionRef.current
-
-    // Why: optimistic saves can update one field while the user has unsaved
-    // edits in the other; only sync fields that still match the last source.
-    if (issue.title !== previousTitle && titleDraft === previousTitle) {
-      setTitleDraft(issue.title)
-    }
-    if (nextDescription !== previousDescription && descriptionDraft === previousDescription) {
-      setDescriptionDraft(nextDescription)
-    }
-
-    lastSyncedTitleRef.current = issue.title
-    lastSyncedDescriptionRef.current = nextDescription
-  }, [descriptionDraft, issue.description, issue.id, issue.title, titleDraft])
+  const updateTitleDraft = useCallback(
+    (title: string): void => {
+      setDraftState((current) => ({
+        ...resolveLinearIssueTextDraftState(current, issue),
+        title
+      }))
+    },
+    [issue]
+  )
+  const updateDescriptionDraft = useCallback(
+    (description: string): void => {
+      setDraftState((current) => ({
+        ...resolveLinearIssueTextDraftState(current, issue),
+        description
+      }))
+    },
+    [issue]
+  )
 
   const saveField = useCallback(
     async (field: 'title' | 'description') => {
       const nextTitle = titleDraft.trim()
       const nextDescription = descriptionDraft.trimEnd()
       if (field === 'title' && !nextTitle) {
-        setTitleDraft(issue.title)
+        updateTitleDraft(issue.title)
         toast.error('Title is required')
         return
       }
@@ -111,9 +150,9 @@ export function LinearIssueTextEditor({
         onIssueChange(revert)
         patchLinearIssue(issue.id, revert)
         if (field === 'title') {
-          setTitleDraft(issue.title)
+          updateTitleDraft(issue.title)
         } else {
-          setDescriptionDraft(issue.description ?? '')
+          updateDescriptionDraft(issue.description ?? '')
         }
         toast.error(error instanceof Error ? error.message : `Failed to update ${field}`)
       } finally {
@@ -129,7 +168,9 @@ export function LinearIssueTextEditor({
       onIssueChange,
       patchLinearIssue,
       settings,
-      titleDraft
+      titleDraft,
+      updateDescriptionDraft,
+      updateTitleDraft
     ]
   )
 
@@ -170,7 +211,7 @@ export function LinearIssueTextEditor({
           <textarea
             ref={titleRef}
             value={titleDraft}
-            onChange={(event) => setTitleDraft(event.target.value)}
+            onChange={(event) => updateTitleDraft(event.target.value)}
             onBlur={() => void saveField('title')}
             onKeyDown={handleTitleKeyDown}
             disabled={savingField === 'title'}
@@ -198,7 +239,7 @@ export function LinearIssueTextEditor({
           <textarea
             ref={descriptionRef}
             value={descriptionDraft}
-            onChange={(event) => setDescriptionDraft(event.target.value)}
+            onChange={(event) => updateDescriptionDraft(event.target.value)}
             onBlur={() => void saveField('description')}
             onKeyDown={handleDescriptionKeyDown}
             disabled={savingField === 'description'}
