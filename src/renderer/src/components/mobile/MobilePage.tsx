@@ -19,8 +19,10 @@ import {
   type MobileNetworkInterface
 } from '../settings/mobile-network-interface-selection'
 import { useMobilePairingDevicePolling } from '../settings/mobile-pairing-device-polling'
-
-type FlowStage = 'intro' | 'paired' | 'flow'
+import {
+  shouldShowPairedAfterDeviceRefresh,
+  type MobilePageStage as FlowStage
+} from './mobile-page-stage'
 
 async function renderQrDataUrl(text: string): Promise<string> {
   return QRCodeBrowser.toDataURL(text, {
@@ -65,18 +67,45 @@ export default function MobilePage(): React.JSX.Element {
   const [revokingDeviceIds, setRevokingDeviceIds] = useState<string[]>([])
   const [deviceCountAtPairStart, setDeviceCountAtPairStart] = useState<number | null>(null)
   const hasGeneratedRef = useRef(false)
-  // Tracks the previous stage so we can set the paired-view baseline exactly
-  // once on entry into 'paired', avoiding a polling-stop race when devices
-  // change while already in paired view.
-  const lastStageRef = useRef<FlowStage | null>(null)
+  const stageRef = useRef<FlowStage | null>(null)
+  const deviceCountAtPairStartRef = useRef<number | null>(null)
   const closeMobilePage = useAppStore((s) => s.closeMobilePage)
   const showMobileButton = useAppStore((s) => s.settings?.showMobileButton !== false)
   const updateSettings = useAppStore((s) => s.updateSettings)
+
+  const setPairingDeviceBaseline = useCallback((count: number | null): void => {
+    deviceCountAtPairStartRef.current = count
+    setDeviceCountAtPairStart(count)
+  }, [])
+
+  const showStage = useCallback((nextStage: FlowStage | null): void => {
+    stageRef.current = nextStage
+    setStage(nextStage)
+  }, [])
+
+  const showPairedDevices = useCallback(
+    (deviceCount: number): void => {
+      // Why: paired-view polling uses this baseline; setting it with the
+      // transition avoids the render-plus-Effect gap where polling stops.
+      setPairingDeviceBaseline(deviceCount)
+      showStage('paired')
+    },
+    [setPairingDeviceBaseline, showStage]
+  )
 
   const loadDevices = useCallback(async (): Promise<PairedDevice[]> => {
     try {
       const result = await window.api.mobile.listDevices()
       setDevices(result.devices)
+      if (
+        shouldShowPairedAfterDeviceRefresh({
+          stage: stageRef.current,
+          deviceCountAtPairStart: deviceCountAtPairStartRef.current,
+          nextDeviceCount: result.devices.length
+        })
+      ) {
+        showPairedDevices(result.devices.length)
+      }
       return result.devices
     } catch (err) {
       // Log so a transient IPC failure (which routes the user to 'intro') is
@@ -84,7 +113,7 @@ export default function MobilePage(): React.JSX.Element {
       console.error('mobile.listDevices failed', err)
       return []
     }
-  }, [])
+  }, [showPairedDevices])
 
   // Why: pick the initial stage based on whether any devices are already
   // paired so returning users don't see the marketing intro every time.
@@ -95,12 +124,16 @@ export default function MobilePage(): React.JSX.Element {
       if (cancelled) {
         return
       }
-      setStage(initialDevices.length > 0 ? 'paired' : 'intro')
+      if (initialDevices.length > 0) {
+        showPairedDevices(initialDevices.length)
+      } else {
+        showStage('intro')
+      }
     })()
     return () => {
       cancelled = true
     }
-  }, [loadDevices])
+  }, [loadDevices, showPairedDevices, showStage])
 
   const revokeDevice = useCallback(
     async (deviceId: string) => {
@@ -122,7 +155,7 @@ export default function MobilePage(): React.JSX.Element {
         const remaining = await loadDevices()
         toast.success('Device revoked')
         if (remaining.length === 0) {
-          setStage('intro')
+          showStage('intro')
         }
       } catch {
         toast.error('Failed to revoke device')
@@ -130,7 +163,7 @@ export default function MobilePage(): React.JSX.Element {
         setRevokingDeviceIds((prev) => prev.filter((id) => id !== deviceId))
       }
     },
-    [loadDevices]
+    [loadDevices, showStage]
   )
 
   // Why: render install QRs lazily — only after the user enters the flow,
@@ -260,59 +293,35 @@ export default function MobilePage(): React.JSX.Element {
     loadDevices: polledLoadDevices
   })
 
-  useEffect(() => {
-    if (
-      stage === 'flow' &&
-      deviceCountAtPairStart !== null &&
-      devices.length > deviceCountAtPairStart
-    ) {
-      setStage('paired')
-    }
-  }, [stage, devices.length, deviceCountAtPairStart])
-
-  // Why: set the paired-view polling baseline exactly once on entry into
-  // 'paired'. Re-baselining on every devices.length change opened a small
-  // window where polling stopped then resumed; capturing the count once on
-  // transition lets newly added devices flow through naturally.
-  useEffect(() => {
-    if (stage === 'paired' && lastStageRef.current !== 'paired') {
-      setDeviceCountAtPairStart(devices.length)
-    }
-    lastStageRef.current = stage
-    // devices.length is intentionally excluded: we want to capture the count
-    // only at the moment of the stage transition, not re-run on every change.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stage])
-
   const enterFlow = (): void => {
     setStepIdx(0)
-    setDeviceCountAtPairStart(devices.length)
+    setPairingDeviceBaseline(devices.length)
     // Force the auto-generate effect to mint a fresh pairing token on next
     // entry into Step 2, and clear stale QR state so we never flash an
     // expired code from a previous session.
     hasGeneratedRef.current = false
     setPairQrDataUrl(null)
     setPairingUrl(null)
-    setStage('flow')
+    showStage('flow')
   }
 
   // Why: from the paired summary, "Pair another device" jumps straight to
   // Step 2 since the app is presumably already installed on the user's phone.
   const pairAnotherDevice = (): void => {
     setStepIdx(1)
-    setDeviceCountAtPairStart(devices.length)
+    setPairingDeviceBaseline(devices.length)
     // Same reset as enterFlow — re-entering must mint a fresh pairing offer.
     hasGeneratedRef.current = false
     setPairQrDataUrl(null)
     setPairingUrl(null)
-    setStage('flow')
+    showStage('flow')
   }
 
   const handleBack = (): void => {
     if (stepIdx === 1) {
       setStepIdx(0)
     } else {
-      setStage('intro')
+      showStage('intro')
     }
   }
 
@@ -430,7 +439,7 @@ export default function MobilePage(): React.JSX.Element {
               refreshingNetworkInterfaces={refreshingNetworkInterfaces}
               onBack={handleBack}
               onContinue={handleContinue}
-              onDone={devices.length > 0 ? () => setStage('paired') : undefined}
+              onDone={devices.length > 0 ? () => showPairedDevices(devices.length) : undefined}
             />
           )}
         </div>
