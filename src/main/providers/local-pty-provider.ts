@@ -146,7 +146,7 @@ export type LocalPtyProviderOptions = {
   buildSpawnEnv?: (
     id: string,
     baseEnv: Record<string, string>,
-    ctx?: { command?: string; isWsl?: boolean }
+    ctx?: { command?: string; shellPath?: string; isWsl?: boolean }
   ) => Record<string, string>
   /** Whether worktree-scoped shell history is enabled. When true (or absent)
    *  and a worktreeId is provided, HISTFILE is scoped per-worktree. */
@@ -291,7 +291,11 @@ export class LocalPtyProvider implements IPtyProvider {
 
     const isWslShell = Boolean(wslInfo) || pathWin32.basename(shellPath).toLowerCase() === 'wsl.exe'
     const finalEnv = this.opts.buildSpawnEnv
-      ? this.opts.buildSpawnEnv(id, spawnEnv, { command: args.command, isWsl: isWslShell })
+      ? this.opts.buildSpawnEnv(id, spawnEnv, {
+          command: args.command,
+          shellPath,
+          isWsl: isWslShell
+        })
       : spawnEnv
     if (
       process.platform === 'win32' &&

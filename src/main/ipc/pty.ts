@@ -30,7 +30,10 @@ import {
   markClaudePtyExited,
   markClaudePtySpawned
 } from '../claude-accounts/live-pty-gate'
-import { applyTerminalAttributionEnv } from '../attribution/terminal-attribution'
+import {
+  applyTerminalAttributionEnv,
+  resolveAttributionShellFamily
+} from '../attribution/terminal-attribution'
 import { registerPty, unregisterPty } from '../memory/pty-registry'
 import { advertisedUrlWatcher } from '../ports/advertised-url-watcher'
 import { track } from '../telemetry/client'
@@ -266,6 +269,8 @@ export type BuildPtyHostEnvOptions = {
    *  resolve to Pi for back-compat. NEVER infer from disk presence; that's
    *  the bug this option fixes (cross-agent shadowing when both dirs exist). */
   launchCommand?: string
+  shellPath?: string
+  isWsl?: boolean
   agentStatusHooksEnabled: boolean
 }
 
@@ -601,7 +606,11 @@ export function buildPtyHostEnv(
   }
   applyTerminalAttributionEnv(baseEnv, {
     enabled: opts.githubAttributionEnabled,
-    userDataPath: opts.userDataPath
+    userDataPath: opts.userDataPath,
+    shellFamily: resolveAttributionShellFamily({
+      shellPath: opts.shellPath,
+      isWsl: opts.isWsl
+    })
   })
 
   return baseEnv
@@ -841,6 +850,8 @@ export function registerPtyHandlers(
           skipCodexHomeEnv: ctx?.isWsl === true,
           githubAttributionEnabled: getSettings?.()?.enableGitHubAttribution ?? false,
           launchCommand: ctx?.command,
+          shellPath: ctx?.shellPath,
+          isWsl: ctx?.isWsl,
           agentStatusHooksEnabled: isAgentStatusHooksEnabled(getSettings?.())
         })
         // Why: agents need their own terminal handle at process start so they
@@ -1212,6 +1223,8 @@ export function registerPtyHandlers(
           skipCodexHomeEnv,
           githubAttributionEnabled: getSettings?.()?.enableGitHubAttribution ?? false,
           launchCommand: args.command,
+          shellPath: daemonShellOverride ?? process.env.COMSPEC,
+          isWsl: shouldSkipCodexHomeEnvForWindowsShell(daemonShellOverride, args.cwd),
           agentStatusHooksEnabled: isAgentStatusHooksEnabled(getSettings?.())
         })
       }
@@ -1631,6 +1644,8 @@ export function registerPtyHandlers(
             skipCodexHomeEnv,
             githubAttributionEnabled: getSettings?.()?.enableGitHubAttribution ?? false,
             launchCommand: args.command,
+            shellPath: effectiveShellOverride ?? process.env.COMSPEC,
+            isWsl: shouldSkipCodexHomeEnvForWindowsShell(effectiveShellOverride, args.cwd),
             agentStatusHooksEnabled: isAgentStatusHooksEnabled(getSettings?.())
           })
         } catch (err) {
