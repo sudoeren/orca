@@ -6,15 +6,13 @@ import {
   Monitor,
   QrCode,
   Settings,
-  Bot,
-  Clock,
-  GitPullRequest,
   ChevronRight,
   Terminal,
   Plus,
   RefreshCw,
   PowerOff,
-  Edit3
+  Edit3,
+  ListTodo
 } from 'lucide-react-native'
 import { ClaudeIcon, OpenAIIcon } from '../src/components/AgentIcons'
 import {
@@ -38,12 +36,19 @@ import type { ConnectionState, HostProfile } from '../src/transport/types'
 import { triggerMediumImpact } from '../src/platform/haptics'
 import { OrcaLogo } from '../src/components/OrcaLogo'
 import { StatusDot } from '../src/components/StatusDot'
+import { TaskProviderLogo } from '../src/components/TaskProviderLogo'
 import { TextInputModal } from '../src/components/TextInputModal'
 import { ActionSheetModal, type ActionSheetAction } from '../src/components/ActionSheetModal'
 import { ConfirmModal } from '../src/components/ConfirmModal'
 import { setCachedWorktrees, getCachedWorktrees } from '../src/cache/worktree-cache'
 import { loadHomeSnapshot, saveHomeSnapshot } from '../src/cache/home-snapshot-cache'
 import { colors, spacing, radii } from '../src/theme/mobile-theme'
+import {
+  filterAvailableTaskProviders,
+  normalizeVisibleTaskProviders,
+  type TaskProvider
+} from '../src/tasks/mobile-task-providers'
+import { useResponsiveLayout } from '../src/layout/responsive-layout'
 
 function endpointLabel(endpoint: string): string {
   try {
@@ -75,6 +80,24 @@ type HostWorktreeInfo = {
   totalWorktrees: number
   activeCount: number
   lastActiveWorktree: WorktreeSummary | null
+}
+
+type HomeTaskSettings = {
+  visibleTaskProviders?: unknown
+}
+
+type HomePreflightStatus = {
+  glab?: { installed?: boolean }
+}
+
+type HomeLinearStatus = {
+  connected?: boolean
+}
+
+const TASK_PROVIDER_LABELS: Record<TaskProvider, string> = {
+  github: 'GitHub',
+  gitlab: 'GitLab',
+  linear: 'Linear'
 }
 
 function formatDuration(ms: number): string {
@@ -196,6 +219,44 @@ function fetchAccountsSnapshot(
     .catch(() => {})
 }
 
+function fetchTaskProviders(
+  client: RpcClient,
+  hostId: string,
+  setProviders: (
+    updater: (prev: Record<string, TaskProvider[]>) => Record<string, TaskProvider[]>
+  ) => void,
+  disposed: () => boolean
+) {
+  Promise.all([
+    client.sendRequest('settings.get'),
+    client.sendRequest('preflight.check'),
+    client.sendRequest('linear.status')
+  ])
+    .then(([settingsResponse, preflightResponse, linearResponse]) => {
+      if (disposed()) return
+      const settings = settingsResponse.ok
+        ? (((settingsResponse.result as { settings?: HomeTaskSettings }).settings ??
+            {}) as HomeTaskSettings)
+        : {}
+      const preflight = preflightResponse.ok
+        ? (preflightResponse.result as HomePreflightStatus)
+        : null
+      const linear = linearResponse.ok ? (linearResponse.result as HomeLinearStatus) : null
+      const providers = filterAvailableTaskProviders(
+        normalizeVisibleTaskProviders(settings.visibleTaskProviders),
+        {
+          gitlabInstalled: preflight?.glab?.installed === true,
+          linearConnected: linear?.connected === true
+        }
+      )
+      setProviders((prev) => ({ ...prev, [hostId]: providers }))
+    })
+    .catch(() => {
+      if (disposed()) return
+      setProviders((prev) => (prev[hostId] ? prev : { ...prev, [hostId]: ['github'] }))
+    })
+}
+
 // Why: repo names get a stable color derived from hashing, matching the
 // host detail page's colored dots for visual consistency.
 const REPO_COLORS = ['#8b5cf6', '#3b82f6', '#22c55e', '#f59e0b', '#ef4444', '#ec4899', '#06b6d4']
@@ -210,6 +271,9 @@ function repoColor(name: string): string {
 export default function HomeScreen() {
   const router = useRouter()
   const insets = useSafeAreaInsets()
+  // Why: cap and center content on wide/tablet canvases so cards don't stretch
+  // edge-to-edge on iPad; on phones isWideLayout is false and layout is unchanged.
+  const { isWideLayout, contentMaxWidth } = useResponsiveLayout()
   const [hosts, setHosts] = useState<HostProfile[]>([])
   const [actionTarget, setActionTarget] = useState<HostProfile | null>(null)
   const [renameTarget, setRenameTarget] = useState<HostProfile | null>(null)
@@ -220,6 +284,7 @@ export default function HomeScreen() {
   const [stats, setStats] = useState<StatsSummary | null>(null)
   const [worktreeInfo, setWorktreeInfo] = useState<Record<string, HostWorktreeInfo>>({})
   const [accountsByHost, setAccountsByHost] = useState<Record<string, AccountsSnapshot>>({})
+  const [taskProvidersByHost, setTaskProvidersByHost] = useState<Record<string, TaskProvider[]>>({})
   const [lastVisited, setLastVisited] = useState<{ hostId: string; worktreeId: string } | null>(
     null
   )
@@ -305,6 +370,7 @@ export default function HomeScreen() {
           fetchStats(entry.client, setStats, () => stale)
           fetchWorktreeInfo(entry.client, entry.hostId, setWorktreeInfo, () => stale)
           fetchAccountsSnapshot(entry.client, entry.hostId, setAccountsByHost, () => stale)
+          fetchTaskProviders(entry.client, entry.hostId, setTaskProvidersByHost, () => stale)
         }
       }
       return () => {
@@ -415,6 +481,7 @@ export default function HomeScreen() {
             statsFetched = true
             fetchStats(entry.client, setStats, () => false)
             fetchWorktreeInfo(entry.client, entry.hostId, setWorktreeInfo, () => false)
+            fetchTaskProviders(entry.client, entry.hostId, setTaskProvidersByHost, () => false)
           }
         } else {
           if (unsubNotif) {
@@ -499,6 +566,75 @@ export default function HomeScreen() {
     return items
   }, [sortedHosts, hostStates, accountsByHost])
 
+  const primaryConnectedHost = useMemo(
+    () => sortedHosts.find((host) => hostStates[host.id] === 'connected') ?? null,
+    [sortedHosts, hostStates]
+  )
+  const primaryTaskProviders = primaryConnectedHost
+    ? (taskProvidersByHost[primaryConnectedHost.id] ?? ['github'])
+    : []
+  const openTasks = useCallback(
+    (provider?: TaskProvider) => {
+      if (!primaryConnectedHost) return
+      const suffix = provider ? `?taskSource=${provider}` : ''
+      router.push(`/h/${primaryConnectedHost.id}/tasks${suffix}`)
+    },
+    [primaryConnectedHost, router]
+  )
+  const renderTaskHomeCard = () => (
+    <Pressable
+      disabled={!primaryConnectedHost}
+      style={({ pressed }) => [
+        styles.taskHomeCard,
+        !primaryConnectedHost && styles.quickActionDisabled,
+        pressed && styles.hostCardPressed
+      ]}
+      onPress={() => {
+        openTasks()
+      }}
+    >
+      <View style={styles.taskHomeIcon}>
+        <ListTodo size={18} color={colors.textSecondary} />
+      </View>
+      <View style={styles.taskHomeMain}>
+        <Text style={styles.taskHomeTitle}>Tasks</Text>
+        <Text style={styles.taskHomeSubtitle} numberOfLines={1}>
+          {primaryTaskProviders.length > 0
+            ? primaryTaskProviders.map((provider) => TASK_PROVIDER_LABELS[provider]).join(' · ')
+            : 'No task sources connected'}
+        </Text>
+      </View>
+      <View style={styles.taskHomeTrailing}>
+        <View
+          style={styles.taskHomeProviderRow}
+          accessibilityLabel={primaryTaskProviders
+            .map((provider) => TASK_PROVIDER_LABELS[provider])
+            .join(', ')}
+        >
+          {primaryTaskProviders.map((provider) => (
+            <Pressable
+              key={provider}
+              accessibilityRole="button"
+              accessibilityLabel={`Open ${TASK_PROVIDER_LABELS[provider]} tasks`}
+              hitSlop={8}
+              style={({ pressed }) => [
+                styles.taskHomeProviderButton,
+                pressed && styles.taskHomeProviderButtonPressed
+              ]}
+              onPress={(event) => {
+                event.stopPropagation()
+                openTasks(provider)
+              }}
+            >
+              <TaskProviderLogo provider={provider} size={22} color={colors.textSecondary} />
+            </Pressable>
+          ))}
+        </View>
+      </View>
+      <ChevronRight size={16} color={colors.textMuted} />
+    </Pressable>
+  )
+
   async function handleRename(newName: string) {
     if (!renameTarget) return
     try {
@@ -544,7 +680,13 @@ export default function HomeScreen() {
 
       {hosts.length === 0 ? (
         /* ─── Empty state: onboarding ─── */
-        <View style={[styles.emptyContainer, { paddingBottom: insets.bottom }]}>
+        <View
+          style={[
+            styles.emptyContainer,
+            { paddingBottom: insets.bottom },
+            isWideLayout && { maxWidth: contentMaxWidth, width: '100%', alignSelf: 'center' }
+          ]}
+        >
           <View style={styles.emptyHero}>
             <Text style={styles.emptyTitle}>Connect your desktop</Text>
             <Text style={styles.emptyBody}>
@@ -580,7 +722,11 @@ export default function HomeScreen() {
           // Why: edge-to-edge — let the list scroll under the system nav bar
           // but reserve insets.bottom so the last row stays reachable above
           // the Samsung 3-button nav / iOS home indicator.
-          contentContainerStyle={[styles.list, { paddingBottom: spacing.xl + insets.bottom }]}
+          contentContainerStyle={[
+            styles.list,
+            { paddingBottom: spacing.xl + insets.bottom },
+            isWideLayout && { maxWidth: contentMaxWidth, width: '100%', alignSelf: 'center' }
+          ]}
           ListHeaderComponent={
             <View>
               <View style={styles.hero}>
@@ -590,25 +736,16 @@ export default function HomeScreen() {
               {stats && (
                 <View style={styles.statsRow}>
                   <View style={styles.statCard}>
-                    <View style={styles.statIcon}>
-                      <Bot size={14} color={colors.textMuted} />
-                    </View>
                     <Text style={styles.statValue}>
                       {stats.totalAgentsSpawned.toLocaleString()}
                     </Text>
                     <Text style={styles.statLabel}>Agents spawned</Text>
                   </View>
                   <View style={styles.statCard}>
-                    <View style={styles.statIcon}>
-                      <Clock size={14} color={colors.textMuted} />
-                    </View>
                     <Text style={styles.statValue}>{formatDuration(stats.totalAgentTimeMs)}</Text>
                     <Text style={styles.statLabel}>Agent time</Text>
                   </View>
                   <View style={styles.statCard}>
-                    <View style={styles.statIcon}>
-                      <GitPullRequest size={14} color={colors.textMuted} />
-                    </View>
                     <Text style={styles.statValue}>{stats.totalPRsCreated.toLocaleString()}</Text>
                     <Text style={styles.statLabel}>PRs created</Text>
                   </View>
@@ -676,7 +813,7 @@ export default function HomeScreen() {
               {/* ─── Resume card ─── */}
               {resumeWorktree ? (
                 <>
-                  <Text style={[styles.sectionHeading, { marginTop: spacing.xl }]}>Resume</Text>
+                  <Text style={[styles.sectionHeading, styles.sectionHeadingTightTop]}>Resume</Text>
                   <Pressable
                     style={({ pressed }) => [styles.resumeCard, pressed && styles.hostCardPressed]}
                     onPress={() =>
@@ -708,8 +845,47 @@ export default function HomeScreen() {
                     </View>
                     <ChevronRight size={16} color={colors.textMuted} />
                   </Pressable>
+                  <Text style={[styles.sectionHeading, styles.sectionHeadingTightTop]}>Tasks</Text>
+                  {renderTaskHomeCard()}
                 </>
-              ) : null}
+              ) : (
+                <>
+                  <Text style={[styles.sectionHeading, styles.sectionHeadingTightTop]}>Tasks</Text>
+                  {renderTaskHomeCard()}
+                </>
+              )}
+
+              {/* ─── Quick actions ─── */}
+              <Text style={[styles.sectionHeading, { marginTop: spacing.xl }]}>Quick Actions</Text>
+              <View style={styles.quickActions}>
+                <Pressable
+                  style={({ pressed }) => [styles.quickAction, pressed && styles.hostCardPressed]}
+                  onPress={() => router.push('/pair-scan')}
+                >
+                  <View style={styles.quickActionIcon}>
+                    <QrCode size={16} color={colors.textSecondary} />
+                  </View>
+                  <Text style={styles.quickActionLabel}>Pair Desktop</Text>
+                </Pressable>
+                <Pressable
+                  disabled={!primaryConnectedHost}
+                  style={({ pressed }) => [
+                    styles.quickAction,
+                    !primaryConnectedHost && styles.quickActionDisabled,
+                    pressed && styles.hostCardPressed
+                  ]}
+                  onPress={() => {
+                    if (primaryConnectedHost) {
+                      router.push(`/h/${primaryConnectedHost.id}?action=newWorktree`)
+                    }
+                  }}
+                >
+                  <View style={styles.quickActionIcon}>
+                    <Plus size={16} color={colors.textSecondary} />
+                  </View>
+                  <Text style={styles.quickActionLabel}>New Workspace</Text>
+                </Pressable>
+              </View>
 
               {/* ─── Account usage ─── */}
               {accountsHosts.length > 0 ? (
@@ -789,34 +965,6 @@ export default function HomeScreen() {
                   })}
                 </>
               ) : null}
-
-              {/* ─── Quick actions ─── */}
-              <Text style={[styles.sectionHeading, { marginTop: spacing.xl }]}>Quick Actions</Text>
-              <View style={styles.quickActions}>
-                <Pressable
-                  style={({ pressed }) => [styles.quickAction, pressed && styles.hostCardPressed]}
-                  onPress={() => router.push('/pair-scan')}
-                >
-                  <View style={styles.quickActionIcon}>
-                    <QrCode size={16} color={colors.textSecondary} />
-                  </View>
-                  <Text style={styles.quickActionLabel}>Pair Desktop</Text>
-                </Pressable>
-                <Pressable
-                  style={({ pressed }) => [styles.quickAction, pressed && styles.hostCardPressed]}
-                  onPress={() => {
-                    const connectedHost = sortedHosts.find((h) => hostStates[h.id] === 'connected')
-                    if (connectedHost) {
-                      router.push(`/h/${connectedHost.id}?action=newWorktree`)
-                    }
-                  }}
-                >
-                  <View style={styles.quickActionIcon}>
-                    <Plus size={16} color={colors.textSecondary} />
-                  </View>
-                  <Text style={styles.quickActionLabel}>New Worktree</Text>
-                </Pressable>
-              </View>
             </View>
           }
         />
@@ -965,12 +1113,12 @@ const styles = StyleSheet.create({
 
   /* ─── Hero / greeting ─── */
   hero: {
-    paddingTop: spacing.md,
-    paddingBottom: spacing.lg
+    paddingTop: spacing.xs,
+    paddingBottom: spacing.md
   },
   heroTitle: {
     color: colors.textPrimary,
-    fontSize: 26,
+    fontSize: 24,
     fontWeight: '800',
     letterSpacing: -0.3
   },
@@ -979,7 +1127,7 @@ const styles = StyleSheet.create({
   statsRow: {
     flexDirection: 'row',
     gap: 10,
-    marginBottom: spacing.xl
+    marginBottom: spacing.lg
   },
   statCard: {
     flex: 1,
@@ -987,17 +1135,8 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.borderSubtle,
     borderRadius: 10,
-    paddingVertical: 10,
+    paddingVertical: 8,
     paddingHorizontal: spacing.md
-  },
-  statIcon: {
-    width: 26,
-    height: 26,
-    borderRadius: 6,
-    backgroundColor: 'rgba(255,255,255,0.04)',
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginBottom: 6
   },
   statValue: {
     color: colors.textPrimary,
@@ -1022,6 +1161,9 @@ const styles = StyleSheet.create({
     marginBottom: spacing.sm,
     paddingHorizontal: spacing.xs
   },
+  sectionHeadingTightTop: {
+    marginTop: spacing.lg
+  },
 
   /* ─── List ─── */
   list: {
@@ -1038,7 +1180,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingLeft: spacing.md,
     paddingRight: spacing.md,
-    paddingVertical: 14,
+    paddingVertical: 12,
     borderRadius: radii.card,
     backgroundColor: colors.bgPanel,
     borderWidth: 1,
@@ -1101,7 +1243,7 @@ const styles = StyleSheet.create({
     borderRadius: radii.card,
     paddingLeft: spacing.md,
     paddingRight: spacing.md,
-    paddingVertical: 14
+    paddingVertical: 12
   },
   resumeIcon: {
     width: 46,
@@ -1136,6 +1278,65 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: colors.textSecondary,
     flex: 1
+  },
+
+  /* ─── Tasks card ─── */
+  taskHomeCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: colors.bgPanel,
+    borderWidth: 1,
+    borderColor: colors.borderSubtle,
+    borderRadius: radii.card,
+    minHeight: 72,
+    paddingLeft: spacing.md,
+    paddingRight: spacing.md,
+    paddingVertical: 12
+  },
+  taskHomeIcon: {
+    width: 46,
+    height: 46,
+    borderRadius: 13,
+    backgroundColor: colors.bgRaised,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 14
+  },
+  taskHomeMain: {
+    flex: 1,
+    minWidth: 0
+  },
+  taskHomeTitle: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: colors.textPrimary
+  },
+  taskHomeSubtitle: {
+    fontSize: 12,
+    color: colors.textSecondary,
+    marginTop: 3
+  },
+  taskHomeTrailing: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexShrink: 0,
+    marginLeft: spacing.sm
+  },
+  taskHomeProviderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    gap: 2
+  },
+  taskHomeProviderButton: {
+    width: 34,
+    height: 34,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: radii.button
+  },
+  taskHomeProviderButtonPressed: {
+    backgroundColor: colors.bgRaised
   },
 
   /* ─── Account usage ─── */
@@ -1201,6 +1402,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     alignItems: 'center',
     gap: 10
+  },
+  quickActionDisabled: {
+    opacity: 0.45
   },
   quickActionIcon: {
     width: 28,

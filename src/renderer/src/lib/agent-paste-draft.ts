@@ -2,17 +2,19 @@ import type { TuiAgent } from '../../../shared/types'
 import { TUI_AGENT_CONFIG, type DraftPasteReadySignal } from '../../../shared/tui-agent-config'
 import { useAppStore } from '@/store'
 import { subscribeToPtyData } from '@/components/terminal-pane/pty-dispatcher'
-import { isRemoteRuntimePtyId, sendRuntimePtyInput } from '@/runtime/runtime-terminal-inspection'
+import {
+  isRemoteRuntimePtyId,
+  sendRuntimePtyInputVerified
+} from '@/runtime/runtime-terminal-inspection'
 import { subscribeToRuntimeTerminalData } from '@/runtime/runtime-terminal-stream'
 
 // Why: bracketed paste markers let modern TUIs (Claude Code / Codex / Pi /
 // OpenCode / Gemini / cursor-agent / copilot) treat the inserted text as a
-// single atomic paste — the payload lands in the input buffer as a draft
-// instead of echoing character-by-character or triggering line-edit
-// shortcuts. Intentionally omit a trailing '\r' so the draft never auto-
-// submits; the user reviews and sends the prompt themselves.
+// single atomic paste instead of echoing character-by-character or triggering
+// line-edit shortcuts. Callers choose whether to append Enter after the paste.
 const BRACKETED_PASTE_BEGIN = '\x1b[200~'
 const BRACKETED_PASTE_END = '\x1b[201~'
+const POST_PASTE_SUBMIT_DELAY_MS = 50
 
 // Why: every prefill-capable TUI we ship support for (claude / codex / pi /
 // opencode / gemini / cursor-agent / copilot) emits `CSI ? 2004 h` (DECSET
@@ -43,9 +45,8 @@ const READINESS_TIMEOUT_MS = 8000
 
 /**
  * Wait until the agent on `tabId` has rendered its input-accepting TUI,
- * then bracketed-paste `content` into its input buffer. Never appends
- * `\r`, so the draft stays editable for the user to review / append
- * before sending.
+ * then bracketed-paste `content` into its input buffer. By default the
+ * draft stays editable; `submit: true` appends Enter after the paste.
  *
  * Returns true when the paste was issued, false on timeout or missing
  * PTY. `onTimeout` lets the caller surface a UI hint (e.g. toast) when
@@ -63,10 +64,11 @@ export async function pasteDraftWhenAgentReady(args: {
   content: string
   agent?: TuiAgent
   submit?: boolean
+  forcePaste?: boolean
   timeoutMs?: number
   onTimeout?: () => void
 }): Promise<boolean> {
-  const { tabId, content, agent, submit, timeoutMs, onTimeout } = args
+  const { tabId, content, agent, submit, forcePaste, timeoutMs, onTimeout } = args
 
   const agentConfig = agent ? TUI_AGENT_CONFIG[agent] : null
 
@@ -75,7 +77,7 @@ export async function pasteDraftWhenAgentReady(args: {
   // duplicate it. Callers should not invoke this helper for those agents;
   // the early return guards against accidental double-injection if a stale
   // call slips through.
-  if (agentConfig?.draftPromptFlag || agentConfig?.draftPromptEnvVar) {
+  if (!forcePaste && (agentConfig?.draftPromptFlag || agentConfig?.draftPromptEnvVar)) {
     return false
   }
 
@@ -93,12 +95,58 @@ export async function pasteDraftWhenAgentReady(args: {
     return false
   }
 
-  sendRuntimePtyInput(
-    useAppStore.getState().settings,
+  return await sendBracketedPasteToAgent({
     ptyId,
-    `${BRACKETED_PASTE_BEGIN}${content}${BRACKETED_PASTE_END}${submit ? '\r' : ''}`
-  )
-  return true
+    content,
+    submit: submit === true
+  })
+}
+
+export async function submitPromptToAgentTab(args: {
+  tabId: string
+  content: string
+  timeoutMs?: number
+}): Promise<boolean> {
+  const { tabId, content, timeoutMs } = args
+  const ptyId = await waitForPtyId(tabId, timeoutMs ?? READINESS_TIMEOUT_MS)
+  if (!ptyId) {
+    return false
+  }
+  return await sendBracketedPasteToAgent({ ptyId, content, submit: true })
+}
+
+export async function sendBracketedPasteToRunningAgent(args: {
+  ptyId: string
+  content: string
+}): Promise<boolean> {
+  return await sendBracketedPasteToAgent({ ptyId: args.ptyId, content: args.content, submit: true })
+}
+
+async function sendBracketedPasteToAgent(args: {
+  ptyId: string
+  content: string
+  submit: boolean
+}): Promise<boolean> {
+  const { ptyId, content, submit } = args
+  const settings = useAppStore.getState().settings
+  const pastePayload = `${BRACKETED_PASTE_BEGIN}${content}${BRACKETED_PASTE_END}`
+  try {
+    const pasted = await sendRuntimePtyInputVerified(settings, ptyId, pastePayload)
+    if (!pasted) {
+      return false
+    }
+    if (!submit) {
+      return true
+    }
+
+    // Why: Claude Code can leave a prompt as editable text when paste-end and
+    // Enter arrive in the same PTY write. Split the submit into the next turn so
+    // the TUI processes bracketed-paste termination before handling Enter.
+    await new Promise<void>((resolve) => window.setTimeout(resolve, POST_PASTE_SUBMIT_DELAY_MS))
+    return await sendRuntimePtyInputVerified(settings, ptyId, '\r')
+  } catch {
+    return false
+  }
 }
 
 /**

@@ -1,3 +1,5 @@
+import { EventEmitter } from 'node:events'
+import { PassThrough } from 'node:stream'
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 
 const { existsSyncMock, spawnMock } = vi.hoisted(() => ({
@@ -13,7 +15,14 @@ vi.mock('child_process', () => ({
   spawn: spawnMock
 }))
 
-import { findSystemSsh, spawnSystemSsh } from './ssh-system-fallback'
+import {
+  buildSshArgs,
+  findSystemSsh,
+  spawnSystemSsh,
+  spawnSystemSshCommand,
+  uploadDirectoryViaSystemSsh,
+  writeFileViaSystemSsh
+} from './ssh-system-fallback'
 import type { SshTarget } from '../../shared/ssh-types'
 
 function createTarget(overrides?: Partial<SshTarget>): SshTarget {
@@ -25,6 +34,65 @@ function createTarget(overrides?: Partial<SshTarget>): SshTarget {
     username: 'deploy',
     ...overrides
   }
+}
+
+type EventedProcess = EventEmitter & {
+  stdin: EventEmitter & {
+    write: ReturnType<typeof vi.fn>
+    end: ReturnType<typeof vi.fn>
+  }
+  stdout: EventEmitter
+  stderr: EventEmitter
+  pid: number
+  kill: ReturnType<typeof vi.fn>
+  exitCode: number | null
+  killed: boolean
+}
+
+function createEventedProcess(): EventedProcess {
+  const proc = new EventEmitter() as EventedProcess
+  proc.stdin = Object.assign(new EventEmitter(), {
+    write: vi.fn((_chunk, _encoding, cb?: (err?: Error | null) => void) => cb?.()),
+    end: vi.fn()
+  })
+  proc.stdout = new EventEmitter()
+  proc.stderr = new EventEmitter()
+  proc.pid = 12345
+  proc.kill = vi.fn()
+  proc.exitCode = null
+  proc.killed = false
+  return proc
+}
+
+function createMockChildProcess(): EventEmitter & {
+  stdin: PassThrough
+  stdout: PassThrough
+  stderr: PassThrough
+  pid: number
+  kill: ReturnType<typeof vi.fn>
+  killed: boolean
+  exitCode: number | null
+} {
+  const child = new EventEmitter() as EventEmitter & {
+    stdin: PassThrough
+    stdout: PassThrough
+    stderr: PassThrough
+    pid: number
+    kill: ReturnType<typeof vi.fn>
+    killed: boolean
+    exitCode: number | null
+  }
+  child.stdin = new PassThrough()
+  child.stdout = new PassThrough()
+  child.stderr = new PassThrough()
+  child.pid = 12345
+  child.killed = false
+  child.exitCode = null
+  child.kill = vi.fn(() => {
+    child.killed = true
+    return true
+  })
+  return child
 }
 
 describe('findSystemSsh', () => {
@@ -45,9 +113,13 @@ describe('findSystemSsh', () => {
 
 describe('spawnSystemSsh', () => {
   let mockProc: {
-    stdin: object
-    stdout: object
-    stderr: object
+    stdin: {
+      write: ReturnType<typeof vi.fn>
+      end: ReturnType<typeof vi.fn>
+      on: ReturnType<typeof vi.fn>
+    }
+    stdout: { on: ReturnType<typeof vi.fn> }
+    stderr: { on: ReturnType<typeof vi.fn> }
     pid: number
     on: ReturnType<typeof vi.fn>
     kill: ReturnType<typeof vi.fn>
@@ -58,7 +130,7 @@ describe('spawnSystemSsh', () => {
     spawnMock.mockReset()
 
     mockProc = {
-      stdin: { write: vi.fn(), end: vi.fn() },
+      stdin: { write: vi.fn(), end: vi.fn(), on: vi.fn() },
       stdout: { on: vi.fn() },
       stderr: { on: vi.fn() },
       pid: 12345,
@@ -102,6 +174,22 @@ describe('spawnSystemSsh', () => {
     expect(args).toContain('/home/user/.ssh/id_ed25519')
   })
 
+  it('includes identity agent option', () => {
+    spawnSystemSsh(createTarget({ identityAgent: '/home/user/.1password/agent.sock' }))
+
+    const args = spawnMock.mock.calls[0][1] as string[]
+    expect(args).toContain('-o')
+    expect(args).toContain('IdentityAgent=/home/user/.1password/agent.sock')
+  })
+
+  it('includes identities only option', () => {
+    spawnSystemSsh(createTarget({ identitiesOnly: true }))
+
+    const args = spawnMock.mock.calls[0][1] as string[]
+    expect(args).toContain('-o')
+    expect(args).toContain('IdentitiesOnly=yes')
+  })
+
   it('includes jump host flag', () => {
     spawnSystemSsh(createTarget({ jumpHost: 'bastion.example.com' }))
 
@@ -118,6 +206,76 @@ describe('spawnSystemSsh', () => {
     expect(args).toContain('ProxyCommand=ssh -W %h:%p bastion')
   })
 
+  it('uses configHost without resolved field overrides so OpenSSH sees the Host block', () => {
+    const args = buildSshArgs(
+      createTarget({
+        configHost: 'fdpass-host',
+        host: 'resolved.example.com',
+        port: 2222,
+        username: 'deploy',
+        identityFile: '/tmp/key',
+        identityAgent: '/tmp/agent.sock',
+        proxyCommand: 'ignored'
+      })
+    )
+
+    expect(args).toContain('deploy@fdpass-host')
+    expect(args).not.toContain('resolved.example.com')
+    expect(args).not.toContain('-p')
+    expect(args).not.toContain('-i')
+    expect(args).not.toContain('IdentityAgent=/tmp/agent.sock')
+    expect(args).not.toContain('ProxyCommand=ignored')
+  })
+
+  it('spawns a remote command through the system ssh target', () => {
+    spawnSystemSshCommand(createTarget({ configHost: 'fdpass-host' }), 'echo hello')
+
+    expect(spawnMock).toHaveBeenCalledWith(
+      '/usr/bin/ssh',
+      expect.arrayContaining(['--', 'deploy@fdpass-host', "exec /bin/sh -c 'echo hello'"]),
+      expect.objectContaining({ stdio: ['pipe', 'pipe', 'pipe'] })
+    )
+  })
+
+  it('exposes child stdin so remote commands receive EOF', () => {
+    const channel = spawnSystemSshCommand(createTarget(), 'cat > /tmp/file')
+
+    channel.stdin.end('contents')
+
+    expect(mockProc.stdin.end).toHaveBeenCalledWith('contents')
+  })
+
+  it('removes wrapped process listeners after command close', () => {
+    const proc = createEventedProcess()
+    spawnMock.mockReturnValue(proc)
+
+    const channel = spawnSystemSshCommand(createTarget(), 'echo hello')
+    const onClose = vi.fn()
+    channel.on('close', onClose)
+    proc.emit('close', 0, null)
+
+    expect(onClose).toHaveBeenCalledWith(0, null)
+    expect(proc.stdout.listenerCount('data')).toBe(0)
+    expect(proc.stdout.listenerCount('end')).toBe(0)
+    expect(proc.stdout.listenerCount('error')).toBe(0)
+    expect(proc.stdin.listenerCount('error')).toBe(0)
+    expect(proc.listenerCount('exit')).toBe(0)
+    expect(proc.listenerCount('close')).toBe(0)
+    expect(proc.listenerCount('error')).toBe(0)
+  })
+
+  it('removes write command wait listeners after close', async () => {
+    const proc = createEventedProcess()
+    spawnMock.mockReturnValue(proc)
+
+    const promise = writeFileViaSystemSsh(createTarget(), '/tmp/file', 'contents')
+    proc.emit('close', 0, null)
+
+    await expect(promise).resolves.toBeUndefined()
+    expect(proc.stdin.end).toHaveBeenCalledWith('contents')
+    expect(proc.stderr.listenerCount('data')).toBe(0)
+  })
+
   it('throws when no system ssh is found', () => {
     existsSyncMock.mockReturnValue(false)
     expect(() => spawnSystemSsh(createTarget())).toThrow('No system ssh binary found')
@@ -129,5 +287,62 @@ describe('spawnSystemSsh', () => {
     expect(result.pid).toBe(12345)
     expect(typeof result.kill).toBe('function')
     expect(typeof result.onExit).toBe('function')
+  })
+})
+
+describe('system SSH operation aborts', () => {
+  beforeEach(() => {
+    existsSyncMock.mockReset()
+    spawnMock.mockReset()
+    existsSyncMock.mockImplementation((p: string) => p === '/usr/bin/ssh')
+  })
+
+  it('rejects directory uploads when aborted even if child processes do not close', async () => {
+    const tarCreate = createMockChildProcess()
+    const sshExtract = createMockChildProcess()
+    spawnMock.mockReturnValueOnce(tarCreate).mockReturnValueOnce(sshExtract)
+    const controller = new AbortController()
+
+    const uploadPromise = uploadDirectoryViaSystemSsh(
+      createTarget(),
+      '/tmp/local-relay',
+      '/tmp/remote-relay',
+      { signal: controller.signal }
+    )
+    controller.abort()
+
+    const outcome = await Promise.race([
+      uploadPromise.then(
+        () => 'resolved',
+        (error: Error) => error.name
+      ),
+      new Promise<string>((resolve) => setTimeout(() => resolve('pending'), 0))
+    ])
+
+    expect(outcome).toBe('AbortError')
+    expect(tarCreate.kill).toHaveBeenCalledTimes(1)
+    expect(sshExtract.kill).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects remote file writes when aborted even if ssh never closes', async () => {
+    const sshProcess = createMockChildProcess()
+    spawnMock.mockReturnValueOnce(sshProcess)
+    const controller = new AbortController()
+
+    const writePromise = writeFileViaSystemSsh(createTarget(), '/tmp/remote-file', 'contents', {
+      signal: controller.signal
+    })
+    controller.abort()
+
+    const outcome = await Promise.race([
+      writePromise.then(
+        () => 'resolved',
+        (error: Error) => error.name
+      ),
+      new Promise<string>((resolve) => setTimeout(() => resolve('pending'), 0))
+    ])
+
+    expect(outcome).toBe('AbortError')
+    expect(sshProcess.kill).toHaveBeenCalledTimes(1)
   })
 })

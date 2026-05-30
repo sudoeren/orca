@@ -1,11 +1,16 @@
+/* eslint-disable max-lines -- Why: the generated URL cache, grant list, and
+   settings form stay together so revocation and cache invalidation remain
+   auditable. */
 import { Check, Copy, Loader2, RefreshCw } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
+import { useMountedRef } from '@/hooks/useMountedRef'
 import type { RuntimeAccessGrant } from '../../../../shared/runtime-access-grants'
 import { Button } from '../ui/button'
 import { Input } from '../ui/input'
 import { Label } from '../ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../ui/select'
+import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip'
 import { RuntimeAccessGrantList } from './RuntimeAccessGrantList'
 
 const LOOPBACK_ADDRESS = '127.0.0.1'
@@ -105,56 +110,93 @@ export function RuntimePairingUrlGenerator({
   )
   const [runtimeAccessGrants, setRuntimeAccessGrants] = useState<RuntimeAccessGrant[]>([])
   const [isLoadingAccessGrants, setIsLoadingAccessGrants] = useState(false)
+  const [refreshingNetworkInterfaces, setRefreshingNetworkInterfaces] = useState(false)
   const [revokingGrantId, setRevokingGrantId] = useState<string | null>(null)
   const [copiedTarget, setCopiedTarget] = useState<'web' | 'pairing' | null>(null)
   const [isGeneratingPairing, setIsGeneratingPairing] = useState(false)
+  const networkInterfaceLoadIdRef = useRef(0)
   const accessGrantLoadIdRef = useRef(0)
+  const mountedRef = useMountedRef()
+
+  useEffect(() => {
+    if (copiedTarget === null) {
+      return
+    }
+    const target = copiedTarget
+    const timeout = window.setTimeout(() => {
+      if (mountedRef.current) {
+        setCopiedTarget((current) => (current === target ? null : current))
+      }
+    }, 1400)
+    return () => window.clearTimeout(timeout)
+  }, [copiedTarget, mountedRef])
 
   const loadRuntimeAccessGrants = useCallback(
     async (options: { showToastOnError?: boolean } = {}): Promise<void> => {
       const loadId = accessGrantLoadIdRef.current + 1
       accessGrantLoadIdRef.current = loadId
-      setIsLoadingAccessGrants(true)
+      if (mountedRef.current) {
+        setIsLoadingAccessGrants(true)
+      }
       try {
         const result = await window.api.mobile.listRuntimeAccessGrants()
-        if (loadId === accessGrantLoadIdRef.current) {
+        if (mountedRef.current && loadId === accessGrantLoadIdRef.current) {
           setRuntimeAccessGrants(result.grants)
         }
       } catch (error) {
-        if (loadId === accessGrantLoadIdRef.current && options.showToastOnError) {
+        if (
+          mountedRef.current &&
+          loadId === accessGrantLoadIdRef.current &&
+          options.showToastOnError
+        ) {
           toast.error(
             error instanceof Error ? error.message : 'Failed to load shared access grants.'
           )
         }
       } finally {
-        if (loadId === accessGrantLoadIdRef.current) {
+        if (mountedRef.current && loadId === accessGrantLoadIdRef.current) {
           setIsLoadingAccessGrants(false)
         }
       }
     },
-    []
+    [mountedRef]
   )
 
-  useEffect(() => {
-    let stale = false
-
-    const loadNetworkInterfaces = async (): Promise<void> => {
+  const loadNetworkInterfaces = useCallback(
+    async (options: { showToastOnError?: boolean } = {}): Promise<void> => {
+      const loadId = networkInterfaceLoadIdRef.current + 1
+      networkInterfaceLoadIdRef.current = loadId
+      if (mountedRef.current) {
+        setRefreshingNetworkInterfaces(true)
+      }
       try {
         const result = await window.api.mobile.listNetworkInterfaces()
-        if (!stale) {
+        if (mountedRef.current && loadId === networkInterfaceLoadIdRef.current) {
           setNetworkInterfaces(result.interfaces)
         }
       } catch {
-        // Keep the loopback option available even if interface enumeration fails.
+        if (
+          mountedRef.current &&
+          loadId === networkInterfaceLoadIdRef.current &&
+          options.showToastOnError
+        ) {
+          toast.error('Failed to refresh network interfaces.')
+        }
+      } finally {
+        if (mountedRef.current && loadId === networkInterfaceLoadIdRef.current) {
+          setRefreshingNetworkInterfaces(false)
+        }
       }
-    }
+    },
+    [mountedRef]
+  )
 
+  useEffect(() => {
     void loadNetworkInterfaces()
-
     return () => {
-      stale = true
+      networkInterfaceLoadIdRef.current += 1
     }
-  }, [])
+  }, [loadNetworkInterfaces])
 
   useEffect(() => {
     void loadRuntimeAccessGrants()
@@ -167,9 +209,11 @@ export function RuntimePairingUrlGenerator({
     runtimePairingUrlCache.runtimePairingUrl = null
     runtimePairingUrlCache.webClientUrl = null
     runtimePairingUrlCache.runtimePairingDeviceId = null
-    setRuntimePairingUrl(null)
-    setWebClientUrl(null)
-    setRuntimePairingDeviceId(null)
+    if (mountedRef.current) {
+      setRuntimePairingUrl(null)
+      setWebClientUrl(null)
+      setRuntimePairingDeviceId(null)
+    }
   }
 
   const generateRuntimePairingUrl = async (): Promise<void> => {
@@ -182,21 +226,31 @@ export function RuntimePairingUrlGenerator({
       })
       if (!result.available) {
         clearGeneratedUrls()
-        toast.error('Runtime pairing is unavailable.')
+        if (mountedRef.current) {
+          toast.error('Runtime pairing is unavailable.')
+        }
         return
       }
       runtimePairingUrlCache.runtimePairingUrl = result.pairingUrl
       runtimePairingUrlCache.webClientUrl = result.webClientUrl
       runtimePairingUrlCache.runtimePairingDeviceId = result.deviceId
-      setRuntimePairingUrl(result.pairingUrl)
-      setWebClientUrl(result.webClientUrl)
-      setRuntimePairingDeviceId(result.deviceId)
+      if (mountedRef.current) {
+        setRuntimePairingUrl(result.pairingUrl)
+        setWebClientUrl(result.webClientUrl)
+        setRuntimePairingDeviceId(result.deviceId)
+      }
       await loadRuntimeAccessGrants()
-      toast.success(result.webClientUrl ? 'Generated web client URL.' : 'Generated pairing URL.')
+      if (mountedRef.current) {
+        toast.success(result.webClientUrl ? 'Generated web client URL.' : 'Generated pairing URL.')
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Failed to generate pairing URL.')
+      if (mountedRef.current) {
+        toast.error(error instanceof Error ? error.message : 'Failed to generate pairing URL.')
+      }
     } finally {
-      setIsGeneratingPairing(false)
+      if (mountedRef.current) {
+        setIsGeneratingPairing(false)
+      }
     }
   }
 
@@ -205,34 +259,45 @@ export function RuntimePairingUrlGenerator({
     try {
       const result = await window.api.mobile.revokeRuntimeAccess({ deviceId: grant.deviceId })
       if (!result.revoked) {
-        toast.error('Shared access was already revoked.')
+        if (mountedRef.current) {
+          toast.error('Shared access was already revoked.')
+        }
         await loadRuntimeAccessGrants()
         return
       }
-      setRuntimeAccessGrants((current) =>
-        current.filter((entry) => entry.deviceId !== grant.deviceId)
-      )
+      if (mountedRef.current) {
+        setRuntimeAccessGrants((current) =>
+          current.filter((entry) => entry.deviceId !== grant.deviceId)
+        )
+      }
       if (runtimePairingDeviceId === grant.deviceId) {
         clearGeneratedUrls()
       }
-      toast.success('Shared access revoked.')
+      if (mountedRef.current) {
+        toast.success('Shared access revoked.')
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Failed to revoke shared access.')
+      if (mountedRef.current) {
+        toast.error(error instanceof Error ? error.message : 'Failed to revoke shared access.')
+      }
     } finally {
-      setRevokingGrantId(null)
+      if (mountedRef.current) {
+        setRevokingGrantId(null)
+      }
     }
   }
 
   const copyGeneratedUrl = async (target: 'web' | 'pairing', value: string): Promise<void> => {
     try {
       await window.api.ui.writeClipboardText(value)
-      setCopiedTarget(target)
-      toast.success(target === 'web' ? 'Copied web client URL.' : 'Copied pairing URL.')
-      window.setTimeout(() => {
-        setCopiedTarget((current) => (current === target ? null : current))
-      }, 1400)
+      if (mountedRef.current) {
+        setCopiedTarget(target)
+        toast.success(target === 'web' ? 'Copied web client URL.' : 'Copied pairing URL.')
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Failed to copy URL.')
+      if (mountedRef.current) {
+        toast.error(error instanceof Error ? error.message : 'Failed to copy URL.')
+      }
     }
   }
 
@@ -264,34 +329,56 @@ export function RuntimePairingUrlGenerator({
       {showGeneratorForm ? (
         <>
           <div className="space-y-3">
-            <div className="grid gap-3 sm:grid-cols-[minmax(0,220px)_minmax(0,1fr)]">
+            <div className="grid gap-3 sm:grid-cols-[minmax(0,260px)_minmax(0,1fr)]">
               <div className="space-y-1">
                 <Label id="runtime-pairing-address-label" htmlFor="runtime-pairing-address">
                   Connection address
                 </Label>
-                <Select value={selectedAddress} onValueChange={updateSelectedAddress}>
-                  <SelectTrigger
-                    id="runtime-pairing-address"
-                    size="sm"
-                    className="min-w-[220px]"
-                    aria-labelledby="runtime-pairing-address-label"
-                  >
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={LOOPBACK_ADDRESS}>
-                      This computer ({LOOPBACK_ADDRESS})
-                    </SelectItem>
-                    {networkInterfaces.map((networkInterface, index) => (
-                      <SelectItem
-                        key={`${networkInterface.name}:${networkInterface.address}:${index}`}
-                        value={networkInterface.address}
-                      >
-                        {networkInterface.name} ({networkInterface.address})
+                <div className="flex min-w-0 items-center gap-2">
+                  <Select value={selectedAddress} onValueChange={updateSelectedAddress}>
+                    <SelectTrigger
+                      id="runtime-pairing-address"
+                      size="sm"
+                      className="min-w-0 flex-1"
+                      aria-labelledby="runtime-pairing-address-label"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={LOOPBACK_ADDRESS}>
+                        This computer ({LOOPBACK_ADDRESS})
                       </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                      {networkInterfaces.map((networkInterface, index) => (
+                        <SelectItem
+                          key={`${networkInterface.name}:${networkInterface.address}:${index}`}
+                          value={networkInterface.address}
+                        >
+                          {networkInterface.name} ({networkInterface.address})
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  {/* Why: server sharing uses the same interface list as Mobile,
+                      and VPN/tailnet addresses can appear after Settings opens. */}
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-sm"
+                        onClick={() => void loadNetworkInterfaces({ showToastOnError: true })}
+                        disabled={refreshingNetworkInterfaces}
+                        aria-label="Refresh connection addresses"
+                        className="text-muted-foreground"
+                      >
+                        <RefreshCw className={refreshingNetworkInterfaces ? 'animate-spin' : ''} />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom" sideOffset={6}>
+                      Refresh connection addresses
+                    </TooltipContent>
+                  </Tooltip>
+                </div>
               </div>
               <div className="min-w-0 space-y-1">
                 <Label htmlFor="runtime-pairing-custom-address">Custom address</Label>

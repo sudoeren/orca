@@ -18,12 +18,26 @@ type PtyRecord = {
   lastMeaningfulOutputAt: number | null
 }
 
+type MeaningfulContentDetector = (chunk: string) => boolean
+
 /**
  * Lightweight normalization to detect whether a PTY data chunk contains
  * meaningful (non-ANSI, non-OSC) output. Mirrors the regex passes in
  * orca-runtime.ts normalizeTerminalChunk but avoids importing the runtime.
  */
 function hasMeaningfulContent(chunk: string): boolean {
+  // Why: large plain-text PTY bursts should not pay the full ANSI stripping
+  // chain just to prove they contain visible output.
+  for (let index = 0; index < chunk.length; index++) {
+    const code = chunk.charCodeAt(index)
+    if (code === 0x1b || code < 0x09 || (code > 0x0d && code < 0x20) || code > 0x7e) {
+      break
+    }
+    if (code > 0x20) {
+      return true
+    }
+  }
+
   const stripped = chunk
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
@@ -60,9 +74,11 @@ function hasMeaningfulContent(chunk: string): boolean {
 export class AgentDetector {
   private ptys = new Map<string, PtyRecord>()
   private stats: StatsCollector
+  private meaningfulContentDetector: MeaningfulContentDetector
 
-  constructor(stats: StatsCollector) {
+  constructor(stats: StatsCollector, meaningfulContentDetector = hasMeaningfulContent) {
     this.stats = stats
+    this.meaningfulContentDetector = meaningfulContentDetector
   }
 
   /**
@@ -87,8 +103,13 @@ export class AgentDetector {
       return
     }
 
-    const hasMeaningfulOutput = hasMeaningfulContent(rawData)
-    if (record.sessionOpen && hasMeaningfulOutput) {
+    let hasMeaningfulOutput: boolean | null = null
+    const getHasMeaningfulOutput = (): boolean => {
+      hasMeaningfulOutput ??= this.meaningfulContentDetector(rawData)
+      return hasMeaningfulOutput
+    }
+
+    if (record.sessionOpen && getHasMeaningfulOutput()) {
       record.lastMeaningfulOutputAt = at
     }
 
@@ -107,7 +128,7 @@ export class AgentDetector {
       record.lastStatus = status
       record.sessionOpen = true
       record.sessionStartAt = at
-      record.lastMeaningfulOutputAt = hasMeaningfulOutput ? at : null
+      record.lastMeaningfulOutputAt = getHasMeaningfulOutput() ? at : null
       this.stats.onAgentStart(ptyId, at)
       return
     }
@@ -127,7 +148,7 @@ export class AgentDetector {
       // title is the start boundary for the next tracked session.
       record.sessionOpen = true
       record.sessionStartAt = at
-      record.lastMeaningfulOutputAt = hasMeaningfulOutput ? at : null
+      record.lastMeaningfulOutputAt = getHasMeaningfulOutput() ? at : null
       this.stats.onAgentStart(ptyId, at)
     }
 

@@ -11,11 +11,13 @@
 //   - the on-disk last-status cache (`last-status.json`) that survives
 //     Orca restart so retained dashboard rows reappear on relaunch
 import { createServer, type IncomingMessage, type ServerResponse } from 'http'
-import { randomUUID } from 'crypto'
+import { createHash, randomBytes, randomUUID } from 'crypto'
 import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs'
 import { join } from 'path'
 
 import { track } from '../telemetry/client'
+import { getCohortAtEmit } from '../telemetry/cohort-classifier'
+import { AGENT_KIND_VALUES, type AgentKind } from '../../shared/telemetry-events'
 import { ORCA_HOOK_PROTOCOL_VERSION } from '../../shared/agent-hook-types'
 import {
   clearAllListenerCaches,
@@ -36,10 +38,16 @@ import {
 } from '../../shared/agent-hook-listener'
 import type { AgentHookSource } from '../../shared/agent-hook-relay'
 import {
+  AGENT_STATUS_STALE_AFTER_MS,
   type AgentStatusIpcPayload,
+  type AgentType,
   type AgentStatusState,
   normalizeAgentStatusPayload
 } from '../../shared/agent-status-types'
+import {
+  isAgentInterruptInputIntent,
+  type AgentInterruptInferenceRequest
+} from '../../shared/agent-interrupt-intent'
 import { parseLegacyNumericPaneKey, parsePaneKey } from '../../shared/stable-pane-id'
 import type { LegacyPaneKeyAliasEntry } from '../../shared/types'
 
@@ -78,6 +86,7 @@ type PaneKeyAliasEntry = {
 const LAST_STATUS_FILE_NAME = 'last-status.json'
 const ASSISTANT_MESSAGE_RETRY_ATTEMPTS = 5
 const ASSISTANT_MESSAGE_RETRY_MS = 50
+const INTERRUPTED_DONE_LATE_WORKING_SUPPRESSION_MS = 15_000
 
 // Why: starts at 2 (not 1) because pre-merge dev iterations of this branch
 // wrote a v1 shape with no receivedAt / stateStartedAt. Bumping to 2 means a
@@ -92,6 +101,7 @@ const LAST_STATUS_FILE_VERSION = 2
 // hook-server batching; quit-time uses flushStatusPersistSync() for the
 // guaranteed final flush.
 const STATUS_PERSIST_DEBOUNCE_MS = 250
+const AGENT_PROMPT_SENT_AGENT_KINDS = new Set<AgentKind>(AGENT_KIND_VALUES)
 
 // Why: bound the on-disk file's growth across many sessions. PTY-teardown
 // eviction handles closed panes, but daemon-restored PTYs that never re-attach
@@ -104,6 +114,34 @@ const HYDRATE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 type LastStatusFile = {
   version: number
   entries: Record<string, EnrichedAgentHookEventPayload>
+}
+
+type AgentPromptSentDedupeEntry = {
+  agentKind: AgentKind
+  promptHash: string
+  promptInteractionKey?: string
+}
+
+function agentTypeToPromptSentAgentKind(agentType: AgentType | undefined): AgentKind {
+  const normalized = agentType?.trim().toLowerCase()
+  if (!normalized || normalized === 'unknown') {
+    return 'other'
+  }
+  if (normalized === 'claude') {
+    return 'claude-code'
+  }
+  return AGENT_PROMPT_SENT_AGENT_KINDS.has(normalized as AgentKind)
+    ? (normalized as AgentKind)
+    : 'other'
+}
+
+function equivalentInterruptAgentType(
+  actual: AgentType | undefined,
+  baseline: AgentType | undefined
+): boolean {
+  const normalizedActual = actual === 'unknown' ? undefined : actual
+  const normalizedBaseline = baseline === 'unknown' ? undefined : baseline
+  return normalizedActual === normalizedBaseline
 }
 
 // Why: paneKey is `${tabId}:${leafUuid}` — validate the durable leaf suffix
@@ -173,6 +211,11 @@ function sanitizeHydratedEntry(
     tabId: typeof tabId === 'string' ? tabId : undefined,
     worktreeId: typeof worktreeId === 'string' ? worktreeId : undefined,
     connectionId,
+    hasExplicitPrompt: record.hasExplicitPrompt === true ? true : undefined,
+    hookEventName: typeof record.hookEventName === 'string' ? record.hookEventName : undefined,
+    toolUseId: typeof record.toolUseId === 'string' ? record.toolUseId : undefined,
+    toolAgentId: typeof record.toolAgentId === 'string' ? record.toolAgentId : undefined,
+    toolAgentType: typeof record.toolAgentType === 'string' ? record.toolAgentType : undefined,
     payload,
     receivedAt,
     stateStartedAt
@@ -200,6 +243,132 @@ function trackEmptyPaneKeyHook(body: unknown): void {
     return
   }
   track('agent_hook_unattributed', { reason: 'empty_pane_key' })
+}
+
+function shouldKeepClaudePermissionVisible(
+  previous: EnrichedAgentHookEventPayload | undefined,
+  next: AgentHookEventPayload
+): boolean {
+  if (
+    previous?.payload.agentType !== 'claude' ||
+    previous.payload.state !== 'waiting' ||
+    next.payload.agentType !== 'claude' ||
+    next.payload.state !== 'working'
+  ) {
+    return false
+  }
+  if (next.hasExplicitPrompt === true) {
+    return false
+  }
+  if (isClaudePermissionResumingApprovedTool(previous, next)) {
+    return false
+  }
+  // Why: Claude can run subagents concurrently in one pane. Keep permission
+  // sticky unless the next hook has a source-level execution id that the
+  // PermissionRequest event itself does not expose.
+  return true
+}
+
+function isClaudePermissionResumingApprovedTool(
+  previous: EnrichedAgentHookEventPayload,
+  next: AgentHookEventPayload
+): boolean {
+  const previousToolUseId = previous.toolUseId?.trim() || undefined
+  const nextToolUseId = next.toolUseId?.trim() || undefined
+  const previousAgentId = previous.toolAgentId?.trim() || undefined
+  const nextAgentId = next.toolAgentId?.trim() || undefined
+  const hasAgentId = previousAgentId !== undefined || nextAgentId !== undefined
+  const previousAgentType = previous.toolAgentType?.trim() || undefined
+  const nextAgentType = next.toolAgentType?.trim() || undefined
+  const hasMatchingConcreteAgentId =
+    previousAgentId !== undefined && previousAgentId === nextAgentId
+  const hasSameExplicitAgentType =
+    !hasAgentId && previousAgentType !== undefined && previousAgentType === nextAgentType
+  const sameToolName =
+    previous.payload.toolName !== undefined && previous.payload.toolName === next.payload.toolName
+  const sameKnownToolInput =
+    previous.payload.toolInput !== undefined &&
+    previous.payload.toolInput === next.payload.toolInput
+  const sameUnknownInputFromConcreteAgent =
+    hasMatchingConcreteAgentId &&
+    previous.payload.toolInput === undefined &&
+    next.payload.toolInput === undefined
+  const hasMatchingToolUseId =
+    previousToolUseId !== undefined && previousToolUseId === nextToolUseId
+  const hasConflictingToolUseId =
+    previousToolUseId !== undefined &&
+    nextToolUseId !== undefined &&
+    previousToolUseId !== nextToolUseId
+  const sameUnknownInputFromToolUseId =
+    hasMatchingToolUseId &&
+    previous.payload.toolInput === undefined &&
+    next.payload.toolInput === undefined
+
+  return (
+    (next.hookEventName === 'PreToolUse' || next.hookEventName === 'PostToolUse') &&
+    nextToolUseId !== undefined &&
+    !hasConflictingToolUseId &&
+    // Why: subagents can share `agent_type`; a concrete agent id is the
+    // strongest available signal that the permission owner resumed execution.
+    // Claude's approval path omits identity but preserves the original
+    // tool_use_id on PostToolUse, so that exact id is also a safe clear signal.
+    (hasMatchingConcreteAgentId || hasSameExplicitAgentType || hasMatchingToolUseId) &&
+    sameToolName &&
+    (sameKnownToolInput || sameUnknownInputFromConcreteAgent || sameUnknownInputFromToolUseId)
+  )
+}
+
+function shouldInheritClaudeToolUseIdForPermission(
+  previous: EnrichedAgentHookEventPayload | undefined,
+  next: AgentHookEventPayload
+): boolean {
+  if (
+    previous?.payload.agentType !== 'claude' ||
+    previous.payload.state !== 'working' ||
+    previous.hookEventName !== 'PreToolUse' ||
+    typeof previous.toolUseId !== 'string' ||
+    previous.toolUseId.trim().length === 0 ||
+    next.payload.agentType !== 'claude' ||
+    next.payload.state !== 'waiting' ||
+    next.hookEventName !== 'PermissionRequest' ||
+    next.toolUseId !== undefined
+  ) {
+    return false
+  }
+  const sameKnownToolInput =
+    previous.payload.toolInput !== undefined &&
+    previous.payload.toolInput === next.payload.toolInput
+  const sameUnknownToolInput =
+    previous.payload.toolInput === undefined && next.payload.toolInput === undefined
+  if (
+    previous.toolAgentId !== next.toolAgentId ||
+    previous.toolAgentType !== next.toolAgentType ||
+    previous.payload.toolName === undefined ||
+    previous.payload.toolName !== next.payload.toolName ||
+    (!sameKnownToolInput && !sameUnknownToolInput)
+  ) {
+    return false
+  }
+  return true
+}
+
+function attachClaudePermissionToolUseId(
+  previous: EnrichedAgentHookEventPayload | undefined,
+  next: AgentHookEventPayload
+): AgentHookEventPayload {
+  const inheritedToolUseId = previous?.toolUseId
+  if (
+    !shouldInheritClaudeToolUseIdForPermission(previous, next) ||
+    typeof inheritedToolUseId !== 'string'
+  ) {
+    return next
+  }
+  return {
+    ...next,
+    // Why: Claude emits PermissionRequest without tool_use_id, then reports the
+    // approved command as PostToolUse with the original PreToolUse id.
+    toolUseId: inheritedToolUseId
+  }
 }
 
 export class AgentHookServer {
@@ -236,6 +405,8 @@ export class AgentHookServer {
   // server instances in the same process (tests) don't share state.
   private statusPersistTimer: ReturnType<typeof setTimeout> | null = null
   private assistantMessageRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  private promptSentDedupeByPaneKey = new Map<string, AgentPromptSentDedupeEntry>()
+  private promptSentHashSalt = randomBytes(16).toString('hex')
   // Why: identity check — skip writes when the JSON-stringified contents
   // exactly match the last successful disk write. Cheap protection against
   // re-firing trailing timers when nothing changed.
@@ -255,7 +426,7 @@ export class AgentHookServer {
         // listener is the bare AgentHookEventPayload because the shared module
         // never reads from this map; only this class does, and only enriched
         // values are ever inserted.
-        listener(payload as EnrichedAgentHookEventPayload)
+        listener({ ...(payload as EnrichedAgentHookEventPayload), isReplay: true })
       } catch (err) {
         console.error('[agent-hooks] replay listener threw', err)
       }
@@ -277,6 +448,70 @@ export class AgentHookServer {
     return Array.from(this.state.lastStatusByPaneKey.values(), (entry) =>
       toAgentStatusIpcPayload(entry as EnrichedAgentHookEventPayload)
     )
+  }
+
+  inferInterrupt(request: AgentInterruptInferenceRequest): boolean {
+    if (!isValidPaneKey(request.paneKey)) {
+      return false
+    }
+    if (!isAgentInterruptInputIntent(request.intent)) {
+      return false
+    }
+    const existing = this.state.lastStatusByPaneKey.get(request.paneKey) as
+      | EnrichedAgentHookEventPayload
+      | undefined
+    if (!existing) {
+      return false
+    }
+    const payload = existing.payload
+    const agentType: AgentType | undefined = payload.agentType
+    // Why: Droid's Ctrl+C does not interrupt the current turn; repeated Ctrl+C
+    // exits the CLI, which is handled by process/PTY lifecycle cleanup.
+    if (agentType === 'droid' && request.intent === 'ctrl-c') {
+      return false
+    }
+    // Why: these agents use the first Escape as a TUI/editor cancel. A single
+    // Escape can leave the turn running, so only a deliberate double Escape
+    // may infer an interrupted turn.
+    if (
+      (agentType === 'opencode' || agentType === 'copilot') &&
+      request.intent === 'plain-escape' &&
+      request.inputCount !== 2
+    ) {
+      return false
+    }
+    // Why: input-intent inference is a fallback for a missing final hook. A strict
+    // baseline match keeps a delayed timer from overwriting any newer hook,
+    // including same-millisecond prompt or agent identity changes.
+    if (
+      payload.state !== 'working' ||
+      !equivalentInterruptAgentType(agentType, request.baselineAgentType) ||
+      payload.prompt !== request.baselinePrompt ||
+      existing.receivedAt !== request.baselineUpdatedAt ||
+      existing.stateStartedAt !== request.baselineStateStartedAt ||
+      Date.now() - existing.receivedAt > AGENT_STATUS_STALE_AFTER_MS
+    ) {
+      return false
+    }
+
+    const inferred = this.applyNormalizedStatus({
+      paneKey: existing.paneKey,
+      tabId: existing.tabId,
+      worktreeId: existing.worktreeId,
+      connectionId: existing.connectionId,
+      payload: {
+        state: 'done',
+        prompt: payload.prompt,
+        agentType,
+        interrupted: true
+      }
+    })
+    console.debug('[agent-hooks] inferred interrupted agent status', {
+      paneKey: inferred.paneKey,
+      agentType,
+      intent: request.intent
+    })
+    return true
   }
 
   getStatusChangeSnapshot(): AgentHookStatusChangeEntry[] {
@@ -318,11 +553,116 @@ export class AgentHookServer {
     }
   }
 
-  private applyNormalizedStatus(payload: AgentHookEventPayload): EnrichedAgentHookEventPayload {
-    if (payload.payload.state !== 'done' || payload.payload.lastAssistantMessage) {
-      this.clearAssistantMessageRetry(payload.paneKey)
+  private hashPromptForTelemetryDedupe(prompt: string): string {
+    return createHash('sha256')
+      .update(this.promptSentHashSalt)
+      .update('\0')
+      .update(prompt)
+      .digest('hex')
+  }
+
+  private maybeTrackAgentPromptSent(
+    payload: AgentHookEventPayload,
+    previousStatus: EnrichedAgentHookEventPayload | undefined
+  ): void {
+    if (payload.isReplay === true || payload.hasExplicitPrompt !== true) {
+      return
     }
-    const enriched = this.attachStatusTiming(payload)
+    const prompt = payload.payload.prompt?.trim() ?? ''
+    if (prompt.length === 0) {
+      return
+    }
+    const agentKind = agentTypeToPromptSentAgentKind(payload.payload.agentType)
+    const promptHash = this.hashPromptForTelemetryDedupe(prompt)
+    const promptInteractionKey =
+      typeof payload.promptInteractionKey === 'string' &&
+      payload.promptInteractionKey.trim().length > 0
+        ? payload.promptInteractionKey.trim()
+        : undefined
+    const previousDedupe = this.promptSentDedupeByPaneKey.get(payload.paneKey)
+    const isCompletedTurnBoundary =
+      previousStatus?.payload.state === 'done' && payload.payload.state === 'working'
+    if (
+      previousDedupe?.agentKind === agentKind &&
+      previousDedupe.promptInteractionKey !== undefined &&
+      previousDedupe.promptInteractionKey === promptInteractionKey &&
+      (agentKind === 'opencode' || previousDedupe.promptHash === promptHash)
+    ) {
+      return
+    }
+    if (
+      previousDedupe?.agentKind === agentKind &&
+      previousDedupe.promptHash === promptHash &&
+      !(
+        previousStatus?.payload.state === 'done' &&
+        payload.payload.state === 'done' &&
+        previousDedupe.promptInteractionKey !== undefined &&
+        promptInteractionKey !== undefined &&
+        previousDedupe.promptInteractionKey !== promptInteractionKey
+      ) &&
+      !isCompletedTurnBoundary
+    ) {
+      return
+    }
+    this.promptSentDedupeByPaneKey.set(payload.paneKey, {
+      agentKind,
+      promptHash,
+      promptInteractionKey
+    })
+    try {
+      // Why: hooks prove the user submitted a turn, but do not know which UI
+      // launched the terminal; keep attribution low-cardinality and conservative.
+      track('agent_prompt_sent', {
+        agent_kind: agentKind,
+        launch_source: 'unknown',
+        request_kind: 'followup',
+        ...getCohortAtEmit()
+      })
+    } catch (err) {
+      console.error('[agent-hooks] prompt-sent telemetry failed', err)
+    }
+  }
+
+  private applyNormalizedStatus(payload: AgentHookEventPayload): EnrichedAgentHookEventPayload {
+    const previous = this.state.lastStatusByPaneKey.get(payload.paneKey) as
+      | EnrichedAgentHookEventPayload
+      | undefined
+    const effectivePayload = attachClaudePermissionToolUseId(previous, payload)
+    if (previous && shouldKeepClaudePermissionVisible(previous, effectivePayload)) {
+      return previous
+    }
+    // Why: some TUIs can emit a delayed tool/working hook after Ctrl+C already
+    // stopped the turn. Do not let that stale same-turn event resurrect the row.
+    if (
+      previous?.payload.state === 'done' &&
+      previous.payload.interrupted === true &&
+      effectivePayload.payload.state === 'done' &&
+      previous.payload.agentType === effectivePayload.payload.agentType &&
+      previous.payload.prompt === effectivePayload.payload.prompt &&
+      Date.now() - previous.receivedAt <= INTERRUPTED_DONE_LATE_WORKING_SUPPRESSION_MS
+    ) {
+      return previous
+    }
+    if (
+      previous?.payload.state === 'done' &&
+      previous.payload.interrupted === true &&
+      effectivePayload.payload.state === 'working' &&
+      previous.payload.agentType === effectivePayload.payload.agentType &&
+      previous.payload.prompt === effectivePayload.payload.prompt &&
+      (effectivePayload.isReplay === true ||
+        (effectivePayload.hasExplicitPrompt !== true &&
+          Date.now() - previous.receivedAt <= INTERRUPTED_DONE_LATE_WORKING_SUPPRESSION_MS))
+    ) {
+      return previous
+    }
+    if (
+      effectivePayload.payload.state !== 'done' ||
+      effectivePayload.payload.lastAssistantMessage
+    ) {
+      this.clearAssistantMessageRetry(effectivePayload.paneKey)
+    }
+    this.maybeTrackAgentPromptSent(effectivePayload, previous)
+    const enriched = this.attachStatusTiming(effectivePayload)
     this.runtimeObservedStatusPaneKeys.add(enriched.paneKey)
     this.state.lastStatusByPaneKey.set(enriched.paneKey, enriched)
     this.scheduleStatusPersist()
@@ -457,6 +797,7 @@ export class AgentHookServer {
       if (entry.ptyId === ptyId) {
         this.legacyPaneKeyAliases.delete(legacyPaneKey)
         clearPaneCacheState(this.state, legacyPaneKey)
+        this.promptSentDedupeByPaneKey.delete(legacyPaneKey)
         const shouldClearStablePaneKey =
           options?.shouldClearStablePaneKey?.(entry.stablePaneKey) ?? true
         if (shouldClearStablePaneKey && this.state.lastStatusByPaneKey.has(entry.stablePaneKey)) {
@@ -468,6 +809,7 @@ export class AgentHookServer {
           // cleanup is the only path that can evict that retained status.
           clearPaneCacheState(this.state, entry.stablePaneKey)
           this.runtimeObservedStatusPaneKeys.delete(entry.stablePaneKey)
+          this.promptSentDedupeByPaneKey.delete(entry.stablePaneKey)
         }
         aliasChanged = true
       }
@@ -517,6 +859,13 @@ export class AgentHookServer {
       worktreeId?: string
       env?: string
       version?: string
+      hasExplicitPrompt?: boolean
+      promptInteractionKey?: string
+      hookEventName?: string
+      toolUseId?: string
+      toolAgentId?: string
+      toolAgentType?: string
+      isReplay?: boolean
       payload: unknown
     },
     connectionId: string
@@ -569,6 +918,27 @@ export class AgentHookServer {
       envelope.worktreeId !== undefined && envelope.worktreeId.trim().length > 0
         ? envelope.worktreeId.trim()
         : undefined
+    const hookEventName =
+      typeof envelope.hookEventName === 'string' && envelope.hookEventName.trim().length > 0
+        ? envelope.hookEventName.trim()
+        : undefined
+    const promptInteractionKey =
+      typeof envelope.promptInteractionKey === 'string' &&
+      envelope.promptInteractionKey.trim().length > 0
+        ? envelope.promptInteractionKey.trim()
+        : undefined
+    const toolUseId =
+      typeof envelope.toolUseId === 'string' && envelope.toolUseId.trim().length > 0
+        ? envelope.toolUseId.trim()
+        : undefined
+    const toolAgentId =
+      typeof envelope.toolAgentId === 'string' && envelope.toolAgentId.trim().length > 0
+        ? envelope.toolAgentId.trim()
+        : undefined
+    const toolAgentType =
+      typeof envelope.toolAgentType === 'string' && envelope.toolAgentType.trim().length > 0
+        ? envelope.toolAgentType.trim()
+        : undefined
     // Why: the relay is across a trust boundary; re-run the canonical
     // normalizer on the inner payload so prompt/agentType/toolName/toolInput
     // length caps, embedded-newline collapse, and the `interrupted`-only-on-
@@ -592,12 +962,23 @@ export class AgentHookServer {
       tabId,
       worktreeId,
       connectionId: trimmedConnectionId,
+      hasExplicitPrompt: envelope.hasExplicitPrompt === true ? true : undefined,
+      promptInteractionKey,
+      hookEventName,
+      toolUseId,
+      toolAgentId,
+      toolAgentType,
+      isReplay: envelope.isReplay === true ? true : undefined,
       payload: normalizedPayload
     }
     this.applyNormalizedStatus(event)
   }
 
-  async start(options?: { env?: string; userDataPath?: string }): Promise<void> {
+  async start(options?: {
+    env?: string
+    userDataPath?: string
+    endpointNamespace?: string
+  }): Promise<void> {
     if (this.server) {
       return
     }
@@ -606,7 +987,12 @@ export class AgentHookServer {
       this.env = options.env
     }
     if (options?.userDataPath) {
-      this.endpointDir = join(options.userDataPath, 'agent-hooks')
+      // Why: dev builds share one userData path, so callers can namespace the
+      // endpoint file by dev instance while packaged builds keep the stable path
+      // that lets long-lived PTYs reconnect after app restart.
+      this.endpointDir = options.endpointNamespace
+        ? join(options.userDataPath, 'agent-hooks', options.endpointNamespace)
+        : join(options.userDataPath, 'agent-hooks')
       this.endpointFilePathCache = join(this.endpointDir, getEndpointFileName())
       this.lastStatusFilePath = join(this.endpointDir, LAST_STATUS_FILE_NAME)
     }
@@ -719,6 +1105,7 @@ export class AgentHookServer {
     this.lastStatusFilePath = null
     this.lastWrittenJson = null
     this.runtimeObservedStatusPaneKeys.clear()
+    this.promptSentDedupeByPaneKey.clear()
     this.legacyPaneKeyAliases.clear()
     clearAllListenerCaches(this.state)
     this.notifyStatusChangeListeners()
@@ -736,9 +1123,13 @@ export class AgentHookServer {
     if (!this.state.lastStatusByPaneKey.has(resolvedPaneKey)) {
       return
     }
+    const existing = this.state.lastStatusByPaneKey.get(resolvedPaneKey)
     this.state.lastStatusByPaneKey.delete(resolvedPaneKey)
     this.clearAssistantMessageRetry(resolvedPaneKey)
     this.runtimeObservedStatusPaneKeys.delete(resolvedPaneKey)
+    if (existing?.payload.state === 'done') {
+      this.promptSentDedupeByPaneKey.delete(resolvedPaneKey)
+    }
     this.scheduleStatusPersist()
     this.notifyStatusChangeListeners()
   }
@@ -752,11 +1143,13 @@ export class AgentHookServer {
     const hadStatus = this.state.lastStatusByPaneKey.has(resolvedPaneKey)
     this.clearAssistantMessageRetry(resolvedPaneKey)
     clearPaneCacheState(this.state, resolvedPaneKey)
+    this.promptSentDedupeByPaneKey.delete(resolvedPaneKey)
     let clearedAlias = false
     for (const [legacyPaneKey, stablePaneKey] of this.legacyPaneKeyAliases) {
       if (stablePaneKey.stablePaneKey === resolvedPaneKey) {
         this.legacyPaneKeyAliases.delete(legacyPaneKey)
         clearPaneCacheState(this.state, legacyPaneKey)
+        this.promptSentDedupeByPaneKey.delete(legacyPaneKey)
         clearedAlias = true
       }
     }
@@ -781,6 +1174,9 @@ export class AgentHookServer {
       ORCA_AGENT_HOOK_ENV: this.env,
       ORCA_AGENT_HOOK_VERSION: ORCA_HOOK_PROTOCOL_VERSION
     }
+    // Why: managed hooks source this file at invocation time. Packaged builds
+    // use a stable file for restart handoff; dev callers pass a per-instance
+    // namespace so parallel `pnpm dev` runs do not steal each other's hooks.
     if (this.endpointFileWritten && this.endpointFilePathCache) {
       env.ORCA_AGENT_HOOK_ENDPOINT = this.endpointFilePathCache
     }
@@ -905,7 +1301,8 @@ export class AgentHookServer {
       if (!isValidPaneKey(paneKey)) {
         continue
       }
-      entries[paneKey] = payload as EnrichedAgentHookEventPayload
+      const { promptInteractionKey: _promptInteractionKey, ...persistedPayload } = payload
+      entries[paneKey] = persistedPayload as EnrichedAgentHookEventPayload
     }
     const file: LastStatusFile = { version: LAST_STATUS_FILE_VERSION, entries }
     return JSON.stringify(file)
@@ -985,6 +1382,10 @@ export class AgentHookServer {
   _getStateForTests(): HookListenerState {
     return this.state
   }
+
+  _resetPromptSentDedupeForTests(): void {
+    this.promptSentDedupeByPaneKey.clear()
+  }
 }
 
 export const agentHookServer = new AgentHookServer()
@@ -1002,5 +1403,6 @@ export const _internals = {
   parseFormEncodedBody,
   resetCachesForTests: (): void => {
     clearAllListenerCaches(agentHookServer._getStateForTests())
+    agentHookServer._resetPromptSentDedupeForTests()
   }
 }

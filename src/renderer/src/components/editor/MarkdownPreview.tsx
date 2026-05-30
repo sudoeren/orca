@@ -1,7 +1,15 @@
 /* eslint-disable max-lines -- Why: MarkdownPreview owns rendering, link interception,
 search, and viewport state for the preview surface in one place so markdown
 behavior stays coherent across split panes and preview tabs. */
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MutableRefObject
+} from 'react'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkBreaks from 'remark-breaks'
@@ -12,7 +20,6 @@ import rehypeKatex from 'rehype-katex'
 import rehypeRaw from 'rehype-raw'
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import rehypeSlug from 'rehype-slug'
-import GithubSlugger from 'github-slugger'
 import { extractFrontMatter } from './markdown-frontmatter'
 import {
   Check,
@@ -22,16 +29,10 @@ import {
   CornerDownLeft,
   MessageSquare,
   Plus,
-  Send,
   X
 } from 'lucide-react'
 import type { Components } from 'react-markdown'
 import { Button } from '@/components/ui/button'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuTrigger
-} from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
 import { useAppStore } from '@/store'
 import { toast } from 'sonner'
@@ -48,6 +49,7 @@ import {
 } from './markdown-preview-links'
 import {
   createMarkdownDocumentIndex,
+  getMarkdownDocLinkAnchor,
   parseMarkdownDocLinkHref,
   remarkMarkdownDocLinks,
   resolveMarkdownDocLink
@@ -64,32 +66,42 @@ import {
 } from './markdown-preview-search'
 import { usePreserveSectionDuringExternalEdit } from './usePreserveSectionDuringExternalEdit'
 import { openHttpLink } from '@/lib/http-link-routing'
+import { getShortcutPlatform } from '@/lib/shortcut-platform'
 import { isLocalPathOpenBlocked, showLocalPathOpenBlockedToast } from '@/lib/local-path-open-guard'
 import { markdownPreviewUrlTransform } from './markdown-preview-url-transform'
 import { settingsForRuntimeOwner } from '@/runtime/runtime-rpc-client'
 import { statRuntimePath } from '@/runtime/runtime-file-client'
+import { useMountedRef } from '@/hooks/useMountedRef'
 import { buildMarkdownTableOfContents } from './markdown-table-of-contents'
 import { MarkdownTableOfContentsPanel } from './MarkdownTableOfContentsPanel'
-import { getDiffCommentLineLabel, isMarkdownComment } from '@/lib/diff-comment-compat'
+import { isMarkdownComment } from '@/lib/diff-comment-compat'
 import { DiffCommentCard } from '../diff-comments/DiffCommentCard'
 import {
+  formatMarkdownReviewCardQuote,
   formatMarkdownReviewNotes,
-  getMarkdownReviewExcerpt,
+  getMarkdownReviewCardQuote,
   sortMarkdownReviewNotes,
   type MarkdownReviewNote
 } from '@/lib/markdown-review-notes'
-import { QuickLaunchAgentMenuItems } from '@/components/tab-bar/QuickLaunchButton'
-import { focusTerminalTabSurface } from '@/lib/focus-terminal-tab-surface'
+import { NotesSendMenu, type NotesSendMenuScope } from './NotesSendMenu'
+import { findWorktreeById } from '@/store/slices/worktree-helpers'
+import { dirname } from '@/lib/path'
 
 type MarkdownPreviewProps = {
   content: string
   filePath: string
+  sourceFileId?: string | null
+  sourceWorktreeId?: string | null
+  sourceRuntimeEnvironmentId?: string | null
   scrollCacheKey: string
   initialAnchor?: string | null
   showTableOfContents?: boolean
   onCloseTableOfContents?: () => void
   markdownDocuments?: MarkdownDocument[]
-  onOpenDocument?: (document: MarkdownDocument) => void | Promise<void>
+  onOpenDocument?: (
+    document: MarkdownDocument,
+    options?: { anchor?: string | null }
+  ) => void | Promise<void>
   markdownAnnotationsEnabled?: boolean
 }
 
@@ -100,6 +112,125 @@ type MarkdownPreviewPositionNode = {
     end?: { line?: number }
   }
   children?: MarkdownPreviewPositionNode[]
+}
+
+type MarkdownPreviewSourceOpenFile = {
+  id: string
+  filePath: string
+  relativePath: string
+  worktreeId: string
+  runtimeEnvironmentId?: string | null
+  mode: string
+  markdownPreviewSourceFileId?: string
+}
+
+function isMarkdownAnnotationNavigationClick(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) {
+    return false
+  }
+  return !target.closest(
+    'a,button,input,textarea,select,summary,[contenteditable="true"],.markdown-annotation-controls'
+  )
+}
+
+export function findMarkdownPreviewSourceOpenFile(
+  openFiles: MarkdownPreviewSourceOpenFile[],
+  params: {
+    sourceFileId: string | null
+    filePath: string
+    sourceWorktreeId: string | null
+    sourceRuntimeEnvironmentId: string | null | undefined
+  }
+): MarkdownPreviewSourceOpenFile | undefined {
+  const ownerMatches = (file: MarkdownPreviewSourceOpenFile): boolean =>
+    (!params.sourceWorktreeId || file.worktreeId === params.sourceWorktreeId) &&
+    (params.sourceRuntimeEnvironmentId === undefined ||
+      (file.runtimeEnvironmentId ?? null) === (params.sourceRuntimeEnvironmentId ?? null))
+
+  if (params.sourceFileId) {
+    const idMatch = openFiles.find((file) => file.id === params.sourceFileId && ownerMatches(file))
+    return (
+      idMatch ??
+      openFiles.find(
+        (file) =>
+          file.mode === 'markdown-preview' &&
+          file.filePath === params.filePath &&
+          file.markdownPreviewSourceFileId === params.sourceFileId &&
+          ownerMatches(file)
+      ) ??
+      openFiles.find((file) => file.id === params.sourceFileId)
+    )
+  }
+
+  return openFiles.find((file) => file.filePath === params.filePath && ownerMatches(file))
+}
+
+export function findMarkdownPreviewOpenedEditFileId(
+  openFiles: MarkdownPreviewSourceOpenFile[],
+  activeFileIdByWorktree: Record<string, string | null>,
+  params: { filePath: string; worktreeId: string }
+): string {
+  const activeFileId = activeFileIdByWorktree[params.worktreeId]
+  const activeFile = openFiles.find(
+    (file) =>
+      file.id === activeFileId &&
+      file.filePath === params.filePath &&
+      file.worktreeId === params.worktreeId &&
+      file.mode === 'edit'
+  )
+  if (activeFile) {
+    return activeFile.id
+  }
+  return (
+    openFiles.find(
+      (file) =>
+        file.filePath === params.filePath &&
+        file.worktreeId === params.worktreeId &&
+        file.mode === 'edit'
+    )?.id ?? params.filePath
+  )
+}
+
+export function getMarkdownPreviewAnchorScrollTop(
+  container: Pick<HTMLElement, 'getBoundingClientRect' | 'scrollTop'>,
+  target: Pick<HTMLElement, 'getBoundingClientRect'>
+): number {
+  const containerTop = container.getBoundingClientRect().top
+  const targetTop = target.getBoundingClientRect().top
+  return Math.max(0, targetTop - containerTop + container.scrollTop - 12)
+}
+
+function cancelMarkdownPreviewEditorRevealFrames(frameIds: MutableRefObject<number[]>): void {
+  for (const frameId of frameIds.current) {
+    cancelAnimationFrame(frameId)
+  }
+  frameIds.current = []
+}
+
+function clearMarkdownPreviewTimeout(timeoutRef: MutableRefObject<number | null>): void {
+  if (timeoutRef.current === null) {
+    return
+  }
+  window.clearTimeout(timeoutRef.current)
+  timeoutRef.current = null
+}
+
+function requestMarkdownPreviewEditorRevealFrame(
+  frameIds: MutableRefObject<number[]>,
+  callback: FrameRequestCallback
+): void {
+  let completed = false
+  let frameId: number | undefined
+  frameId = requestAnimationFrame((timestamp) => {
+    completed = true
+    if (frameId !== undefined) {
+      frameIds.current = frameIds.current.filter((pendingFrameId) => pendingFrameId !== frameId)
+    }
+    callback(timestamp)
+  })
+  if (!completed) {
+    frameIds.current.push(frameId)
+  }
 }
 
 function getMarkdownPreviewBlockRange(
@@ -114,6 +245,30 @@ function getMarkdownPreviewBlockRange(
     return null
   }
   return { startLine, endLine: Math.max(startLine, endLine) }
+}
+
+function getMarkdownPreviewReactText(node: React.ReactNode): string {
+  if (typeof node === 'string' || typeof node === 'number') {
+    return String(node)
+  }
+  if (!node || typeof node === 'boolean') {
+    return ''
+  }
+  if (Array.isArray(node)) {
+    return node.map(getMarkdownPreviewReactText).join(' ')
+  }
+  if (!React.isValidElement(node)) {
+    return ''
+  }
+  const props = node.props as { alt?: unknown; children?: React.ReactNode }
+  if (typeof props.alt === 'string' && props.alt.trim()) {
+    return props.alt
+  }
+  return getMarkdownPreviewReactText(props.children)
+}
+
+function getMarkdownPreviewAnnotationQuote(node: React.ReactNode): string | undefined {
+  return formatMarkdownReviewCardQuote(getMarkdownPreviewReactText(node))
 }
 
 function hasMarkdownPreviewNestedBlock(node: MarkdownPreviewPositionNode | undefined): boolean {
@@ -141,7 +296,12 @@ const markdownPreviewSanitizeSchema = {
       ['className', /^language-[\w-]+$/, 'math-inline', 'math-display']
     ],
     div: [...(defaultSchema.attributes?.div ?? []), ['className', /^language-[\w-]+$/], 'align'],
-    details: [...(defaultSchema.attributes?.details ?? []), 'open'],
+    details: [
+      ...(defaultSchema.attributes?.details ?? []),
+      'open',
+      ['className', 'orca-details'],
+      ['dataOrcaToggle', 'heading-1']
+    ],
     h1: [...(defaultSchema.attributes?.h1 ?? []), 'id'],
     h2: [...(defaultSchema.attributes?.h2 ?? []), 'id'],
     h3: [...(defaultSchema.attributes?.h3 ?? []), 'id'],
@@ -157,27 +317,6 @@ const markdownPreviewSanitizeSchema = {
   }
 }
 
-function getMarkdownPreviewNodeText(node: React.ReactNode): string {
-  if (typeof node === 'string' || typeof node === 'number') {
-    return String(node)
-  }
-  if (Array.isArray(node)) {
-    return node.map((child) => getMarkdownPreviewNodeText(child)).join('')
-  }
-  if (React.isValidElement<{ children?: React.ReactNode }>(node)) {
-    return getMarkdownPreviewNodeText(node.props.children)
-  }
-  return ''
-}
-
-// Why: use the same GithubSlugger that rehype-slug uses internally so
-// heading IDs match standard GitHub/VS Code anchor links. The custom
-// slugger previously stripped punctuation differently, breaking links
-// like `#a--b` for headings containing `A & B`.
-function createMarkdownPreviewHeadingId(headingText: string, slugger: GithubSlugger): string {
-  return slugger.slug(headingText)
-}
-
 function parseLineTarget(hash: string): { line: number; column?: number } | null {
   if (!hash) {
     return null
@@ -190,8 +329,54 @@ function parseLineTarget(hash: string): { line: number; column?: number } | null
   return { line: Number(match[1]), column: match[2] ? Number(match[2]) : undefined }
 }
 
+export function decodeMarkdownPreviewAnchor(rawAnchor: string): string {
+  try {
+    return decodeURIComponent(rawAnchor)
+  } catch {
+    return rawAnchor
+  }
+}
+
 function normalizeMarkdownPreviewAbsolutePath(absolutePath: string): string {
   return absolutePath.replaceAll('\\', '/')
+}
+
+function normalizeMarkdownPreviewRelativePath(relativePath: string): string {
+  return relativePath.replaceAll('\\', '/').replace(/^\/+/, '')
+}
+
+function isMarkdownPreviewAbsolutePathLike(path: string): boolean {
+  return path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path) || path.startsWith('\\\\')
+}
+
+function formatMarkdownPreviewRootPath(rootPath: string): string {
+  if (rootPath === '') {
+    return '/'
+  }
+  if (/^[A-Za-z]:$/.test(rootPath)) {
+    return `${rootPath}/`
+  }
+  return rootPath
+}
+
+export function deriveMarkdownPreviewSourceRoot(
+  filePath: string,
+  relativePath: string | null | undefined
+): string {
+  const normalizedFilePath = normalizeMarkdownPreviewAbsolutePath(filePath)
+  const normalizedRelativePath =
+    relativePath && !isMarkdownPreviewAbsolutePathLike(relativePath)
+      ? normalizeMarkdownPreviewRelativePath(relativePath)
+      : ''
+
+  if (normalizedRelativePath) {
+    const suffix = `/${normalizedRelativePath}`
+    if (normalizedFilePath.endsWith(suffix)) {
+      return formatMarkdownPreviewRootPath(normalizedFilePath.slice(0, -suffix.length))
+    }
+  }
+
+  return formatMarkdownPreviewRootPath(normalizeMarkdownPreviewAbsolutePath(dirname(filePath)))
 }
 
 function findWorktreeForMarkdownPreviewPath(
@@ -220,9 +405,24 @@ function findWorktreeForMarkdownPreviewPath(
   return bestMatch
 }
 
+export function resolveMarkdownPreviewSourceWorktree(
+  worktreesByRepo: Record<string, Worktree[]>,
+  sourceWorktreeId: string | null | undefined,
+  filePath: string
+): Worktree | null {
+  const sourceWorktree = sourceWorktreeId
+    ? (findWorktreeById(worktreesByRepo, sourceWorktreeId) ?? null)
+    : null
+
+  return sourceWorktree ?? findWorktreeForMarkdownPreviewPath(worktreesByRepo, filePath)
+}
+
 export default function MarkdownPreview({
   content,
   filePath,
+  sourceFileId = null,
+  sourceWorktreeId = null,
+  sourceRuntimeEnvironmentId = undefined,
   scrollCacheKey,
   initialAnchor = null,
   showTableOfContents = false,
@@ -236,6 +436,7 @@ export default function MarkdownPreview({
   const inputRef = useRef<HTMLInputElement>(null)
   const matchesRef = useRef<HTMLElement[]>([])
   const lastAppliedInitialAnchorRef = useRef<string | null>(null)
+  const pendingEditorRevealFrameIdsRef = useRef<number[]>([])
   const [isSearchOpen, setIsSearchOpen] = useState(false)
   const [query, setQuery] = useState('')
   const [matchCount, setMatchCount] = useState(0)
@@ -249,17 +450,37 @@ export default function MarkdownPreview({
   const addDiffComment = useAppStore((s) => s.addDiffComment)
   const deleteDiffComment = useAppStore((s) => s.deleteDiffComment)
   const updateDiffComment = useAppStore((s) => s.updateDiffComment)
-  const allDiffComments = useAppStore((s): DiffComment[] | undefined => {
-    const worktree = findWorktreeForMarkdownPreviewPath(s.worktreesByRepo, filePath)
-    return worktree?.diffComments
-  })
+  const clearDeliveredDiffComments = useAppStore((s) => s.clearDeliveredDiffComments)
+  const keybindings = useAppStore((s) => s.keybindings)
   const worktreesByRepo = useAppStore((s) => s.worktreesByRepo)
-  const sourceRuntimeEnvironmentId = useAppStore(
-    (s) => s.openFiles.find((file) => file.filePath === filePath)?.runtimeEnvironmentId
+  const sourceOpenFile = useAppStore((s) =>
+    findMarkdownPreviewSourceOpenFile(s.openFiles, {
+      sourceFileId,
+      filePath,
+      sourceWorktreeId,
+      sourceRuntimeEnvironmentId
+    })
   )
-  const sourceWorktree = findWorktreeForMarkdownPreviewPath(worktreesByRepo, filePath)
-  const sourceConnectionId = sourceWorktree ? getConnectionId(sourceWorktree.id) : null
-  const worktreeRoot = sourceWorktree?.path ?? null
+  const resolvedSourceWorktreeId = sourceWorktreeId ?? sourceOpenFile?.worktreeId ?? null
+  const resolvedSourceRuntimeEnvironmentId =
+    sourceRuntimeEnvironmentId !== undefined
+      ? sourceRuntimeEnvironmentId
+      : sourceOpenFile?.runtimeEnvironmentId
+  const sourceWorktree = resolveMarkdownPreviewSourceWorktree(
+    worktreesByRepo,
+    resolvedSourceWorktreeId,
+    filePath
+  )
+  const allDiffComments = sourceWorktree?.diffComments
+  const sourceRoutingWorktreeId = sourceWorktree?.id ?? resolvedSourceWorktreeId
+  const sourceConnectionId = sourceRoutingWorktreeId
+    ? (getConnectionId(sourceRoutingWorktreeId) ?? null)
+    : null
+  const worktreeRoot =
+    sourceWorktree?.path ??
+    (sourceRoutingWorktreeId
+      ? deriveMarkdownPreviewSourceRoot(filePath, sourceOpenFile?.relativePath)
+      : null)
   const sourceRelativePath = useMemo(() => {
     if (!sourceWorktree) {
       return null
@@ -284,15 +505,21 @@ export default function MarkdownPreview({
   const settings = useAppStore((s) => s.settings)
   const imageRuntimeContext = useMemo(
     () =>
-      sourceWorktree
+      sourceRoutingWorktreeId && worktreeRoot
         ? {
-            settings: settingsForRuntimeOwner(settings, sourceRuntimeEnvironmentId),
-            worktreeId: sourceWorktree.id,
-            worktreePath: sourceWorktree.path,
+            settings: settingsForRuntimeOwner(settings, resolvedSourceRuntimeEnvironmentId),
+            worktreeId: sourceRoutingWorktreeId,
+            worktreePath: worktreeRoot,
             connectionId: sourceConnectionId
           }
         : undefined,
-    [settings, sourceConnectionId, sourceRuntimeEnvironmentId, sourceWorktree]
+    [
+      settings,
+      sourceConnectionId,
+      resolvedSourceRuntimeEnvironmentId,
+      sourceRoutingWorktreeId,
+      worktreeRoot
+    ]
   )
   const editorFontZoomLevel = useAppStore((s) => s.editorFontZoomLevel)
   const editorFontSize = computeEditorFontSize(14, editorFontZoomLevel)
@@ -320,11 +547,15 @@ export default function MarkdownPreview({
       .replace(/\r?\n(?:---|\+\+\+)\r?\n?$/, '')
       .trim()
   }, [frontMatter])
-  const sluggerRef = useRef(new GithubSlugger())
   const [activeAnnotationBlockKey, setActiveAnnotationBlockKey] = useState<string | null>(null)
-  const [reviewPanelOpen, setReviewPanelOpen] = useState(false)
   const [reviewNotesCopied, setReviewNotesCopied] = useState(false)
+  const reviewNotesCopiedResetTimerRef = useRef<number | null>(null)
+  // Why: clipboard IPC can resolve after the preview unmounts; skip copied
+  // feedback instead of starting a reset timer on a stale preview.
+  const reviewNotesCopyMountedRef = useRef(false)
   const [activeReviewCommentId, setActiveReviewCommentId] = useState<string | null>(null)
+  const [attentionReviewCommentId, setAttentionReviewCommentId] = useState<string | null>(null)
+  const attentionReviewCommentTimeoutRef = useRef<number | null>(null)
   const markdownReviewNotes = useMemo(
     () => sortMarkdownReviewNotes(markdownComments as MarkdownReviewNote[]),
     [markdownComments]
@@ -333,9 +564,38 @@ export default function MarkdownPreview({
     () => formatMarkdownReviewNotes(markdownReviewNotes, renderedContent),
     [markdownReviewNotes, renderedContent]
   )
+  const unsentMarkdownReviewNotes = useMemo(
+    () => markdownReviewNotes.filter((note) => !note.sentAt),
+    [markdownReviewNotes]
+  )
+  const unsentMarkdownReviewPrompt = useMemo(
+    () => formatMarkdownReviewNotes(unsentMarkdownReviewNotes, renderedContent),
+    [renderedContent, unsentMarkdownReviewNotes]
+  )
+  const unsentMarkdownReviewScope = useMemo<NotesSendMenuScope<MarkdownReviewNote>[]>(
+    () => [
+      {
+        id: 'all',
+        label: 'All unsent notes',
+        notes: unsentMarkdownReviewNotes,
+        prompt: unsentMarkdownReviewPrompt
+      }
+    ],
+    [unsentMarkdownReviewNotes, unsentMarkdownReviewPrompt]
+  )
   const canShowReviewTools = Boolean(
     markdownAnnotationsEnabled && sourceWorktree && sourceRelativePath !== null
   )
+
+  useEffect(() => {
+    return () => {
+      // Why: review-note reveal/copy timers are event-owned, but the final
+      // cancellation belongs to the preview surface unmount.
+      cancelMarkdownPreviewEditorRevealFrames(pendingEditorRevealFrameIdsRef)
+      clearMarkdownPreviewTimeout(attentionReviewCommentTimeoutRef)
+      clearMarkdownPreviewTimeout(reviewNotesCopiedResetTimerRef)
+    }
+  }, [])
 
   // Why: each split pane needs its own markdown preview viewport even when the
   // underlying file is shared. The caller passes a pane-scoped cache key so
@@ -438,6 +698,24 @@ export default function MarkdownPreview({
     setActiveMatchIndex(-1)
   }, [])
 
+  const clearReviewNotesCopiedResetTimer = useCallback((): void => {
+    if (reviewNotesCopiedResetTimerRef.current !== null) {
+      window.clearTimeout(reviewNotesCopiedResetTimerRef.current)
+      reviewNotesCopiedResetTimerRef.current = null
+    }
+  }, [])
+
+  const setRootRef = useCallback(
+    (node: HTMLDivElement | null) => {
+      rootRef.current = node
+      reviewNotesCopyMountedRef.current = node !== null
+      if (node === null) {
+        clearReviewNotesCopiedResetTimer()
+      }
+    },
+    [clearReviewNotesCopiedResetTimer]
+  )
+
   const scrollToAnchor = useCallback((rawAnchor: string): boolean => {
     const container = rootRef.current
     const body = bodyRef.current
@@ -445,7 +723,7 @@ export default function MarkdownPreview({
       return false
     }
 
-    const decodedAnchor = decodeURIComponent(rawAnchor)
+    const decodedAnchor = decodeMarkdownPreviewAnchor(rawAnchor)
     let target: HTMLElement | null = null
     for (const candidate of body.querySelectorAll<HTMLElement>('[id]')) {
       if (candidate.id === decodedAnchor) {
@@ -457,8 +735,7 @@ export default function MarkdownPreview({
       return false
     }
 
-    const targetTop = target.offsetTop
-    container.scrollTo({ top: Math.max(0, targetTop - 12) })
+    container.scrollTo({ top: getMarkdownPreviewAnchorScrollTop(container, target) })
     target.focus({ preventScroll: true })
     return true
   }, [])
@@ -542,7 +819,7 @@ export default function MarkdownPreview({
       const targetInsidePreview = target instanceof Node && root.contains(target)
 
       if (
-        isMarkdownPreviewFindShortcut(event, navigator.userAgent.includes('Mac')) &&
+        isMarkdownPreviewFindShortcut(event, getShortcutPlatform(), keybindings) &&
         targetInsidePreview
       ) {
         event.preventDefault()
@@ -565,7 +842,7 @@ export default function MarkdownPreview({
 
     window.addEventListener('keydown', handleKeyDown, { capture: true })
     return () => window.removeEventListener('keydown', handleKeyDown, { capture: true })
-  }, [closeSearch, isSearchOpen, openSearch])
+  }, [closeSearch, isSearchOpen, keybindings, openSearch])
 
   const handleCopyMarkdownReviewNotes = useCallback(async (): Promise<void> => {
     if (markdownReviewNotes.length === 0) {
@@ -573,19 +850,63 @@ export default function MarkdownPreview({
     }
     try {
       await window.api.ui.writeClipboardText(markdownReviewPrompt)
+      if (!reviewNotesCopyMountedRef.current) {
+        return
+      }
+      clearReviewNotesCopiedResetTimer()
       setReviewNotesCopied(true)
+      reviewNotesCopiedResetTimerRef.current = window.setTimeout(() => {
+        reviewNotesCopiedResetTimerRef.current = null
+        setReviewNotesCopied(false)
+      }, 1600)
     } catch {
       // Best-effort clipboard action; failures usually mean the window is not focused.
     }
-  }, [markdownReviewNotes.length, markdownReviewPrompt])
+  }, [clearReviewNotesCopiedResetTimer, markdownReviewNotes.length, markdownReviewPrompt])
 
-  useEffect(() => {
-    if (!reviewNotesCopied) {
-      return
+  const pulseRenderedMarkdownReviewNote = useCallback((commentId: string): void => {
+    if (attentionReviewCommentTimeoutRef.current !== null) {
+      window.clearTimeout(attentionReviewCommentTimeoutRef.current)
     }
-    const timeout = window.setTimeout(() => setReviewNotesCopied(false), 1600)
-    return () => window.clearTimeout(timeout)
-  }, [reviewNotesCopied])
+    setAttentionReviewCommentId(null)
+    window.requestAnimationFrame(() => {
+      setAttentionReviewCommentId(commentId)
+      attentionReviewCommentTimeoutRef.current = window.setTimeout(() => {
+        setAttentionReviewCommentId(null)
+        attentionReviewCommentTimeoutRef.current = null
+      }, 900)
+    })
+  }, [])
+
+  const findRenderedMarkdownReviewNoteCard = useCallback(
+    (commentId: string): HTMLElement | null => {
+      const root = rootRef.current
+      if (!root) {
+        return null
+      }
+      return (
+        Array.from(root.querySelectorAll<HTMLElement>('[data-markdown-review-note-id]')).find(
+          (candidate) => candidate.dataset.markdownReviewNoteId === commentId
+        ) ?? null
+      )
+    },
+    []
+  )
+
+  const scrollRenderedMarkdownReviewNoteIntoView = useCallback(
+    (comment: DiffComment): void => {
+      setActiveReviewCommentId(comment.id)
+      pulseRenderedMarkdownReviewNote(comment.id)
+      window.requestAnimationFrame(() => {
+        findRenderedMarkdownReviewNoteCard(comment.id)?.scrollIntoView({
+          behavior: 'smooth',
+          block: 'center',
+          inline: 'nearest'
+        })
+      })
+    },
+    [findRenderedMarkdownReviewNoteCard, pulseRenderedMarkdownReviewNote]
+  )
 
   const scrollToReviewNote = useCallback((comment: DiffComment): void => {
     setActiveReviewCommentId(comment.id)
@@ -606,17 +927,44 @@ export default function MarkdownPreview({
     target?.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }, [])
 
+  const getMarkdownCommentsForRange = useCallback(
+    (range: { startLine: number; endLine: number }): DiffComment[] =>
+      markdownComments.filter(
+        (comment) => range.startLine <= comment.lineNumber && comment.lineNumber <= range.endLine
+      ),
+    [markdownComments]
+  )
+
+  const handleAnnotatedMarkdownBlockClick = useCallback(
+    (range: { startLine: number; endLine: number }, event: React.MouseEvent<HTMLElement>): void => {
+      if (!isMarkdownAnnotationNavigationClick(event.target)) {
+        return
+      }
+      const commentsForBlock = getMarkdownCommentsForRange(range)
+      const comment =
+        commentsForBlock.find((candidate) => candidate.id !== activeReviewCommentId) ??
+        commentsForBlock[0]
+      if (!comment) {
+        return
+      }
+      scrollRenderedMarkdownReviewNoteIntoView(comment)
+    },
+    [activeReviewCommentId, getMarkdownCommentsForRange, scrollRenderedMarkdownReviewNoteIntoView]
+  )
+
   const renderAnnotationControls = useCallback(
-    (range: { startLine: number; endLine: number }, blockKey: string): React.ReactNode => {
+    (
+      range: { startLine: number; endLine: number },
+      blockKey: string,
+      annotationQuote?: string
+    ): React.ReactNode => {
       if (!sourceWorktree || sourceRelativePath === null) {
         return null
       }
       if (!markdownAnnotationsEnabled) {
         return null
       }
-      const commentsForBlock = markdownComments.filter(
-        (comment) => range.startLine <= comment.lineNumber && comment.lineNumber <= range.endLine
-      )
+      const commentsForBlock = getMarkdownCommentsForRange(range)
 
       const handleSubmit = async (body: string): Promise<boolean> => {
         const result = await addDiffComment({
@@ -625,6 +973,7 @@ export default function MarkdownPreview({
           source: 'markdown',
           startLine: range.startLine === range.endLine ? undefined : range.startLine,
           lineNumber: range.endLine,
+          ...(annotationQuote ? { selectedText: annotationQuote } : {}),
           body,
           side: 'modified'
         })
@@ -640,7 +989,7 @@ export default function MarkdownPreview({
           <button
             type="button"
             className="markdown-annotation-add"
-            aria-label={`Add note on line ${range.startLine}`}
+            aria-label="Add note"
             title="Add note"
             onClick={(event) => {
               event.preventDefault()
@@ -658,32 +1007,59 @@ export default function MarkdownPreview({
               onSubmit={handleSubmit}
             />
           ) : null}
-          {commentsForBlock.map((comment) => (
-            <div
-              key={comment.id}
-              className={`markdown-annotation-card ${
-                activeReviewCommentId === comment.id ? 'is-active' : ''
-              }`.trim()}
-            >
-              <DiffCommentCard
-                lineNumber={comment.lineNumber}
-                startLine={comment.startLine}
-                body={comment.body}
-                onDelete={() => void deleteDiffComment(sourceWorktree.id, comment.id)}
-                onSubmitEdit={(body) => updateDiffComment(sourceWorktree.id, comment.id, body)}
-              />
-            </div>
-          ))}
+          <div className="markdown-annotation-note-stack">
+            {commentsForBlock.map((comment) => (
+              <div
+                key={comment.id}
+                data-markdown-review-note-id={comment.id}
+                className={`markdown-annotation-card ${
+                  activeReviewCommentId === comment.id ? 'is-active' : ''
+                } ${attentionReviewCommentId === comment.id ? 'is-attention' : ''}`.trim()}
+              >
+                <DiffCommentCard
+                  lineNumber={comment.lineNumber}
+                  startLine={comment.startLine}
+                  label={null}
+                  quote={
+                    formatMarkdownReviewCardQuote(comment.selectedText) ??
+                    annotationQuote ??
+                    getMarkdownReviewCardQuote(content, comment)
+                  }
+                  body={comment.body}
+                  sentAt={comment.sentAt}
+                  onDelete={() => void deleteDiffComment(sourceWorktree.id, comment.id)}
+                  onSubmitEdit={(body) => updateDiffComment(sourceWorktree.id, comment.id, body)}
+                  headerActions={
+                    <MarkdownSingleNoteSendMenu
+                      worktreeId={sourceWorktree.id}
+                      filePath={filePath}
+                      content={renderedContent}
+                      note={comment as MarkdownReviewNote}
+                      modeSlot="preview-inline"
+                      onDelivered={(notes) =>
+                        void clearDeliveredDiffComments(sourceWorktree.id, notes)
+                      }
+                    />
+                  }
+                />
+              </div>
+            ))}
+          </div>
         </div>
       )
     },
     [
       activeAnnotationBlockKey,
       activeReviewCommentId,
+      attentionReviewCommentId,
       addDiffComment,
+      clearDeliveredDiffComments,
       deleteDiffComment,
+      filePath,
+      getMarkdownCommentsForRange,
       markdownAnnotationsEnabled,
-      markdownComments,
+      content,
+      renderedContent,
       sourceRelativePath,
       sourceWorktree,
       updateDiffComment
@@ -701,27 +1077,31 @@ export default function MarkdownPreview({
         return rendered
       }
       const blockKey = `${tagName}:${range.startLine}-${range.endLine}`
-      const controls = renderAnnotationControls(range, blockKey)
+      const controls = renderAnnotationControls(
+        range,
+        blockKey,
+        getMarkdownPreviewAnnotationQuote(rendered)
+      )
       if (!controls) {
         return rendered
       }
+      const hasReviewNotes = getMarkdownCommentsForRange(range).length > 0
       return (
         <div
-          className="markdown-annotation-block"
+          className={`markdown-annotation-block ${hasReviewNotes ? 'has-review-notes' : ''}`.trim()}
           data-source-line={range.startLine}
           data-source-end-line={range.endLine}
+          onClick={(event) => handleAnnotatedMarkdownBlockClick(range, event)}
         >
           {rendered}
           {controls}
         </div>
       )
     },
-    [renderAnnotationControls]
+    [getMarkdownCommentsForRange, handleAnnotatedMarkdownBlockClick, renderAnnotationControls]
   )
 
   const components: Components = useMemo(() => {
-    sluggerRef.current.reset()
-    const slugger = sluggerRef.current
     return {
       a: ({ href, children, className, ...props }) => {
         const docLinkTarget = parseMarkdownDocLinkHref(href)
@@ -734,7 +1114,9 @@ export default function MarkdownPreview({
           const handleDocLinkClick = (event: React.MouseEvent<HTMLAnchorElement>): void => {
             event.preventDefault()
             if (resolvedDocument && onOpenDocument) {
-              void onOpenDocument(resolvedDocument)
+              void onOpenDocument(resolvedDocument, {
+                anchor: getMarkdownDocLinkAnchor(docLinkTarget)
+              })
             }
           }
 
@@ -790,7 +1172,7 @@ export default function MarkdownPreview({
                 isLocalPathOpenBlocked(
                   settingsForRuntimeOwner(
                     useAppStore.getState().settings,
-                    sourceRuntimeEnvironmentId
+                    resolvedSourceRuntimeEnvironmentId
                   ),
                   { connectionId: sourceConnectionId }
                 )
@@ -857,12 +1239,15 @@ export default function MarkdownPreview({
 
           const targetWorktree = findWorktreeForMarkdownPreviewPath(worktreesByRepo, absolutePath)
           if (!targetWorktree) {
-            if (sourceWorktree) {
+            if (sourceRoutingWorktreeId && worktreeRoot) {
+              // Why: floating markdown files are owned by a synthetic workspace,
+              // so there may be no repo worktree even though Orca can stat/open
+              // links relative to the source file root.
               void activateMarkdownLink(href, {
                 sourceFilePath: filePath,
-                worktreeId: sourceWorktree.id,
-                worktreeRoot: sourceWorktree.path,
-                runtimeEnvironmentId: sourceRuntimeEnvironmentId
+                worktreeId: sourceRoutingWorktreeId,
+                worktreeRoot,
+                runtimeEnvironmentId: resolvedSourceRuntimeEnvironmentId
               })
               return
             }
@@ -870,7 +1255,7 @@ export default function MarkdownPreview({
               isLocalPathOpenBlocked(
                 settingsForRuntimeOwner(
                   useAppStore.getState().settings,
-                  sourceRuntimeEnvironmentId
+                  resolvedSourceRuntimeEnvironmentId
                 ),
                 { connectionId: sourceConnectionId }
               )
@@ -891,7 +1276,7 @@ export default function MarkdownPreview({
               {
                 settings: settingsForRuntimeOwner(
                   useAppStore.getState().settings,
-                  sourceRuntimeEnvironmentId
+                  resolvedSourceRuntimeEnvironmentId
                 ),
                 worktreeId: targetWorktree.id,
                 worktreePath: targetWorktree.path,
@@ -911,22 +1296,30 @@ export default function MarkdownPreview({
           // Why: line targets like #L10 and path.ts:10 should reveal in Monaco,
           // not open a preview tab or a literal path with the suffix included.
           if (lineTarget) {
-            if (language === 'markdown') {
-              setMarkdownViewMode(absolutePath, 'source')
-            }
             openFile({
               filePath: absolutePath,
               relativePath,
               worktreeId: targetWorktree.id,
-              runtimeEnvironmentId: sourceRuntimeEnvironmentId,
+              runtimeEnvironmentId: resolvedSourceRuntimeEnvironmentId,
               language,
               mode: 'edit'
             })
+            const openedState = useAppStore.getState()
+            const targetFileId = findMarkdownPreviewOpenedEditFileId(
+              openedState.openFiles,
+              openedState.activeFileIdByWorktree,
+              { filePath: absolutePath, worktreeId: targetWorktree.id }
+            )
+            if (language === 'markdown') {
+              setMarkdownViewMode(targetFileId, 'source')
+            }
+            cancelMarkdownPreviewEditorRevealFrames(pendingEditorRevealFrameIdsRef)
             setPendingEditorReveal(null)
-            requestAnimationFrame(() => {
-              requestAnimationFrame(() => {
+            requestMarkdownPreviewEditorRevealFrame(pendingEditorRevealFrameIdsRef, () => {
+              requestMarkdownPreviewEditorRevealFrame(pendingEditorRevealFrameIdsRef, () => {
                 setPendingEditorReveal({
                   filePath: absolutePath,
+                  fileId: targetFileId,
                   line: lineTarget.line,
                   column: lineTarget.column ?? 1,
                   matchLength: 0
@@ -942,7 +1335,7 @@ export default function MarkdownPreview({
                 filePath: absolutePath,
                 relativePath,
                 worktreeId: targetWorktree.id,
-                runtimeEnvironmentId: sourceRuntimeEnvironmentId,
+                runtimeEnvironmentId: resolvedSourceRuntimeEnvironmentId,
                 language
               },
               { anchor: target.hash ? target.hash.slice(1) : null }
@@ -954,7 +1347,7 @@ export default function MarkdownPreview({
             filePath: absolutePath,
             relativePath,
             worktreeId: targetWorktree.id,
-            runtimeEnvironmentId: sourceRuntimeEnvironmentId,
+            runtimeEnvironmentId: resolvedSourceRuntimeEnvironmentId,
             language,
             mode: 'edit'
           })
@@ -982,7 +1375,7 @@ export default function MarkdownPreview({
             return
           }
 
-          if (!src || !sourceWorktree) {
+          if (!src || !sourceRoutingWorktreeId || !worktreeRoot) {
             return
           }
 
@@ -990,9 +1383,9 @@ export default function MarkdownPreview({
           event.stopPropagation()
           void activateMarkdownLink(src, {
             sourceFilePath: filePath,
-            worktreeId: sourceWorktree.id,
-            worktreeRoot: sourceWorktree.path,
-            runtimeEnvironmentId: sourceRuntimeEnvironmentId
+            worktreeId: sourceRoutingWorktreeId,
+            worktreeRoot,
+            runtimeEnvironmentId: resolvedSourceRuntimeEnvironmentId
           })
         }
 
@@ -1057,69 +1450,77 @@ export default function MarkdownPreview({
           return <li {...props}>{children}</li>
         }
         const blockKey = `li:${range.startLine}-${range.endLine}`
+        const hasReviewNotes = getMarkdownCommentsForRange(range).length > 0
         return (
-          <li {...props} data-source-line={range.startLine} data-source-end-line={range.endLine}>
-            {children}
-            {renderAnnotationControls(range, blockKey)}
+          <li {...props}>
+            <div
+              className={`markdown-annotation-list-block ${
+                hasReviewNotes ? 'has-review-notes' : ''
+              }`.trim()}
+              data-source-line={range.startLine}
+              data-source-end-line={range.endLine}
+              onClick={(event) => handleAnnotatedMarkdownBlockClick(range, event)}
+            >
+              <span className="markdown-annotation-list-content">{children}</span>
+              {renderAnnotationControls(
+                range,
+                blockKey,
+                getMarkdownPreviewAnnotationQuote(children)
+              )}
+            </div>
           </li>
         )
       },
       h1: ({ node, children, ...props }) => {
-        const id = createMarkdownPreviewHeadingId(getMarkdownPreviewNodeText(children), slugger)
         return wrapAnnotatedBlock(
           'h1',
           node as MarkdownPreviewPositionNode,
-          <h1 {...props} id={id} tabIndex={-1}>
+          <h1 {...props} tabIndex={-1}>
             {children}
           </h1>
         )
       },
       h2: ({ node, children, ...props }) => {
-        const id = createMarkdownPreviewHeadingId(getMarkdownPreviewNodeText(children), slugger)
         return wrapAnnotatedBlock(
           'h2',
           node as MarkdownPreviewPositionNode,
-          <h2 {...props} id={id} tabIndex={-1}>
+          <h2 {...props} tabIndex={-1}>
             {children}
           </h2>
         )
       },
       h3: ({ node, children, ...props }) => {
-        const id = createMarkdownPreviewHeadingId(getMarkdownPreviewNodeText(children), slugger)
         return wrapAnnotatedBlock(
           'h3',
           node as MarkdownPreviewPositionNode,
-          <h3 {...props} id={id} tabIndex={-1}>
+          <h3 {...props} tabIndex={-1}>
             {children}
           </h3>
         )
       },
       h4: ({ node, children, ...props }) => {
-        const id = createMarkdownPreviewHeadingId(getMarkdownPreviewNodeText(children), slugger)
         return wrapAnnotatedBlock(
           'h4',
           node as MarkdownPreviewPositionNode,
-          <h4 {...props} id={id} tabIndex={-1}>
+          <h4 {...props} tabIndex={-1}>
             {children}
           </h4>
         )
       },
       h5: ({ node, children, ...props }) => {
-        const id = createMarkdownPreviewHeadingId(getMarkdownPreviewNodeText(children), slugger)
         return wrapAnnotatedBlock(
           'h5',
           node as MarkdownPreviewPositionNode,
-          <h5 {...props} id={id} tabIndex={-1}>
+          <h5 {...props} tabIndex={-1}>
             {children}
           </h5>
         )
       },
       h6: ({ node, children, ...props }) => {
-        const id = createMarkdownPreviewHeadingId(getMarkdownPreviewNodeText(children), slugger)
         return wrapAnnotatedBlock(
           'h6',
           node as MarkdownPreviewPositionNode,
-          <h6 {...props} id={id} tabIndex={-1}>
+          <h6 {...props} tabIndex={-1}>
             {children}
           </h6>
         )
@@ -1134,6 +1535,8 @@ export default function MarkdownPreview({
     isDark,
     isMac,
     imageRuntimeContext,
+    getMarkdownCommentsForRange,
+    handleAnnotatedMarkdownBlockClick,
     markdownDocumentIndex,
     onOpenDocument,
     openFile,
@@ -1143,8 +1546,8 @@ export default function MarkdownPreview({
     setMarkdownViewMode,
     setPendingEditorReveal,
     sourceConnectionId,
-    sourceRuntimeEnvironmentId,
-    sourceWorktree,
+    resolvedSourceRuntimeEnvironmentId,
+    sourceRoutingWorktreeId,
     worktreeRoot,
     worktreesByRepo,
     wrapAnnotatedBlock
@@ -1153,7 +1556,7 @@ export default function MarkdownPreview({
   return (
     <div className="markdown-preview-shell">
       <div
-        ref={rootRef}
+        ref={setRootRef}
         tabIndex={0}
         style={{ fontSize: `${editorFontSize}px` }}
         className={`markdown-preview h-full min-h-0 overflow-auto scrollbar-editor ${isDark ? 'markdown-dark' : 'markdown-light'}`}
@@ -1235,9 +1638,15 @@ export default function MarkdownPreview({
             <button
               type="button"
               className="markdown-review-toolbar-button"
-              onClick={() => setReviewPanelOpen((open) => !open)}
-              aria-expanded={reviewPanelOpen}
-              title={reviewPanelOpen ? 'Hide review notes' : 'Show review notes'}
+              onClick={() => {
+                const firstNote = markdownReviewNotes[0]
+                if (firstNote) {
+                  scrollToReviewNote(firstNote)
+                }
+              }}
+              disabled={markdownReviewNotes.length === 0}
+              title="Jump to first review note"
+              aria-label="Jump to first review note"
             >
               <MessageSquare className="size-3.5" />
               <span>Review notes</span>
@@ -1254,29 +1663,14 @@ export default function MarkdownPreview({
               {reviewNotesCopied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
             </button>
             {sourceWorktree ? (
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <button
-                    type="button"
-                    className="markdown-review-icon-button"
-                    disabled={markdownReviewNotes.length === 0}
-                    title="Send notes to a new agent"
-                    aria-label="Send notes to a new agent"
-                  >
-                    <Send className="size-3.5" />
-                  </button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="min-w-[180px]">
-                  <QuickLaunchAgentMenuItems
-                    worktreeId={sourceWorktree.id}
-                    groupId={sourceWorktree.id}
-                    onFocusTerminal={focusTerminalTabSurface}
-                    prompt={markdownReviewPrompt}
-                    promptDelivery="draft"
-                    launchSource="notes_send"
-                  />
-                </DropdownMenuContent>
-              </DropdownMenu>
+              <NotesSendMenu
+                worktreeId={sourceWorktree.id}
+                groupId={sourceWorktree.id}
+                modeIdParts={['markdown-notes', sourceWorktree.id, filePath, 'preview-toolbar']}
+                scopes={unsentMarkdownReviewScope}
+                triggerClassName="markdown-review-icon-button"
+                onDelivered={(notes) => void clearDeliveredDiffComments(sourceWorktree.id, notes)}
+              />
             ) : null}
           </div>
         ) : null}
@@ -1322,21 +1716,6 @@ export default function MarkdownPreview({
           </Markdown>
         </div>
       </div>
-      {canShowReviewTools && reviewPanelOpen && sourceWorktree ? (
-        <MarkdownReviewNotesPanel
-          notes={markdownReviewNotes}
-          content={renderedContent}
-          activeId={activeReviewCommentId}
-          copied={reviewNotesCopied}
-          onClose={() => setReviewPanelOpen(false)}
-          onCopy={() => void handleCopyMarkdownReviewNotes()}
-          onSelect={scrollToReviewNote}
-          onDelete={(id) => void deleteDiffComment(sourceWorktree.id, id)}
-          onSubmitEdit={(id, body) => updateDiffComment(sourceWorktree.id, id, body)}
-          prompt={markdownReviewPrompt}
-          worktreeId={sourceWorktree.id}
-        />
-      ) : null}
       {showTableOfContents ? (
         <MarkdownTableOfContentsPanel
           items={tableOfContentsItems}
@@ -1348,123 +1727,43 @@ export default function MarkdownPreview({
   )
 }
 
-function MarkdownReviewNotesPanel({
-  notes,
+function MarkdownSingleNoteSendMenu({
+  worktreeId,
+  filePath,
   content,
-  activeId,
-  copied,
-  onClose,
-  onCopy,
-  onSelect,
-  onDelete,
-  onSubmitEdit,
-  prompt,
-  worktreeId
+  note,
+  modeSlot,
+  onDelivered
 }: {
-  notes: MarkdownReviewNote[]
-  content: string
-  activeId: string | null
-  copied: boolean
-  onClose: () => void
-  onCopy: () => void
-  onSelect: (note: MarkdownReviewNote) => void
-  onDelete: (id: string) => void
-  onSubmitEdit: (id: string, body: string) => Promise<boolean>
-  prompt: string
   worktreeId: string
+  filePath: string
+  content: string
+  note: MarkdownReviewNote
+  modeSlot: string
+  onDelivered: (notes: readonly MarkdownReviewNote[]) => void
 }): React.JSX.Element {
   return (
-    <aside className="markdown-review-panel">
-      <div className="markdown-review-panel-header">
-        <div className="markdown-review-panel-title">
-          <MessageSquare className="size-3.5" />
-          <span>Review notes</span>
-          <span className="markdown-review-count">{notes.length}</span>
-        </div>
-        <div className="markdown-review-panel-actions">
-          <button
-            type="button"
-            className="markdown-review-icon-button"
-            onClick={onCopy}
-            disabled={notes.length === 0}
-            title="Copy notes for agent"
-            aria-label="Copy notes for agent"
-          >
-            {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
-          </button>
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <button
-                type="button"
-                className="markdown-review-icon-button"
-                disabled={notes.length === 0}
-                title="Send notes to a new agent"
-                aria-label="Send notes to a new agent"
-              >
-                <Send className="size-3.5" />
-              </button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="min-w-[180px]">
-              <QuickLaunchAgentMenuItems
-                worktreeId={worktreeId}
-                groupId={worktreeId}
-                onFocusTerminal={focusTerminalTabSurface}
-                prompt={prompt}
-                promptDelivery="draft"
-                launchSource="notes_send"
-              />
-            </DropdownMenuContent>
-          </DropdownMenu>
-          <button
-            type="button"
-            className="markdown-review-icon-button"
-            onClick={onClose}
-            title="Close notes"
-            aria-label="Close notes"
-          >
-            <X className="size-3.5" />
-          </button>
-        </div>
-      </div>
-      <div className="markdown-review-note-list scrollbar-sleek">
-        {notes.length === 0 ? (
-          <div className="markdown-review-empty">No review notes for this file.</div>
-        ) : (
-          notes.map((note) => (
-            <div
-              key={note.id}
-              className={`markdown-review-note ${activeId === note.id ? 'is-active' : ''}`.trim()}
-            >
-              <button
-                type="button"
-                className="markdown-review-note-anchor"
-                onClick={() => onSelect(note)}
-              >
-                <span className="markdown-review-note-line">
-                  {getDiffCommentLineLabel(note, true)}
-                </span>
-                <span className="markdown-review-note-excerpt">
-                  {getMarkdownReviewExcerpt(content, note).replace(/^> /gm, '') || 'No preview'}
-                </span>
-              </button>
-              <DiffCommentCard
-                lineNumber={note.lineNumber}
-                startLine={note.startLine}
-                body={note.body}
-                onDelete={() => onDelete(note.id)}
-                onSubmitEdit={(body) => onSubmitEdit(note.id, body)}
-              />
-            </div>
-          ))
-        )}
-      </div>
-    </aside>
+    <NotesSendMenu
+      worktreeId={worktreeId}
+      groupId={worktreeId}
+      modeIdParts={['markdown-notes', worktreeId, filePath, modeSlot, note.id]}
+      scopes={[
+        {
+          id: 'note',
+          label: 'This note',
+          notes: note.sentAt ? [] : [note],
+          prompt: formatMarkdownReviewNotes([note], content)
+        }
+      ]}
+      targetModeLabel="This note"
+      triggerClassName="markdown-review-icon-button"
+      disabledTooltip="Note already sent"
+      onDelivered={onDelivered}
+    />
   )
 }
 
 function MarkdownAnnotationComposer({
-  lineNumber,
-  startLine,
   onCancel,
   onSubmit
 }: {
@@ -1476,15 +1775,12 @@ function MarkdownAnnotationComposer({
   const [body, setBody] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
+  const mountedRef = useMountedRef()
 
   useEffect(() => {
     textareaRef.current?.focus()
   }, [])
 
-  const label =
-    startLine !== undefined && startLine !== lineNumber
-      ? `Lines ${startLine}-${lineNumber}`
-      : `Line ${lineNumber}`
   const trimmed = body.trim()
 
   const submit = async (): Promise<void> => {
@@ -1494,17 +1790,22 @@ function MarkdownAnnotationComposer({
     setSubmitting(true)
     try {
       const ok = await onSubmit(trimmed)
+      if (!mountedRef.current) {
+        return
+      }
       if (ok) {
         setBody('')
       }
     } finally {
-      setSubmitting(false)
+      if (mountedRef.current) {
+        setSubmitting(false)
+      }
     }
   }
 
   return (
     <div className="markdown-annotation-composer" onClick={(event) => event.stopPropagation()}>
-      <div className="orca-diff-comment-popover-label">{label}</div>
+      <div className="orca-diff-comment-popover-label">Selected text</div>
       <textarea
         ref={textareaRef}
         className="orca-diff-comment-popover-textarea"

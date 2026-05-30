@@ -1,7 +1,8 @@
-import { CornerDownLeft, Pencil, Trash } from 'lucide-react'
+import { CornerDownLeft, Pencil, Trash, FileText } from 'lucide-react'
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { Button } from '@/components/ui/button'
 import { getDiffCommentLineLabel } from '@/lib/diff-comment-compat'
+import { useMountedRef } from '@/hooks/useMountedRef'
 
 // Why: the saved-note card lives inside a Monaco view zone's DOM node.
 // useDiffCommentDecorator creates a React root per zone and renders this
@@ -16,9 +17,14 @@ import { getDiffCommentLineLabel } from '@/lib/diff-comment-compat'
 type Props = {
   lineNumber: number
   startLine?: number
-  label?: string
+  label?: string | null
+  quote?: string
   body: string
-  onDelete: () => void
+  sentAt?: number
+  author?: string
+  createdAtLabel?: string
+  url?: string
+  onDelete?: () => void
   // Why: Monaco view zones have a fixed `heightInPx` set at insertion time
   // and aren't auto-measured. While the user is in edit mode the textarea
   // grows, so the parent decorator passes a callback we fire on resize and
@@ -32,7 +38,12 @@ export function DiffCommentCard({
   lineNumber,
   startLine,
   label,
+  quote,
   body,
+  sentAt,
+  author,
+  createdAtLabel,
+  url,
   onDelete,
   onContentResize,
   onSubmitEdit,
@@ -41,16 +52,8 @@ export function DiffCommentCard({
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(body)
   const [submitting, setSubmitting] = useState(false)
+  const mountedRef = useMountedRef()
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
-
-  // Why: keep the draft in sync with external body changes when not actively
-  // editing, so a concurrent agent edit (or a delete + recreate) is visible
-  // the next time the user opens the editor.
-  useEffect(() => {
-    if (!editing) {
-      setDraft(body)
-    }
-  }, [body, editing])
 
   // Why: stash `onContentResize` in a ref so the layout/resize effects only
   // re-run on `editing` transitions. The decorator passes a fresh arrow every
@@ -105,6 +108,11 @@ export function DiffCommentCard({
 
   const trimmedDraft = draft.trim()
   const canSubmit = !submitting && trimmedDraft.length > 0 && trimmedDraft !== body
+  const lineLabel =
+    label === undefined ? getDiffCommentLineLabel({ lineNumber, startLine }).toLowerCase() : label
+  const metaText = [author || 'Note', lineLabel, createdAtLabel || (sentAt ? 'sent' : null)]
+    .filter(Boolean)
+    .join(' ')
 
   const handleSubmit = async (): Promise<void> => {
     if (!canSubmit || !onSubmitEdit) {
@@ -113,7 +121,7 @@ export function DiffCommentCard({
     setSubmitting(true)
     try {
       const ok = await onSubmitEdit(trimmedDraft)
-      if (ok) {
+      if (ok && mountedRef.current) {
         setEditing(false)
       }
     } catch (err) {
@@ -123,109 +131,143 @@ export function DiffCommentCard({
       // (`void handleSubmit()`).
       console.error('Failed to submit diff comment edit:', err)
     } finally {
-      setSubmitting(false)
+      if (mountedRef.current) {
+        setSubmitting(false)
+      }
     }
   }
 
   return (
     <div className="orca-diff-comment-card">
-      <div className="orca-diff-comment-header">
-        <span className="orca-diff-comment-meta">
-          Note · {label ?? getDiffCommentLineLabel({ lineNumber, startLine }).toLowerCase()}
-        </span>
-        <div className="orca-diff-comment-actions">
-          {!editing && headerActions}
-          {onSubmitEdit && !editing && (
-            <button
-              type="button"
-              className="orca-diff-comment-edit"
-              title="Edit note"
-              aria-label="Edit note"
-              onMouseDown={(ev) => ev.stopPropagation()}
-              onClick={(ev) => {
-                ev.preventDefault()
-                ev.stopPropagation()
-                handleStartEdit()
-              }}
-            >
-              <Pencil className="size-3.5" />
-            </button>
-          )}
+      <div className="orca-diff-comment-content-col">
+        {/* Header Row */}
+        <div className="orca-diff-comment-header">
+          <div className="orca-diff-comment-meta-group">{metaText}</div>
+
+          {/* Action buttons pill (only shown if not editing) */}
           {!editing && (
-            <button
-              type="button"
-              className="orca-diff-comment-delete"
-              title="Delete note"
-              aria-label="Delete note"
+            <div
+              className="orca-diff-comment-actions-pill"
               onMouseDown={(ev) => ev.stopPropagation()}
-              onClick={(ev) => {
-                ev.preventDefault()
-                ev.stopPropagation()
-                onDelete()
-              }}
             >
-              <Trash className="size-3.5" />
-            </button>
+              {headerActions}
+              {headerActions && (url || onSubmitEdit || onDelete) && (
+                <span className="orca-diff-comment-pill-divider" />
+              )}
+              {url && (
+                <>
+                  <button
+                    type="button"
+                    className="orca-diff-comment-pill-btn"
+                    title="Open in browser"
+                    aria-label="Open in browser"
+                    onClick={(ev) => {
+                      ev.preventDefault()
+                      ev.stopPropagation()
+                      void window.api.shell.openUrl(url)
+                    }}
+                  >
+                    Open
+                  </button>
+                  {(onSubmitEdit || onDelete) && (
+                    <span className="orca-diff-comment-pill-divider" />
+                  )}
+                </>
+              )}
+              {onSubmitEdit && (
+                <>
+                  <button
+                    type="button"
+                    className="orca-diff-comment-pill-btn"
+                    title="Edit note"
+                    aria-label="Edit note"
+                    onClick={(ev) => {
+                      ev.preventDefault()
+                      ev.stopPropagation()
+                      handleStartEdit()
+                    }}
+                  >
+                    <Pencil className="size-3" />
+                  </button>
+                  {onDelete && <span className="orca-diff-comment-pill-divider" />}
+                </>
+              )}
+              {onDelete && (
+                <button
+                  type="button"
+                  className="orca-diff-comment-pill-btn orca-diff-comment-pill-btn-danger"
+                  title="Delete note"
+                  aria-label="Delete note"
+                  onClick={(ev) => {
+                    ev.preventDefault()
+                    ev.stopPropagation()
+                    onDelete()
+                  }}
+                >
+                  <Trash className="size-3" />
+                </button>
+              )}
+            </div>
           )}
         </div>
-      </div>
-      {editing ? (
-        <>
-          <textarea
-            ref={textareaRef}
-            className="orca-diff-comment-popover-textarea"
-            value={draft}
-            onChange={(e) => {
-              setDraft(e.target.value)
-              const el = e.currentTarget
-              el.style.height = 'auto'
-              el.style.height = `${Math.min(el.scrollHeight, 240)}px`
-              onContentResizeRef.current?.()
-            }}
-            onKeyDown={(e) => {
-              if (e.key === 'Escape') {
-                e.preventDefault()
-                handleCancel()
-                return
-              }
-              // Why: plain Enter saves to mirror the new-note popover; Shift
-              // +Enter keeps the newline. IME composition is excluded so a
-              // CJK conversion-confirm keystroke doesn't submit a half-typed
-              // note. Share the canSubmit predicate with the Save button so
-              // Enter doesn't quietly close the editor when empty/unchanged
-              // (the user must explicitly Cancel/Escape).
-              if (e.key === 'Enter' && !e.nativeEvent.isComposing && !e.shiftKey) {
-                e.preventDefault()
-                if (!canSubmit) {
+
+        {/* Quote Block */}
+        {quote ? (
+          <div className="orca-diff-comment-quote">
+            <FileText className="size-3.5 flex-shrink-0 text-amber-500 mt-0.5" />
+            <div className="orca-diff-comment-quote-text">{quote}</div>
+          </div>
+        ) : null}
+
+        {/* Body or Edit Mode */}
+        {editing ? (
+          <div className="flex flex-col gap-2 mt-1">
+            <textarea
+              ref={textareaRef}
+              className="orca-diff-comment-popover-textarea"
+              value={draft}
+              onChange={(e) => {
+                setDraft(e.target.value)
+                const el = e.currentTarget
+                el.style.height = 'auto'
+                el.style.height = `${Math.min(el.scrollHeight, 240)}px`
+                onContentResizeRef.current?.()
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') {
+                  e.preventDefault()
+                  handleCancel()
                   return
                 }
-                void handleSubmit()
-              }
-            }}
-            rows={3}
-          />
-          <div className="orca-diff-comment-popover-footer">
-            <Button variant="ghost" size="sm" onClick={handleCancel} disabled={submitting}>
-              Cancel
-            </Button>
-            <Button
-              size="sm"
-              onClick={() => void handleSubmit()}
-              disabled={!canSubmit}
-              // Why: keep the label "Save" while submitting so the button
-              // doesn't change width mid-flight; the disabled state alone
-              // signals the in-flight save. The title attribute surfaces the
-              // status for assistive tech.
-              title={submitting ? 'Saving…' : undefined}
-            >
-              Save
-              <CornerDownLeft className="ml-1 size-3 opacity-70" />
-            </Button>
+                if (e.key === 'Enter' && !e.nativeEvent.isComposing && !e.shiftKey) {
+                  e.preventDefault()
+                  if (!canSubmit) {
+                    return
+                  }
+                  void handleSubmit()
+                }
+              }}
+              rows={3}
+            />
+            <div className="orca-diff-comment-popover-footer">
+              <Button variant="ghost" size="sm" onClick={handleCancel} disabled={submitting}>
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => void handleSubmit()}
+                disabled={!canSubmit}
+                title={submitting ? 'Saving…' : undefined}
+              >
+                Save
+                <CornerDownLeft className="ml-1 size-3 opacity-70" />
+              </Button>
+            </div>
           </div>
-        </>
-      ) : (
-        <div className="orca-diff-comment-body">{body}</div>
-      )}
+        ) : (
+          <div className="orca-diff-comment-body">{body}</div>
+        )}
+      </div>
     </div>
   )
 }

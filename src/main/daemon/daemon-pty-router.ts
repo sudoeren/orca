@@ -55,6 +55,14 @@ export class DaemonPtyRouter implements IPtyProvider {
     await this.adapterFor(id).attach(id)
   }
 
+  hasPty(id: string): boolean {
+    const routed = this.sessionAdapters.get(id)
+    if (routed) {
+      return routed.hasPty(id)
+    }
+    return this.current.hasPty(id) || this.legacy.some((adapter) => adapter.hasPty(id))
+  }
+
   write(id: string, data: string): void {
     this.adapterFor(id).write(id, data)
   }
@@ -167,8 +175,14 @@ export class DaemonPtyRouter implements IPtyProvider {
     const killed: string[] = []
     for (const adapter of this.allAdapters()) {
       const result = await adapter.reconcileOnStartup(validWorktreeIds)
-      alive.push(...result.alive)
-      killed.push(...result.killed)
+      // Why: daemon startup can reconcile many restored sessions; spreading
+      // those arrays into push can exceed JavaScript's argument limit.
+      for (const id of result.alive) {
+        alive.push(id)
+      }
+      for (const id of result.killed) {
+        killed.push(id)
+      }
       for (const id of result.alive) {
         this.sessionAdapters.set(id, adapter)
       }

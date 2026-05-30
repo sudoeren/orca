@@ -70,6 +70,7 @@ function mockBrowserManager(
     getWorktreeIdForTab: (tabId: string) => worktrees.get(tabId),
     getGuestWebContentsId: vi.fn(() => null),
     ensureWebviewVisible: vi.fn(async () => () => {}),
+    acquireAutomationVisibility: vi.fn(async () => () => {}),
     ...overrides
   } as unknown as BrowserManager
 }
@@ -154,6 +155,40 @@ describe('AgentBrowserBridge', () => {
       (c[1] as string[]).includes('click')
     )
     expect(clickCall![1]).not.toContain('--cdp')
+  })
+
+  it('continues when stale agent-browser session close hangs during session creation', async () => {
+    vi.useFakeTimers()
+    try {
+      const closeKill = vi.fn()
+      execFileMock.mockImplementation(
+        (_bin: string, args: string[], _opts: unknown, cb: Function) => {
+          if (args.includes('close')) {
+            return { kill: closeKill }
+          }
+          if (args.includes('snapshot')) {
+            cb(null, JSON.stringify({ success: true, data: { snapshot: 'ready' } }), '')
+            return { kill: vi.fn() }
+          }
+          throw new Error(`unexpected agent-browser args ${args.join(' ')}`)
+        }
+      )
+
+      const promise = bridge.snapshot()
+      let settled = false
+      void promise.finally(() => {
+        settled = true
+      })
+
+      await vi.advanceTimersByTimeAsync(3_000)
+      await Promise.resolve()
+
+      expect(settled).toBe(true)
+      await expect(promise).resolves.toEqual({ browserPageId: 'tab-1', snapshot: 'ready' })
+      expect(closeKill).toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   // ── --json always appended ──
@@ -272,7 +307,9 @@ describe('AgentBrowserBridge', () => {
 
   it('strips --cdp and --session from exec commands', async () => {
     succeedWith({ output: 'ok' })
-    await bridge.exec('dblclick @e3 --cdp ws://evil --session hijack')
+    await bridge.exec(
+      'dblclick @e3 --cdp ws://evil --session hijack --cdp=ws://evil-equals --session=hijack-equals'
+    )
 
     // Why: find the actual exec call (contains 'dblclick'), not the stale-session close
     const execCall = execFileMock.mock.calls.find((c: unknown[]) =>
@@ -280,9 +317,11 @@ describe('AgentBrowserBridge', () => {
     )
     const args = execCall![1] as string[]
     // The bridge's own --session and --cdp (for session init) are expected.
-    // Verify the user-injected ones were stripped: no 'ws://evil' or 'hijack'
+    // Verify the user-injected ones were stripped, including --flag=value forms.
     expect(args.join(' ')).not.toContain('ws://evil')
+    expect(args.join(' ')).not.toContain('ws://evil-equals')
     expect(args.join(' ')).not.toContain('hijack')
+    expect(args.join(' ')).not.toContain('hijack-equals')
     expect(args).toContain('dblclick')
     expect(args).toContain('@e3')
   })
@@ -420,6 +459,100 @@ describe('AgentBrowserBridge', () => {
     expect(snapshotIdx).toBeLessThan(clickIdx)
   })
 
+  it('acquires an automation visibility lease while running snapshot commands', async () => {
+    const lifecycleEvents: string[] = []
+    const restore = vi.fn(() => {
+      lifecycleEvents.push('restore-100')
+    })
+    const acquireAutomationVisibility = vi.fn(async (webContentsId: number) => {
+      lifecycleEvents.push(`acquire-${webContentsId}`)
+      return restore
+    })
+
+    const b = new AgentBrowserBridge(
+      mockBrowserManager(undefined, undefined, {
+        acquireAutomationVisibility
+      })
+    )
+    b.setActiveTab(100)
+
+    let releaseSnapshot: (() => void) | null = null
+    execFileMock.mockImplementation(
+      (_bin: string, args: string[], _opts: unknown, cb: Function) => {
+        if (args.includes('close')) {
+          cb(null, JSON.stringify({ success: true, data: null }), '')
+          return
+        }
+        if (args.includes('snapshot')) {
+          lifecycleEvents.push('command-snapshot')
+          releaseSnapshot = () => {
+            cb(null, JSON.stringify({ success: true, data: { snapshot: 'tree' } }), '')
+          }
+          return
+        }
+        cb(null, JSON.stringify({ success: true, data: { ok: true } }), '')
+      }
+    )
+
+    const snapshot = b.snapshot()
+
+    await vi.waitFor(() => {
+      expect(releaseSnapshot).not.toBeNull()
+    })
+    expect(lifecycleEvents).toEqual(['acquire-100', 'command-snapshot'])
+    expect(restore).not.toHaveBeenCalled()
+
+    releaseSnapshot!()
+
+    await expect(snapshot).resolves.toEqual({ browserPageId: 'tab-1', snapshot: 'tree' })
+    expect(lifecycleEvents).toEqual(['acquire-100', 'command-snapshot', 'restore-100'])
+  })
+
+  it('clears reload fallback timer after the load event settles', async () => {
+    vi.useFakeTimers()
+    try {
+      succeedWith(null)
+      const wc = {
+        ...mockWebContents(100, 'https://reloaded.example', 'Reloaded'),
+        reload: vi.fn(),
+        on: vi.fn(),
+        removeListener: vi.fn()
+      }
+      webContentsFromIdMock.mockReturnValue(wc)
+
+      const result = bridge.reload()
+
+      await vi.waitFor(() => {
+        expect(wc.on).toHaveBeenCalledWith('did-finish-load', expect.any(Function))
+      })
+
+      const finishListener = wc.on.mock.calls.find(
+        ([event]) => event === 'did-finish-load'
+      )?.[1] as (() => void) | undefined
+      const failListener = wc.on.mock.calls.find(([event]) => event === 'did-fail-load')?.[1] as
+        | (() => void)
+        | undefined
+      expect(finishListener).toBeDefined()
+      expect(failListener).toBeDefined()
+      expect(vi.getTimerCount()).toBe(1)
+
+      finishListener!()
+
+      await expect(result).resolves.toEqual({
+        url: 'https://reloaded.example',
+        title: 'Reloaded'
+      })
+      expect(wc.removeListener).toHaveBeenCalledWith('did-finish-load', finishListener)
+      expect(wc.removeListener).toHaveBeenCalledWith('did-fail-load', failListener)
+      expect(vi.getTimerCount()).toBe(0)
+
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(wc.removeListener).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('serializes screenshot visibility prep across sessions', async () => {
     vi.useFakeTimers()
     try {
@@ -432,8 +565,8 @@ describe('AgentBrowserBridge', () => {
         ['tab-2', 'wt-2']
       ])
       const lifecycleEvents: string[] = []
-      const ensureWebviewVisibleMock = vi.fn(async (webContentsId: number) => {
-        lifecycleEvents.push(`ensure-${webContentsId}`)
+      const acquireAutomationVisibilityMock = vi.fn(async (webContentsId: number) => {
+        lifecycleEvents.push(`acquire-${webContentsId}`)
         return () => {
           lifecycleEvents.push(`restore-${webContentsId}`)
         }
@@ -449,7 +582,7 @@ describe('AgentBrowserBridge', () => {
 
       const b = new AgentBrowserBridge(
         mockBrowserManager(tabs, worktrees, {
-          ensureWebviewVisible: ensureWebviewVisibleMock
+          acquireAutomationVisibility: acquireAutomationVisibilityMock
         })
       )
       b.setActiveTab(1, 'wt-1')
@@ -489,9 +622,9 @@ describe('AgentBrowserBridge', () => {
       await Promise.resolve()
       await vi.advanceTimersByTimeAsync(300)
 
-      expect(lifecycleEvents).toContain('ensure-1')
+      expect(lifecycleEvents).toContain('acquire-1')
       expect(lifecycleEvents).toContain('command-orca-tab-tab-1')
-      expect(lifecycleEvents).not.toContain('ensure-2')
+      expect(lifecycleEvents).not.toContain('acquire-2')
 
       expect(releaseFirstScreenshot).not.toBeNull()
       releaseFirstScreenshot!()
@@ -503,7 +636,9 @@ describe('AgentBrowserBridge', () => {
       await Promise.resolve()
       await Promise.resolve()
 
-      expect(lifecycleEvents.indexOf('restore-1')).toBeLessThan(lifecycleEvents.indexOf('ensure-2'))
+      expect(lifecycleEvents.indexOf('restore-1')).toBeLessThan(
+        lifecycleEvents.indexOf('acquire-2')
+      )
 
       await vi.advanceTimersByTimeAsync(300)
       await expect(second).resolves.toEqual({
@@ -665,7 +800,9 @@ describe('AgentBrowserBridge', () => {
     )
 
     const runningSnapshot = bridge.snapshot()
-    await Promise.resolve()
+    await vi.waitFor(() => {
+      expect(resolveRunningCommand).not.toBeNull()
+    })
 
     const destroyPromise = (
       bridge as unknown as { destroySession: (name: string) => Promise<void> }
@@ -968,6 +1105,20 @@ describe('AgentBrowserBridge', () => {
     const args = execFileMock.mock.calls.at(-1)![1] as string[]
     expect(args).toContain('goto')
     expect(args).toContain('https://example.com')
+  })
+
+  it('builds valid fill eval JavaScript for multiline values', async () => {
+    succeedWith({ ok: true })
+
+    await bridge.fill('@textarea', "line one\nline two with 'quote' and \\ slash")
+
+    const evalCall = execFileMock.mock.calls.find((call: unknown[]) =>
+      (call[1] as string[]).includes('eval')
+    )
+    expect(evalCall).toBeDefined()
+    const args = evalCall![1] as string[]
+    const expression = args[args.indexOf('eval') + 1]
+    expect(() => new Function(expression)).not.toThrow()
   })
 
   // ── Cookie command arg building ──

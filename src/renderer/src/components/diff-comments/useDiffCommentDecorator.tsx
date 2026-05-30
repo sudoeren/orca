@@ -1,10 +1,17 @@
-import { useEffect, useRef } from 'react'
+/* eslint-disable max-lines -- Why: this hook owns the Monaco view-zone
+lifecycle, inline React roots, range selection, and scroll-to-comment
+coordination so those invariants stay in one place. */
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 import * as monaco from 'monaco-editor'
 import type { editor as monacoEditor, IDisposable } from 'monaco-editor'
 import { createRoot, type Root } from 'react-dom/client'
 import type { DiffComment } from '../../../../shared/types'
+import { getDiffCommentLineLabel } from '@/lib/diff-comment-compat'
+import { formatDiffComments } from '@/lib/diff-comments-format'
+import { useAppStore } from '@/store'
 import { DiffCommentCard } from './DiffCommentCard'
 import { getDiffCommentPopoverTop } from './diff-comment-popover-position'
+import { NotesSendMenu, type NotesSendMenuScope } from '../editor/NotesSendMenu'
 
 // Why: Monaco glyph-margin *decorations* don't expose click events in a way
 // that lets us show a polished popover anchored to a line. So instead we own a
@@ -14,11 +21,21 @@ import { getDiffCommentPopoverTop } from './diff-comment-popover-position'
 // than Monaco decorations, and we get pixel-accurate positioning via Monaco's
 // getTopForLineNumber.
 
+export type DecoratedDiffComment = DiffComment & {
+  author?: string
+  authorAvatarUrl?: string
+  createdAtLabel?: string
+  url?: string
+  canDelete?: boolean
+  canEdit?: boolean
+}
+
 type DecoratorArgs = {
   editor: monacoEditor.ICodeEditor | null
   filePath: string
   worktreeId: string
-  comments: DiffComment[]
+  comments: readonly DecoratedDiffComment[]
+  commentableLineNumbers?: readonly number[]
   addButtonLabel?: string
   onAddCommentClick: (args: { lineNumber: number; startLine?: number; top: number }) => void
   onDeleteComment: (commentId: string) => void
@@ -26,6 +43,7 @@ type DecoratorArgs = {
   // diffs persisted to WorktreeMeta). GitHub PR review surfaces don't pass
   // this — their notes are remote and can't be edited via this slice.
   onUpdateComment?: (commentId: string, body: string) => Promise<boolean>
+  formatCommentPrompt?: (comment: DecoratedDiffComment) => string
   // Why: pending-scroll request from the SourceControl sidebar. When this id
   // matches a comment in this surface the decorator reveals that line in the
   // editor and calls the ack callback so the same id can be requested again
@@ -43,7 +61,7 @@ type ZoneEntry = {
   // mutating the delegate is the supported way to grow a zone in place.
   delegate: monacoEditor.IViewZone
   root: Root
-  lastBody: string
+  lastRenderSignature: string
   // Why: Monaco invokes IViewZone.onDomNodeTop on every render once the zone
   // is in the layout. The first invocation is our deterministic "this zone is
   // now part of the editor's vertical layout" signal — equivalent in role to
@@ -56,22 +74,59 @@ type ZoneEntry = {
 // Why: card chrome (header/meta/border/padding) plus per-line body height. Used
 // in two places — the initial heightInPx estimate and the live resize during
 // inline edit — so keep them in lockstep.
-const ZONE_CHROME_PX = 52
-const ZONE_LINE_PX = 18
-const ZONE_MIN_PX = 72
+const ZONE_CHROME_PX = 68
+const ZONE_LINE_PX = 20
+const ZONE_MIN_PX = 88
+
+function getRenderSignature(
+  comment: DecoratedDiffComment,
+  formatCommentPrompt?: (comment: DecoratedDiffComment) => string
+): string {
+  return JSON.stringify({
+    body: comment.body,
+    sentAt: comment.sentAt ?? null,
+    author: comment.author ?? null,
+    authorAvatarUrl: comment.authorAvatarUrl ?? null,
+    createdAtLabel: comment.createdAtLabel ?? null,
+    url: comment.url ?? null,
+    canDelete: comment.canDelete ?? null,
+    canEdit: comment.canEdit ?? null,
+    sendPrompt: formatCommentPrompt ? formatCommentPrompt(comment) : null
+  })
+}
+
+function getSingleCommentSendScopes(
+  comment: DecoratedDiffComment,
+  formatCommentPrompt?: (comment: DecoratedDiffComment) => string
+): NotesSendMenuScope<DecoratedDiffComment>[] {
+  return [
+    {
+      id: 'note',
+      label: 'This note',
+      notes: comment.sentAt ? [] : [comment],
+      prompt: formatCommentPrompt ? formatCommentPrompt(comment) : formatDiffComments([comment])
+    }
+  ]
+}
 
 export function useDiffCommentDecorator({
   editor,
   filePath,
   worktreeId,
   comments,
+  commentableLineNumbers,
   addButtonLabel = 'Add note for the AI',
   onAddCommentClick,
   onDeleteComment,
   onUpdateComment,
+  formatCommentPrompt,
   pendingScrollCommentId,
   onPendingScrollConsumed
 }: DecoratorArgs): void {
+  const clearDeliveredDiffComments = useAppStore((s) => s.clearDeliveredDiffComments)
+  const activeGroupId = useAppStore((s) =>
+    worktreeId ? (s.activeGroupIdByWorktree[worktreeId] ?? worktreeId) : worktreeId
+  )
   const hoverLineRef = useRef<number | null>(null)
   // Why: one React root per view zone. Body updates re-render into the
   // existing root, so Monaco's zone DOM stays in place and only the card
@@ -94,6 +149,7 @@ export function useDiffCommentDecorator({
   // request-effect call the latest version without restructuring the
   // diff-zones effect into a hook-level helper.
   const scrollToZoneRef = useRef<((commentId: string) => void) | null>(null)
+  const scrollToZoneFrameRef = useRef<number | null>(null)
   // Why: stash the consumer callbacks in refs so the decorator effect's
   // cleanup does not run on every parent render. The parent passes inline
   // arrow functions; without this, each render would tear down and re-attach
@@ -106,6 +162,19 @@ export function useDiffCommentDecorator({
   onDeleteCommentRef.current = onDeleteComment
   onUpdateCommentRef.current = onUpdateComment
   onPendingScrollConsumedRef.current = onPendingScrollConsumed
+
+  const cancelScrollToZoneFrame = useCallback((): void => {
+    if (scrollToZoneFrameRef.current === null) {
+      return
+    }
+    cancelAnimationFrame(scrollToZoneFrameRef.current)
+    scrollToZoneFrameRef.current = null
+  }, [])
+
+  const commentableLineSet = useMemo(
+    () => (commentableLineNumbers ? new Set(commentableLineNumbers) : null),
+    [commentableLineNumbers]
+  )
 
   useEffect(() => {
     if (!editor) {
@@ -181,6 +250,24 @@ export function useDiffCommentDecorator({
       return editor.getTargetAtClientPoint(clientX, clientY)?.position?.lineNumber ?? null
     }
 
+    const canCommentOnLine = (lineNumber: number): boolean => {
+      return commentableLineSet === null || commentableLineSet.has(lineNumber)
+    }
+
+    const canCommentOnRange = (startLine: number, endLine: number): boolean => {
+      if (commentableLineSet === null) {
+        return true
+      }
+      const from = Math.min(startLine, endLine)
+      const to = Math.max(startLine, endLine)
+      for (let line = from; line <= to; line++) {
+        if (!commentableLineSet.has(line)) {
+          return false
+        }
+      }
+      return true
+    }
+
     const positionAtLine = (lineNumber: number): void => {
       const lineTop = editor.getTopForLineNumber(lineNumber) - editor.getScrollTop()
       const top = Math.round(lineTop + (getLineHeight() - BUTTON_SIZE) / 2)
@@ -202,6 +289,9 @@ export function useDiffCommentDecorator({
       if (!currentDrag) {
         return
       }
+      if (!canCommentOnRange(currentDrag.startLine, currentDrag.endLine)) {
+        return
+      }
       const startLine = Math.min(currentDrag.startLine, currentDrag.endLine)
       const lineNumber = Math.max(currentDrag.startLine, currentDrag.endLine)
       const top = getDiffCommentPopoverTop(editor, lineNumber, getLineHeight())
@@ -220,7 +310,12 @@ export function useDiffCommentDecorator({
         return
       }
       const line = getLineAtClientPoint(ev.clientX, ev.clientY)
-      if (line == null || line === dragState.endLine) {
+      if (
+        line == null ||
+        line === dragState.endLine ||
+        !canCommentOnLine(line) ||
+        !canCommentOnRange(dragState.startLine, line)
+      ) {
         return
       }
       dragState = { ...dragState, endLine: line }
@@ -231,7 +326,7 @@ export function useDiffCommentDecorator({
       ev.preventDefault()
       ev.stopPropagation()
       const line = hoverLineRef.current
-      if (line == null) {
+      if (line == null || !canCommentOnLine(line)) {
         return
       }
       dragState = { startLine: line, endLine: line }
@@ -253,7 +348,8 @@ export function useDiffCommentDecorator({
         return
       }
       const ln = e.target.position?.lineNumber ?? null
-      if (ln == null) {
+      if (ln == null || !canCommentOnLine(ln)) {
+        hoverLineRef.current = null
         setDisplay('none')
         return
       }
@@ -313,10 +409,11 @@ export function useDiffCommentDecorator({
       }
       // Why: editor went away — drop both the in-flight scroll request and
       // the resolver closure (which captured the now-disposed editor).
+      cancelScrollToZoneFrame()
       pendingScrollRef.current = null
       scrollToZoneRef.current = null
     }
-  }, [addButtonLabel, editor])
+  }, [addButtonLabel, cancelScrollToZoneFrame, commentableLineSet, editor])
 
   useEffect(() => {
     if (!editor) {
@@ -375,7 +472,9 @@ export function useDiffCommentDecorator({
     // guarantees we run after restoreViewState, so its cached scroll doesn't
     // snap the editor back from the requested note.
     const scrollToZone = (commentId: string): void => {
-      requestAnimationFrame(() => {
+      cancelScrollToZoneFrame()
+      scrollToZoneFrameRef.current = requestAnimationFrame(() => {
+        scrollToZoneFrameRef.current = null
         const entry = zones.get(commentId)
         if (!entry || !editor.getModel()) {
           return
@@ -395,15 +494,22 @@ export function useDiffCommentDecorator({
     // Why: render helper used by BOTH the new-zone branch and the patch-
     // existing-zone branch so the card's prop wiring stays in lockstep — any
     // future prop is added once.
-    const renderCard = (root: Root, comment: DiffComment): void => {
+    const renderCard = (root: Root, comment: DecoratedDiffComment): void => {
       root.render(
         <DiffCommentCard
           lineNumber={comment.lineNumber}
           startLine={comment.startLine}
+          label={comment.author ? getDiffCommentLineLabel(comment).toLowerCase() : undefined}
           body={comment.body}
-          onDelete={() => onDeleteCommentRef.current(comment.id)}
+          sentAt={comment.sentAt}
+          author={comment.author}
+          createdAtLabel={comment.createdAtLabel}
+          url={comment.url}
+          onDelete={
+            comment.canDelete === false ? undefined : () => onDeleteCommentRef.current(comment.id)
+          }
           onSubmitEdit={
-            onUpdateCommentRef.current
+            onUpdateCommentRef.current && comment.canEdit !== false
               ? async (body) => {
                   const fn = onUpdateCommentRef.current
                   if (!fn) {
@@ -414,6 +520,20 @@ export function useDiffCommentDecorator({
               : undefined
           }
           onContentResize={() => resizeZone(comment.id)}
+          headerActions={
+            worktreeId && comment.author === undefined ? (
+              <NotesSendMenu
+                worktreeId={worktreeId}
+                groupId={activeGroupId}
+                modeIdParts={['diff-comment-note', worktreeId, filePath, comment.id]}
+                scopes={getSingleCommentSendScopes(comment, formatCommentPrompt)}
+                targetModeLabel="This note"
+                triggerClassName="orca-diff-comment-edit"
+                disabledTooltip="Note already sent"
+                onDelivered={(notes) => void clearDeliveredDiffComments(worktreeId, notes)}
+              />
+            ) : null
+          }
         />
       )
     }
@@ -457,8 +577,8 @@ export function useDiffCommentDecorator({
         // insertion and does not re-measure the DOM node, so an underestimate
         // lets the card bleed into the following editor line. The constant
         // covers fixed chrome (inline wrapper padding ~10, card border 2, card
-        // padding 12, header+meta ~22, trailing breathing room) and the
-        // per-line factor matches the 12px/1.4 body line-height.
+        // padding 12, header+meta ~24, body margin 2) and the per-line factor
+        // matches the 13.5px/1.5 body line-height.
         const lineCount = c.body.split('\n').length
         const heightInPx = Math.max(ZONE_MIN_PX, ZONE_CHROME_PX + lineCount * ZONE_LINE_PX)
 
@@ -498,23 +618,24 @@ export function useDiffCommentDecorator({
           domNode: dom,
           delegate,
           root,
-          lastBody: c.body,
+          lastRenderSignature: getRenderSignature(c, formatCommentPrompt),
           laidOut: false
         })
       }
 
-      // Patch existing zones whose body text changed in place — re-render the
-      // same root with new props instead of removing/re-adding the zone.
+      // Patch existing zones whose visible props changed in place — re-render
+      // the same root instead of removing/re-adding the zone.
       for (const c of relevant) {
         const entry = zones.get(c.id)
         if (!entry) {
           continue
         }
-        if (entry.lastBody === c.body) {
+        const renderSignature = getRenderSignature(c, formatCommentPrompt)
+        if (entry.lastRenderSignature === renderSignature) {
           continue
         }
         renderCard(entry.root, c)
-        entry.lastBody = c.body
+        entry.lastRenderSignature = renderSignature
       }
     })
 
@@ -532,7 +653,16 @@ export function useDiffCommentDecorator({
     // forcing a full rebuild — exactly the flicker this diff-based pass is
     // meant to avoid. Zone teardown lives in the editor-scoped effect above,
     // which only fires when the editor itself is replaced/unmounted.
-  }, [editor, filePath, worktreeId, comments])
+  }, [
+    activeGroupId,
+    cancelScrollToZoneFrame,
+    clearDeliveredDiffComments,
+    editor,
+    filePath,
+    formatCommentPrompt,
+    worktreeId,
+    comments
+  ])
 
   // Why: route a sidebar scroll-to-note request into the decorator. We mirror
   // VS Code's commentsController.revealCommentThread (which awaits
@@ -549,6 +679,7 @@ export function useDiffCommentDecorator({
     // diff) must drop any in-flight pending id so a late onDomNodeTop on a
     // previously-requested zone doesn't snap-scroll the user.
     if (!pendingScrollCommentId) {
+      cancelScrollToZoneFrame()
       pendingScrollRef.current = null
       return
     }
@@ -561,6 +692,7 @@ export function useDiffCommentDecorator({
       // file/worktree). Drop any prior pending id so a late onDomNodeTop on a
       // previously-requested zone in this decorator can't fire scrollToZone and
       // ack — which would clear the global request meant for the owning surface.
+      cancelScrollToZoneFrame()
       pendingScrollRef.current = null
       return
     }
@@ -571,5 +703,5 @@ export function useDiffCommentDecorator({
     }
     // If !laidOut we wait — onDomNodeTop on the zone will pick the request
     // up and call scrollToZone once Monaco's render pass places the zone.
-  }, [editor, comments, pendingScrollCommentId, filePath, worktreeId])
+  }, [cancelScrollToZoneFrame, editor, comments, pendingScrollCommentId, filePath, worktreeId])
 }

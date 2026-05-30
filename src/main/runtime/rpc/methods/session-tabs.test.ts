@@ -9,6 +9,179 @@ function makeRequest(method: string, params?: unknown): RpcRequest {
 }
 
 describe('session tab RPC methods', () => {
+  it('dispatches tab moves through the runtime', async () => {
+    const runtime = {
+      getRuntimeId: () => 'test-runtime',
+      moveMobileSessionTab: vi.fn().mockResolvedValue({
+        moved: true
+      })
+    } as unknown as OrcaRuntimeService
+    const dispatcher = new RpcDispatcher({ runtime, methods: SESSION_TAB_METHODS })
+
+    const response = await dispatcher.dispatch(
+      makeRequest('session.tabs.move', {
+        worktree: 'id:wt-1',
+        tabId: 'tab-1::leaf-1',
+        targetGroupId: 'group-left',
+        kind: 'reorder',
+        tabOrder: ['tab-2::leaf-1', 'tab-1::leaf-1']
+      })
+    )
+
+    expect(response.ok).toBe(true)
+    expect(runtime.moveMobileSessionTab).toHaveBeenCalledWith('id:wt-1', {
+      tabId: 'tab-1::leaf-1',
+      targetGroupId: 'group-left',
+      kind: 'reorder',
+      tabOrder: ['tab-2::leaf-1', 'tab-1::leaf-1']
+    })
+  })
+
+  it('rejects ambiguous tab move payloads', async () => {
+    const runtime = {
+      getRuntimeId: () => 'test-runtime',
+      moveMobileSessionTab: vi.fn()
+    } as unknown as OrcaRuntimeService
+    const dispatcher = new RpcDispatcher({ runtime, methods: SESSION_TAB_METHODS })
+
+    const response = await dispatcher.dispatch(
+      makeRequest('session.tabs.move', {
+        worktree: 'id:wt-1',
+        tabId: 'tab-1',
+        targetGroupId: 'group-1',
+        kind: 'reorder',
+        splitDirection: 'right',
+        tabOrder: ['tab-1']
+      })
+    )
+
+    expect(response.ok).toBe(false)
+    expect(runtime.moveMobileSessionTab).not.toHaveBeenCalled()
+  })
+
+  it('dispatches split tab moves without reorder-only fields', async () => {
+    const runtime = {
+      getRuntimeId: () => 'test-runtime',
+      moveMobileSessionTab: vi.fn().mockResolvedValue({ moved: true })
+    } as unknown as OrcaRuntimeService
+    const dispatcher = new RpcDispatcher({ runtime, methods: SESSION_TAB_METHODS })
+
+    const response = await dispatcher.dispatch(
+      makeRequest('session.tabs.move', {
+        worktree: 'id:wt-1',
+        tabId: 'tab-1',
+        targetGroupId: 'group-2',
+        kind: 'split',
+        splitDirection: 'right'
+      })
+    )
+
+    expect(response.ok).toBe(true)
+    expect(runtime.moveMobileSessionTab).toHaveBeenCalledWith('id:wt-1', {
+      tabId: 'tab-1',
+      targetGroupId: 'group-2',
+      kind: 'split',
+      splitDirection: 'right'
+    })
+  })
+
+  it('dispatches terminal creation with the requested tab group', async () => {
+    const runtime = {
+      getRuntimeId: () => 'test-runtime',
+      createMobileSessionTerminal: vi.fn().mockResolvedValue({
+        tab: {
+          type: 'terminal',
+          id: 'tab-1::leaf-1',
+          parentTabId: 'tab-1',
+          leafId: 'leaf-1',
+          title: 'Terminal',
+          status: 'ready',
+          terminal: 'pty-1',
+          isActive: true
+        },
+        publicationEpoch: 'epoch-1',
+        snapshotVersion: 1
+      })
+    } as unknown as OrcaRuntimeService
+    const dispatcher = new RpcDispatcher({ runtime, methods: SESSION_TAB_METHODS })
+
+    const response = await dispatcher.dispatch(
+      makeRequest('session.tabs.createTerminal', {
+        worktree: 'id:wt-1',
+        targetGroupId: 'group-left',
+        command: 'zsh',
+        activate: true
+      })
+    )
+
+    expect(response.ok).toBe(true)
+    expect(runtime.createMobileSessionTerminal).toHaveBeenCalledWith('id:wt-1', {
+      afterTabId: undefined,
+      targetGroupId: 'group-left',
+      command: 'zsh',
+      agent: undefined,
+      activate: true
+    })
+  })
+
+  it('dispatches terminal creation with a requested agent preset', async () => {
+    const runtime = {
+      getRuntimeId: () => 'test-runtime',
+      createMobileSessionTerminal: vi.fn().mockResolvedValue({
+        tab: {
+          type: 'terminal',
+          id: 'tab-1::leaf-1',
+          parentTabId: 'tab-1',
+          leafId: 'leaf-1',
+          title: 'Terminal',
+          status: 'ready',
+          terminal: 'pty-1',
+          isActive: true
+        },
+        publicationEpoch: 'epoch-1',
+        snapshotVersion: 1
+      })
+    } as unknown as OrcaRuntimeService
+    const dispatcher = new RpcDispatcher({ runtime, methods: SESSION_TAB_METHODS })
+
+    const response = await dispatcher.dispatch(
+      makeRequest('session.tabs.createTerminal', {
+        worktree: 'id:wt-1',
+        agent: 'codex'
+      })
+    )
+
+    expect(response.ok).toBe(true)
+    expect(runtime.createMobileSessionTerminal).toHaveBeenCalledWith('id:wt-1', {
+      afterTabId: undefined,
+      targetGroupId: undefined,
+      command: undefined,
+      agent: 'codex',
+      activate: undefined
+    })
+  })
+
+  it('rejects unknown agent presets without creating a terminal', async () => {
+    const runtime = {
+      getRuntimeId: () => 'test-runtime',
+      createMobileSessionTerminal: vi.fn()
+    } as unknown as OrcaRuntimeService
+    const dispatcher = new RpcDispatcher({ runtime, methods: SESSION_TAB_METHODS })
+
+    const response = await dispatcher.dispatch(
+      makeRequest('session.tabs.createTerminal', {
+        worktree: 'id:wt-1',
+        agent: 'not-real'
+      })
+    )
+
+    expect(response.ok).toBe(false)
+    expect(response).toMatchObject({
+      error: { code: 'invalid_argument', message: 'Unknown agent preset' }
+    })
+    expect(runtime.createMobileSessionTerminal).not.toHaveBeenCalled()
+  })
+
   it('streams all known session tab snapshots and later updates', async () => {
     const unsubscribe = vi.fn()
     const listeners: ((snapshot: unknown) => void)[] = []

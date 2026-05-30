@@ -6,6 +6,7 @@ import {
   AGENT_STATE_HISTORY_MAX,
   type AgentStateHistoryEntry,
   type AgentStatusEntry,
+  type AgentStatusOrchestrationContext,
   type AgentType,
   type MigrationUnsupportedPtyEntry,
   type ParsedAgentStatusPayload
@@ -54,7 +55,7 @@ export type AgentStatusSlice = {
   /** Update or insert an agent status entry from a status payload. */
   setAgentStatus: (
     paneKey: string,
-    payload: ParsedAgentStatusPayload,
+    payload: ParsedAgentStatusPayload & { orchestration?: AgentStatusOrchestrationContext },
     terminalTitle?: string,
     timing?: { updatedAt?: number; stateStartedAt?: number }
   ) => void
@@ -123,6 +124,31 @@ function paneKeyMatchesAnyTabPrefix(paneKey: string, tabPrefixes: string[]): boo
   return false
 }
 
+function isAgentCompletionState(state: ParsedAgentStatusPayload['state']): boolean {
+  return state === 'done' || state === 'waiting' || state === 'blocked'
+}
+
+function getTabIdFromPaneKey(paneKey: string): string | null {
+  const separator = paneKey.indexOf(':')
+  if (separator <= 0 || separator !== paneKey.lastIndexOf(':')) {
+    return null
+  }
+  return paneKey.slice(0, separator)
+}
+
+function findAgentPaneWorktreeId(state: AppState, paneKey: string): string | null {
+  const tabId = getTabIdFromPaneKey(paneKey)
+  if (!tabId) {
+    return null
+  }
+  for (const [worktreeId, tabs] of Object.entries(state.tabsByWorktree)) {
+    if (tabs.some((tab) => tab.id === tabId)) {
+      return worktreeId
+    }
+  }
+  return null
+}
+
 function pruneMigrationUnsupportedEntries(
   entries: Record<string, MigrationUnsupportedPtyEntry>,
   predicate: (entry: MigrationUnsupportedPtyEntry) => boolean
@@ -172,6 +198,7 @@ export const createAgentStatusSlice: StateCreator<AppState, [], [], AgentStatusS
 
     setAgentStatus: (paneKey, payload, terminalTitle, timing) => {
       const updatedAt = timing?.updatedAt ?? Date.now()
+      let completionRefreshWorktreeId: string | null = null
       set((s) => {
         const existing = s.agentStatusByPaneKey[paneKey]
         // Why: snapshots and live pushes share receivedAt from the same main-side
@@ -252,17 +279,30 @@ export const createAgentStatusSlice: StateCreator<AppState, [], [], AgentStatusS
           toolName: payload.toolName,
           toolInput: payload.toolInput,
           lastAssistantMessage: payload.lastAssistantMessage,
+          // Why: orchestration dispatch metadata may disappear after the
+          // worker completes and the active dispatch closes. Preserve the last
+          // known parent-child link so done/retained rows stay grouped.
+          orchestration: payload.orchestration ?? existing?.orchestration,
           // Why: interrupted lives on `done` only. parseAgentStatusPayload
           // already clamps it to `undefined` for non-done states, so writing
           // the field through directly preserves truth for done and resets
           // it when a new turn starts (working → Stop reprices it).
           interrupted: payload.interrupted
         }
+        if (
+          isAgentCompletionState(entry.state) &&
+          existing !== undefined &&
+          !isAgentCompletionState(existing.state)
+        ) {
+          completionRefreshWorktreeId = findAgentPaneWorktreeId(s, paneKey)
+        }
         // Why: broad freshness-aware subscribers only need a global tick when
-        // an entry appears, changes state, or crosses stale->fresh. Same-state
-        // tool/prompt pings still update agentStatusByPaneKey for the owning
-        // row, but they must not fan out through dashboard/sidebar aggregate
-        // work across every card. Sort-relevant inputs are:
+        // an entry appears, changes state, crosses stale->fresh, or receives
+        // a same-state `done` update that may carry the final assistant
+        // message for retained rows. Same-state working prompt/tool pings
+        // still update agentStatusByPaneKey for the owning row, but they must
+        // not fan out through dashboard/sidebar aggregate work across every
+        // card. Sort-relevant inputs are:
         //   1. `state` transitions — smart-sort class is a function of state.
         //   2. Freshness transitions (stale → fresh) — `resolveAttention` in
         //      smart-attention.ts filters entries through
@@ -276,6 +316,20 @@ export const createAgentStatusSlice: StateCreator<AppState, [], [], AgentStatusS
         const wasFresh =
           !!existing && isExplicitAgentStatusFresh(existing, updatedAt, AGENT_STATUS_STALE_AFTER_MS)
         const sortRelevantChange = !existing || existing.state !== payload.state || !wasFresh
+        const doneRetentionFieldsChanged =
+          existing?.state === 'done' &&
+          entry.state === 'done' &&
+          (entry.prompt !== existing.prompt ||
+            entry.updatedAt !== existing.updatedAt ||
+            entry.stateStartedAt !== existing.stateStartedAt ||
+            entry.agentType !== existing.agentType ||
+            entry.terminalTitle !== existing.terminalTitle ||
+            entry.toolName !== existing.toolName ||
+            entry.toolInput !== existing.toolInput ||
+            entry.lastAssistantMessage !== existing.lastAssistantMessage ||
+            entry.orchestration !== existing.orchestration ||
+            entry.interrupted !== existing.interrupted)
+        const retentionRelevantChange = sortRelevantChange || doneRetentionFieldsChanged
         // Why: a new status event means the agent is live again — lift any
         // one-shot retention suppressor so the row can be retained normally
         // on its next disappearance. setAgentStatus fires on every PTY status
@@ -298,16 +352,23 @@ export const createAgentStatusSlice: StateCreator<AppState, [], [], AgentStatusS
           migrationUnsupportedByPtyId: migrationUnsupported.next,
           retentionSuppressedPaneKeys: nextRetentionSuppressedPaneKeys,
           agentStatusEpoch:
-            sortRelevantChange || migrationUnsupported.changed
+            retentionRelevantChange || migrationUnsupported.changed
               ? s.agentStatusEpoch + 1
               : s.agentStatusEpoch,
           sortEpoch:
             sortRelevantChange || migrationUnsupported.changed ? s.sortEpoch + 1 : s.sortEpoch
         }
       })
+      get().setGeneratedTabTitleFromAgentPrompt(paneKey, payload.prompt)
       // Why: schedule after set completes so the timer reads the updated map.
       // queueMicrotask avoids re-entry into the zustand store during set.
       queueMicrotask(() => freshness.schedule())
+      if (completionRefreshWorktreeId) {
+        const worktreeId = completionRefreshWorktreeId
+        // Why: agents can create a PR via `gh pr create`, bypassing Orca's
+        // create-PR flow and leaving a fresh "no PR" cache entry in place.
+        queueMicrotask(() => get().refreshGitHubForWorktreeIfStale(worktreeId))
+      }
     },
 
     setMigrationUnsupportedPty: (entry) => {

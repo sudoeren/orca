@@ -1,5 +1,5 @@
 import type { PRCheckDetail, PRComment, PRInfo } from './types'
-import type { HostedReviewQueueSummary } from './hosted-review'
+import type { HostedReviewInfo, HostedReviewQueueSummary } from './hosted-review'
 
 export type HostedReviewFromGitHubPRInfoArgs = {
   pr: PRInfo
@@ -73,7 +73,18 @@ export function hostedReviewSummaryFromGitHubPRInfo(
     author: args.authorLogin ? { login: args.authorLogin, isBot: args.authorIsBot } : null,
     updatedAt: args.pr.updatedAt,
     mergeable: args.pr.mergeable,
+    ...(args.pr.mergeStateStatus !== undefined
+      ? { mergeStateStatus: args.pr.mergeStateStatus }
+      : {}),
     checksStatus: deriveChecksStatus(args.pr.checksStatus, args.checks),
+    reviewDecision:
+      args.pr.reviewDecision === 'APPROVED'
+        ? 'approved'
+        : args.pr.reviewDecision === 'CHANGES_REQUESTED'
+          ? 'changes_requested'
+          : args.pr.reviewDecision === 'REVIEW_REQUIRED'
+            ? 'review_required'
+            : undefined,
     threadSummary:
       unresolvedCount === null
         ? undefined
@@ -84,5 +95,24 @@ export function hostedReviewSummaryFromGitHubPRInfo(
     requestedReviewerLogins: args.requestedReviewerLogins,
     lastViewedAt: args.lastViewedAt,
     draft: args.pr.state === 'draft'
+  }
+}
+
+export function hostedReviewInfoFromGitHubPRInfo(pr: PRInfo): HostedReviewInfo {
+  return {
+    provider: 'github',
+    number: pr.number,
+    title: pr.title,
+    state: pr.state,
+    url: pr.url,
+    status: pr.checksStatus,
+    updatedAt: pr.updatedAt,
+    mergeable: pr.mergeable,
+    ...(pr.reviewDecision !== undefined ? { reviewDecision: pr.reviewDecision } : {}),
+    ...(pr.autoMergeEnabled !== undefined ? { autoMergeEnabled: pr.autoMergeEnabled } : {}),
+    ...(pr.mergeQueueRequired !== undefined ? { mergeQueueRequired: pr.mergeQueueRequired } : {}),
+    ...(pr.mergeStateStatus !== undefined ? { mergeStateStatus: pr.mergeStateStatus } : {}),
+    ...(pr.headSha ? { headSha: pr.headSha } : {}),
+    ...(pr.conflictSummary ? { conflictSummary: pr.conflictSummary } : {})
   }
 }

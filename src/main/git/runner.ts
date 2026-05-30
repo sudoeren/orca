@@ -9,11 +9,17 @@ consistent across every repo-scoped subprocess call. */
  * This module detects WSL paths and routes command execution through `wsl.exe -d <distro>`
  * with translated Linux paths, so every call site gets WSL support for free.
  */
-import { execFile, execFileSync, spawn, type ChildProcess, type SpawnOptions } from 'child_process'
-import { promisify } from 'util'
+import {
+  execFile,
+  execFileSync,
+  spawn,
+  type ChildProcess,
+  type ExecFileOptions,
+  type SpawnOptions
+} from 'child_process'
+import { withGitSpan } from '../observability/instrumentation'
 import { getDefaultWslDistro, parseWslPath, toWindowsWslPath, type WslPathInfo } from '../wsl'
-
-const execFileAsync = promisify(execFile)
+import { getSpawnArgsForWindows, isWindowsBatchScript, resolveWindowsCommand } from '../win32-utils'
 
 // ─── Core resolution ────────────────────────────────────────────────
 
@@ -212,6 +218,268 @@ type GitExecOptions = {
   env?: NodeJS.ProcessEnv
 }
 
+type CommandExecOptions = {
+  cwd?: string
+  encoding?: BufferEncoding
+  maxBuffer?: number
+  timeout?: number
+  env?: NodeJS.ProcessEnv
+  signal?: AbortSignal
+}
+
+function isMissingCommandError(error: unknown): boolean {
+  return Boolean(
+    error && typeof error === 'object' && (error as { code?: unknown }).code === 'ENOENT'
+  )
+}
+
+function hasPathSeparator(command: string): boolean {
+  return command.includes('/') || command.includes('\\')
+}
+
+function shouldRetryWindowsCommandShim(error: unknown, resolved: ResolvedCommand): boolean {
+  return (
+    process.platform === 'win32' &&
+    resolved.wsl === null &&
+    isMissingCommandError(error) &&
+    !hasPathSeparator(resolved.binary) &&
+    !/\.[A-Za-z0-9]+$/.test(resolved.binary)
+  )
+}
+
+function createAbortError(): Error {
+  const error = new Error('The operation was aborted.')
+  error.name = 'AbortError'
+  return error
+}
+
+function killSpawnedCommandTree(child: ChildProcess): void {
+  const pid = child.pid
+  if (!pid || process.platform !== 'win32') {
+    child.kill()
+    return
+  }
+  try {
+    // Why: Windows package-manager CLIs are often .cmd shims. Killing only
+    // cmd.exe leaves the underlying node/npm/pnpm child running.
+    const killer = spawn('taskkill', ['/pid', String(pid), '/t', '/f'], {
+      stdio: 'ignore',
+      windowsHide: true
+    })
+    killer.on('error', () => child.kill())
+    killer.unref()
+  } catch {
+    child.kill()
+  }
+}
+
+type ExecFileCaptureOptions = Omit<ExecFileOptions, 'timeout'> & {
+  timeout?: number
+}
+
+function emptyExecFileOutput(options: ExecFileCaptureOptions): string | Buffer {
+  return options.encoding === 'buffer' ? Buffer.alloc(0) : ''
+}
+
+function isExecFileResultObject(
+  value: unknown
+): value is { stdout: string | Buffer; stderr: string | Buffer } {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    !Buffer.isBuffer(value) &&
+    'stdout' in value &&
+    'stderr' in value
+  )
+}
+
+function execFileCapture(
+  command: string,
+  args: string[],
+  options: ExecFileCaptureOptions
+): Promise<{ stdout: string | Buffer; stderr: string | Buffer }> {
+  return new Promise((resolve, reject) => {
+    if (options.signal?.aborted) {
+      reject(createAbortError())
+      return
+    }
+
+    let settled = false
+    let child: ChildProcess | null = null
+    let timer: NodeJS.Timeout | null = null
+    const cleanup = (): void => {
+      if (timer) {
+        clearTimeout(timer)
+        timer = null
+      }
+      options.signal?.removeEventListener('abort', onAbort)
+    }
+    const finish = (
+      error: Error | null,
+      stdout: string | Buffer = emptyExecFileOutput(options),
+      stderr: string | Buffer = emptyExecFileOutput(options)
+    ): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      cleanup()
+      if (error) {
+        const enriched = error as Error & { stdout?: string | Buffer; stderr?: string | Buffer }
+        enriched.stdout ??= stdout
+        enriched.stderr ??= stderr
+        reject(enriched)
+        return
+      }
+      resolve({ stdout, stderr })
+    }
+    const onAbort = (): void => {
+      if (child) {
+        killSpawnedCommandTree(child)
+      }
+      finish(createAbortError())
+    }
+
+    try {
+      child = execFile(
+        command,
+        args,
+        {
+          cwd: options.cwd,
+          encoding: options.encoding,
+          maxBuffer: options.maxBuffer,
+          env: options.env,
+          signal: options.signal
+        },
+        (error, stdout, stderr) => {
+          if (!error && stderr === undefined && isExecFileResultObject(stdout)) {
+            finish(null, stdout.stdout, stdout.stderr)
+            return
+          }
+          finish(error, stdout, stderr)
+        }
+      )
+    } catch (error) {
+      finish(error instanceof Error ? error : new Error(String(error)))
+      return
+    }
+
+    // Why: Node's native execFile timeout waits for the child to exit after
+    // signaling it. Some CLIs ignore that signal, so reject the UI operation
+    // on our own timer and kill the child only as best effort.
+    if (options.timeout && options.timeout > 0) {
+      timer = setTimeout(() => {
+        if (child) {
+          killSpawnedCommandTree(child)
+        }
+        finish(new Error(`${command} timed out.`))
+      }, options.timeout)
+    }
+    options.signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+async function spawnCommandCapture(
+  command: string,
+  args: string[],
+  options: CommandExecOptions
+): Promise<{ stdout: string; stderr: string }> {
+  const { spawnCmd, spawnArgs } = getSpawnArgsForWindows(command, args)
+  return new Promise((resolve, reject) => {
+    if (options.signal?.aborted) {
+      reject(createAbortError())
+      return
+    }
+    let settled = false
+    let stdout = ''
+    let stderr = ''
+    let stdoutBytes = 0
+    let stderrBytes = 0
+    const child = spawn(spawnCmd, spawnArgs, {
+      cwd: options.cwd,
+      env: options.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true
+    })
+    let timer: NodeJS.Timeout | null = null
+    const onAbort = (): void => {
+      killSpawnedCommandTree(child)
+      finish(createAbortError())
+    }
+    const cleanupListeners = (): void => {
+      if (timer) {
+        clearTimeout(timer)
+        timer = null
+      }
+      options.signal?.removeEventListener('abort', onAbort)
+      child.stdout?.off('data', onStdoutData)
+      child.stderr?.off('data', onStderrData)
+      child.off('error', onError)
+      child.off('close', onClose)
+    }
+    const finish = (error: Error | null): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      cleanupListeners()
+      if (error) {
+        reject(Object.assign(error, { stdout, stderr }))
+        return
+      }
+      resolve({ stdout, stderr })
+    }
+    timer = options.timeout
+      ? setTimeout(() => {
+          killSpawnedCommandTree(child)
+          finish(new Error(`${command} timed out.`))
+        }, options.timeout)
+      : null
+    options.signal?.addEventListener('abort', onAbort, { once: true })
+    function onStdoutData(chunk: Buffer): void {
+      stdoutBytes += chunk.byteLength
+      if (options.maxBuffer && stdoutBytes > options.maxBuffer) {
+        killSpawnedCommandTree(child)
+        finish(new Error(`${command} stdout exceeded maxBuffer.`))
+        return
+      }
+      stdout += chunk.toString(options.encoding ?? 'utf-8')
+    }
+    function onStderrData(chunk: Buffer): void {
+      stderrBytes += chunk.byteLength
+      if (options.maxBuffer && stderrBytes > options.maxBuffer) {
+        killSpawnedCommandTree(child)
+        finish(new Error(`${command} stderr exceeded maxBuffer.`))
+        return
+      }
+      stderr += chunk.toString(options.encoding ?? 'utf-8')
+    }
+    function onError(error: Error): void {
+      finish(error)
+    }
+    function onClose(code: number | null): void {
+      if (code === 0) {
+        finish(null)
+        return
+      }
+      finish(new Error(`${command} exited with ${code}.`))
+    }
+    child.stdout?.on('data', onStdoutData)
+    child.stderr?.on('data', onStderrData)
+    child.on('error', onError)
+    child.on('close', onClose)
+  })
+}
+
+export function gitOptionalLocksDisabledEnv(
+  env: NodeJS.ProcessEnv = process.env
+): NodeJS.ProcessEnv {
+  return {
+    ...env,
+    GIT_OPTIONAL_LOCKS: '0'
+  }
+}
+
 /**
  * Async git command execution. Drop-in replacement for
  * `execFileAsync('git', args, { cwd, encoding, ... })`.
@@ -220,15 +488,67 @@ export async function gitExecFileAsync(
   args: string[],
   options: GitExecOptions
 ): Promise<{ stdout: string; stderr: string }> {
-  const resolved = resolveCommand('git', args, options.cwd)
-  const { stdout, stderr } = await execFileAsync(resolved.binary, resolved.args, {
-    cwd: resolved.cwd,
-    encoding: (options.encoding ?? 'utf-8') as BufferEncoding,
-    maxBuffer: options.maxBuffer,
-    timeout: options.timeout,
-    env: options.env
-  })
-  return { stdout: stdout as string, stderr: stderr as string }
+  // Why wrap here: the resolved binary path / WSL detection is internal
+  // detail; the span attributes track the user-visible `git <subcommand>
+  // <args…>` form so dashboards group cleanly by intent rather than by
+  // platform-conditional binary path.
+  return withGitSpan(
+    { args, ...(options.cwd !== undefined ? { cwd: options.cwd } : {}) },
+    async () => {
+      const resolved = resolveCommand('git', args, options.cwd)
+      const { stdout, stderr } = await execFileCapture(resolved.binary, resolved.args, {
+        cwd: resolved.cwd,
+        encoding: (options.encoding ?? 'utf-8') as BufferEncoding,
+        maxBuffer: options.maxBuffer,
+        timeout: options.timeout,
+        env: options.env
+      })
+      return { stdout: stdout as string, stderr: stderr as string }
+    }
+  )
+}
+
+/**
+ * Async command execution with the same WSL cwd translation as repo-scoped git.
+ * Keep this for fixed binary+argv call sites; never pass shell fragments.
+ */
+export async function commandExecFileAsync(
+  command: string,
+  args: string[],
+  options: CommandExecOptions = {}
+): Promise<{ stdout: string; stderr: string }> {
+  const resolved = resolveCommand(command, args, options.cwd)
+  const binary =
+    resolved.wsl === null ? resolveWindowsCommand(resolved.binary, options.env) : resolved.binary
+  if (isWindowsBatchScript(binary)) {
+    return spawnCommandCapture(binary, resolved.args, {
+      ...options,
+      cwd: resolved.cwd
+    })
+  }
+  try {
+    const { stdout, stderr } = await execFileCapture(binary, resolved.args, {
+      cwd: resolved.cwd,
+      encoding: options.encoding ?? 'utf-8',
+      maxBuffer: options.maxBuffer,
+      timeout: options.timeout,
+      env: options.env,
+      signal: options.signal
+    })
+    return { stdout: stdout as string, stderr: stderr as string }
+  } catch (error) {
+    if (shouldRetryWindowsCommandShim(error, resolved)) {
+      return spawnCommandCapture(
+        resolveWindowsCommand(`${resolved.binary}.cmd`, options.env),
+        resolved.args,
+        {
+          ...options,
+          cwd: resolved.cwd
+        }
+      )
+    }
+    throw error
+  }
 }
 
 /**
@@ -240,7 +560,7 @@ export async function gitExecFileAsyncBuffer(
   options: { cwd: string; maxBuffer?: number }
 ): Promise<{ stdout: Buffer }> {
   const resolved = resolveCommand('git', args, options.cwd)
-  const { stdout } = (await execFileAsync(resolved.binary, resolved.args, {
+  const { stdout } = (await execFileCapture(resolved.binary, resolved.args, {
     cwd: resolved.cwd,
     encoding: 'buffer',
     maxBuffer: options.maxBuffer
@@ -525,7 +845,7 @@ export async function ghExecFileAsync(
   let attemptedDefaultWslFallback = false
   for (let attempt = 0; attempt <= GH_RETRY_DELAYS_MS.length; attempt++) {
     try {
-      const { stdout, stderr } = await execFileAsync(resolved.binary, resolved.args, {
+      const { stdout, stderr } = await execFileCapture(resolved.binary, resolved.args, {
         cwd: resolved.cwd,
         encoding: (options.encoding ?? 'utf-8') as BufferEncoding,
         maxBuffer: options.maxBuffer,
@@ -622,7 +942,7 @@ export async function glabExecFileAsync(
   let attemptedDefaultWslFallback = false
   for (let attempt = 0; attempt <= GH_RETRY_DELAYS_MS.length; attempt++) {
     try {
-      const { stdout, stderr } = await execFileAsync(resolved.binary, resolved.args, {
+      const { stdout, stderr } = await execFileCapture(resolved.binary, resolved.args, {
         cwd: resolved.cwd,
         encoding: (options.encoding ?? 'utf-8') as BufferEncoding,
         maxBuffer: options.maxBuffer,

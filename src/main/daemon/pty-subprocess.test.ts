@@ -3,10 +3,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import type * as LocalPtyUtils from '../providers/local-pty-utils'
 
-const { spawnMock, isPwshAvailableMock } = vi.hoisted(() => ({
+const { spawnMock, isPwshAvailableMock, validateWorkingDirectoryMock } = vi.hoisted(() => ({
   spawnMock: vi.fn(),
-  isPwshAvailableMock: vi.fn()
+  isPwshAvailableMock: vi.fn(),
+  validateWorkingDirectoryMock: vi.fn((cwd: string) => {
+    if (cwd.includes('definitely-missing')) {
+      throw new Error(
+        `Working directory "${cwd}" does not exist. It may have been deleted or is on an unmounted volume.`
+      )
+    }
+  })
 }))
 
 vi.mock('node-pty', () => ({
@@ -17,12 +25,22 @@ vi.mock('../pwsh', () => ({
   isPwshAvailable: isPwshAvailableMock
 }))
 
+vi.mock('../providers/local-pty-utils', async (importOriginal) => {
+  const actual = await importOriginal<typeof LocalPtyUtils>()
+  return {
+    ...actual,
+    validateWorkingDirectory: validateWorkingDirectoryMock
+  }
+})
+
 import { createPtySubprocess } from './pty-subprocess'
 
 const ORCA_SHELL_WRAPPER_ENV = [
   'ORCA_ATTRIBUTION_SHIM_DIR',
   'ORCA_OPENCODE_CONFIG_DIR',
-  'ORCA_PI_CODING_AGENT_DIR'
+  'ORCA_PI_CODING_AGENT_DIR',
+  'ORCA_OMP_CODING_AGENT_DIR',
+  'ORCA_CODEX_HOME'
 ] as const
 const POWERSHELL_OSC133_COMMAND_ARGS = ['-NoLogo', '-NoExit', '-EncodedCommand', expect.any(String)]
 const ZSH_SHELL_READY_DIR = /shell-ready[\\/]zsh/
@@ -57,6 +75,7 @@ describe('createPtySubprocess', () => {
   beforeEach(() => {
     spawnMock.mockReset()
     isPwshAvailableMock.mockReset()
+    validateWorkingDirectoryMock.mockClear()
     isPwshAvailableMock.mockReturnValue(false)
     previousUserDataPath = process.env.ORCA_USER_DATA_PATH
     userDataPath = mkdtempSync(join(tmpdir(), 'daemon-pty-subprocess-test-'))
@@ -128,6 +147,34 @@ describe('createPtySubprocess', () => {
     expect(handle.pid).toBe(42)
   })
 
+  it('normalizes foreground process names from node-pty', () => {
+    const proc = mockPtyProcess()
+    proc.process = '/opt/homebrew/bin/codex'
+    spawnMock.mockReturnValue(proc)
+
+    const handle = createPtySubprocess({
+      sessionId: 'test',
+      cols: 80,
+      rows: 24
+    })
+
+    expect(handle.getForegroundProcess()).toBe('codex')
+  })
+
+  it('treats node-pty terminal name as inconclusive foreground process', () => {
+    const proc = mockPtyProcess()
+    proc.process = 'xterm-256color'
+    spawnMock.mockReturnValue(proc)
+
+    const handle = createPtySubprocess({
+      sessionId: 'test',
+      cols: 80,
+      rows: 24
+    })
+
+    expect(handle.getForegroundProcess()).toBeNull()
+  })
+
   it('does not inherit parent Orca pane identity when caller omits pane env', () => {
     const proc = mockPtyProcess()
     spawnMock.mockReturnValue(proc)
@@ -195,6 +242,95 @@ describe('createPtySubprocess', () => {
     expect(env.ORCA_PANE_KEY).toBe('child-tab:child-leaf')
     expect(env.ORCA_TAB_ID).toBe('child-tab')
     expect(env.ORCA_WORKTREE_ID).toBe('child-worktree')
+  })
+
+  it('does not inherit ELECTRON_RUN_AS_NODE from the daemon process env', () => {
+    // Why: the daemon is forked with ELECTRON_RUN_AS_NODE=1. If that flag
+    // reaches user shells, nested Electron commands run as plain Node.
+    const proc = mockPtyProcess()
+    spawnMock.mockReturnValue(proc)
+    const previous = process.env.ELECTRON_RUN_AS_NODE
+    process.env.ELECTRON_RUN_AS_NODE = '1'
+
+    try {
+      createPtySubprocess({ sessionId: 'test', cols: 80, rows: 24 })
+    } finally {
+      if (previous === undefined) {
+        delete process.env.ELECTRON_RUN_AS_NODE
+      } else {
+        process.env.ELECTRON_RUN_AS_NODE = previous
+      }
+    }
+
+    const env = spawnMock.mock.calls.at(-1)?.[2].env
+    expect(env.ELECTRON_RUN_AS_NODE).toBeUndefined()
+  })
+
+  it('does not inherit parent agent hook endpoint for development hook env', () => {
+    const proc = mockPtyProcess()
+    spawnMock.mockReturnValue(proc)
+    const previousEndpoint = process.env.ORCA_AGENT_HOOK_ENDPOINT
+    process.env.ORCA_AGENT_HOOK_ENDPOINT = '/tmp/stale-endpoint.env'
+
+    try {
+      createPtySubprocess({
+        sessionId: 'test',
+        cols: 80,
+        rows: 24,
+        env: {
+          ORCA_AGENT_HOOK_ENV: 'development',
+          ORCA_AGENT_HOOK_PORT: '1234',
+          ORCA_AGENT_HOOK_TOKEN: 'token',
+          ORCA_AGENT_HOOK_VERSION: '1'
+        }
+      })
+    } finally {
+      if (previousEndpoint === undefined) {
+        delete process.env.ORCA_AGENT_HOOK_ENDPOINT
+      } else {
+        process.env.ORCA_AGENT_HOOK_ENDPOINT = previousEndpoint
+      }
+    }
+
+    const env = spawnMock.mock.calls.at(-1)?.[2].env
+    expect(env.ORCA_AGENT_HOOK_ENDPOINT).toBeUndefined()
+    expect(env.ORCA_AGENT_HOOK_ENV).toBe('development')
+    expect(env.ORCA_AGENT_HOOK_PORT).toBe('1234')
+    expect(env.ORCA_AGENT_HOOK_TOKEN).toBe('token')
+  })
+
+  it('preserves explicit development agent hook endpoint files', () => {
+    const proc = mockPtyProcess()
+    spawnMock.mockReturnValue(proc)
+    const previousEndpoint = process.env.ORCA_AGENT_HOOK_ENDPOINT
+    process.env.ORCA_AGENT_HOOK_ENDPOINT = '/tmp/stale-endpoint.env'
+
+    try {
+      createPtySubprocess({
+        sessionId: 'test',
+        cols: 80,
+        rows: 24,
+        env: {
+          ORCA_AGENT_HOOK_ENV: 'development',
+          ORCA_AGENT_HOOK_PORT: '1234',
+          ORCA_AGENT_HOOK_TOKEN: 'token',
+          ORCA_AGENT_HOOK_VERSION: '1',
+          ORCA_AGENT_HOOK_ENDPOINT: '/tmp/fresh-endpoint.env'
+        }
+      })
+    } finally {
+      if (previousEndpoint === undefined) {
+        delete process.env.ORCA_AGENT_HOOK_ENDPOINT
+      } else {
+        process.env.ORCA_AGENT_HOOK_ENDPOINT = previousEndpoint
+      }
+    }
+
+    const env = spawnMock.mock.calls.at(-1)?.[2].env
+    expect(env.ORCA_AGENT_HOOK_ENDPOINT).toBe('/tmp/fresh-endpoint.env')
+    expect(env.ORCA_AGENT_HOOK_ENV).toBe('development')
+    expect(env.ORCA_AGENT_HOOK_PORT).toBe('1234')
+    expect(env.ORCA_AGENT_HOOK_TOKEN).toBe('token')
   })
 
   it('forwards write calls', () => {
@@ -413,6 +549,61 @@ describe('createPtySubprocess', () => {
     expect(lastCall[2].env.ORCA_SHELL_READY_MARKER).toBe('0')
   })
 
+  it('uses shell wrapper when Codex home must survive shell startup', () => {
+    const proc = mockPtyProcess()
+    spawnMock.mockReturnValue(proc)
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')
+    Object.defineProperty(process, 'platform', { value: 'linux' })
+
+    try {
+      createPtySubprocess({
+        sessionId: 'test',
+        cols: 80,
+        rows: 24,
+        env: {
+          SHELL: '/bin/zsh',
+          CODEX_HOME: '/tmp/orca-codex-home',
+          ORCA_CODEX_HOME: '/tmp/orca-codex-home'
+        }
+      })
+    } finally {
+      if (platform) {
+        Object.defineProperty(process, 'platform', platform)
+      }
+    }
+
+    const lastCall = spawnMock.mock.calls.at(-1)!
+    expect(lastCall[1]).toEqual(['-l'])
+    expect(lastCall[2].env.ZDOTDIR).toMatch(ZSH_SHELL_READY_DIR)
+    expect(lastCall[2].env.ORCA_SHELL_READY_MARKER).toBe('0')
+  })
+
+  it('deletes requested env keys after merging daemon process env', () => {
+    const proc = mockPtyProcess()
+    spawnMock.mockReturnValue(proc)
+    const previousCodexHome = process.env.CODEX_HOME
+    process.env.CODEX_HOME = '/host/codex-home'
+
+    try {
+      createPtySubprocess({
+        sessionId: 'test',
+        cols: 80,
+        rows: 24,
+        env: { SHELL: '/bin/bash' },
+        envToDelete: ['CODEX_HOME']
+      })
+    } finally {
+      if (previousCodexHome === undefined) {
+        delete process.env.CODEX_HOME
+      } else {
+        process.env.CODEX_HOME = previousCodexHome
+      }
+    }
+
+    const lastCall = spawnMock.mock.calls.at(-1)!
+    expect(lastCall[2].env.CODEX_HOME).toBeUndefined()
+  })
+
   it('combines HOMEDRIVE and HOMEPATH for Windows default cwd', () => {
     const proc = mockPtyProcess()
     spawnMock.mockReturnValue(proc)
@@ -601,6 +792,37 @@ describe('createPtySubprocess', () => {
     )
   })
 
+  it('launches Git Bash with login args and CHERE_INVOKING on Windows', () => {
+    const proc = mockPtyProcess()
+    spawnMock.mockReturnValue(proc)
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')
+
+    Object.defineProperty(process, 'platform', { value: 'win32' })
+
+    try {
+      createPtySubprocess({
+        sessionId: 'test',
+        cols: 80,
+        rows: 24,
+        cwd: 'C:\\Users\\jin\\repo',
+        shellOverride: 'C:\\PortableGit\\bin\\bash.exe'
+      })
+    } finally {
+      if (platform) {
+        Object.defineProperty(process, 'platform', platform)
+      }
+    }
+
+    expect(spawnMock).toHaveBeenCalledWith(
+      'C:\\PortableGit\\bin\\bash.exe',
+      ['--login', '-i'],
+      expect.objectContaining({
+        cwd: 'C:\\Users\\jin\\repo',
+        env: expect.objectContaining({ CHERE_INVOKING: '1' })
+      })
+    )
+  })
+
   it('rejects a missing explicit native Windows cwd before node-pty spawn', () => {
     const platform = Object.getOwnPropertyDescriptor(process, 'platform')
     Object.defineProperty(process, 'platform', { value: 'win32' })
@@ -704,6 +926,251 @@ describe('createPtySubprocess', () => {
     expect(spawnMock).toHaveBeenCalledWith(
       'wsl.exe',
       ['--', 'bash', '-c', `cd '${expectedLinuxCwd}' && exec bash -l`],
+      expect.objectContaining({ cwd: expect.any(String) })
+    )
+  })
+
+  it('uses the preferred WSL distro for daemon WSL terminals with Windows cwd', () => {
+    const proc = mockPtyProcess()
+    spawnMock.mockReturnValue(proc)
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')
+    const cwd = mkdtempSync(join(tmpdir(), 'daemon-pty-wsl-distro-test-'))
+
+    Object.defineProperty(process, 'platform', { value: 'win32' })
+
+    try {
+      createPtySubprocess({
+        sessionId: 'test',
+        cols: 80,
+        rows: 24,
+        cwd,
+        shellOverride: 'wsl.exe',
+        terminalWindowsWslDistro: 'Debian'
+      })
+    } finally {
+      if (platform) {
+        Object.defineProperty(process, 'platform', platform)
+      }
+      rmSync(cwd, { recursive: true, force: true })
+    }
+
+    const normalizedCwd = cwd.replace(/\\/g, '/')
+    const driveMatch = normalizedCwd.match(/^([A-Za-z]):\/?(.*)$/)
+    const expectedLinuxCwd = driveMatch
+      ? `/mnt/${driveMatch[1].toLowerCase()}${driveMatch[2] ? `/${driveMatch[2]}` : ''}`
+      : '/mnt/c'
+
+    expect(spawnMock).toHaveBeenCalledWith(
+      'wsl.exe',
+      ['-d', 'Debian', '--', 'bash', '-c', `cd '${expectedLinuxCwd}' && exec bash -l`],
+      expect.objectContaining({ cwd: expect.any(String) })
+    )
+  })
+
+  it('launches WSL for WSL worktree cwd even when a stale Windows shell override is present', () => {
+    const proc = mockPtyProcess()
+    spawnMock.mockReturnValue(proc)
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')
+
+    Object.defineProperty(process, 'platform', { value: 'win32' })
+
+    try {
+      createPtySubprocess({
+        sessionId: 'test',
+        cols: 80,
+        rows: 24,
+        cwd: '\\\\wsl.localhost\\Ubuntu\\home\\jin\\repo',
+        shellOverride: 'powershell.exe'
+      })
+    } finally {
+      if (platform) {
+        Object.defineProperty(process, 'platform', platform)
+      }
+    }
+
+    expect(spawnMock).toHaveBeenCalledWith(
+      'wsl.exe',
+      ['-d', 'Ubuntu', '--', 'bash', '-c', "cd '/home/jin/repo' && exec bash -l"],
+      expect.objectContaining({ cwd: expect.any(String) })
+    )
+  })
+
+  it('does not pass a Windows Codex home into daemon WSL terminals', () => {
+    const proc = mockPtyProcess()
+    spawnMock.mockReturnValue(proc)
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')
+
+    Object.defineProperty(process, 'platform', { value: 'win32' })
+
+    try {
+      createPtySubprocess({
+        sessionId: 'test',
+        cols: 80,
+        rows: 24,
+        cwd: '\\\\wsl.localhost\\Ubuntu\\home\\jin\\repo',
+        env: { CODEX_HOME: 'C:\\Users\\jin\\.codex', ORCA_CODEX_HOME: 'C:\\Users\\jin\\.codex' }
+      })
+    } finally {
+      if (platform) {
+        Object.defineProperty(process, 'platform', platform)
+      }
+    }
+
+    expect(spawnMock).toHaveBeenCalledWith(
+      'wsl.exe',
+      ['-d', 'Ubuntu', '--', 'bash', '-c', "cd '/home/jin/repo' && exec bash -l"],
+      expect.objectContaining({
+        env: expect.not.objectContaining({
+          CODEX_HOME: expect.anything(),
+          ORCA_CODEX_HOME: expect.anything()
+        })
+      })
+    )
+  })
+
+  it('does not pass a WSL managed Codex home into daemon Windows terminals', () => {
+    const proc = mockPtyProcess()
+    spawnMock.mockReturnValue(proc)
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')
+
+    Object.defineProperty(process, 'platform', { value: 'win32' })
+
+    try {
+      createPtySubprocess({
+        sessionId: 'test',
+        cols: 80,
+        rows: 24,
+        cwd: 'C:\\Users\\jin\\repo',
+        env: {
+          CODEX_HOME:
+            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\orca\\codex-accounts\\a\\home',
+          ORCA_CODEX_HOME:
+            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\orca\\codex-accounts\\a\\home'
+        }
+      })
+    } finally {
+      if (platform) {
+        Object.defineProperty(process, 'platform', platform)
+      }
+    }
+
+    expect(spawnMock).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(Array),
+      expect.objectContaining({
+        env: expect.not.objectContaining({
+          CODEX_HOME: expect.anything(),
+          ORCA_CODEX_HOME: expect.anything()
+        })
+      })
+    )
+  })
+
+  it('routes daemon default WSL terminals to the Codex home distro without losing cwd', () => {
+    const proc = mockPtyProcess()
+    spawnMock.mockReturnValue(proc)
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')
+    const cwd = mkdtempSync(join(tmpdir(), 'daemon-pty-wsl-codex-home-cwd-'))
+
+    Object.defineProperty(process, 'platform', { value: 'win32' })
+
+    try {
+      createPtySubprocess({
+        sessionId: 'test',
+        cols: 80,
+        rows: 24,
+        cwd,
+        shellOverride: 'wsl.exe',
+        env: {
+          CODEX_HOME:
+            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\orca\\codex-accounts\\a\\home',
+          ORCA_CODEX_HOME:
+            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\orca\\codex-accounts\\a\\home'
+        }
+      })
+    } finally {
+      if (platform) {
+        Object.defineProperty(process, 'platform', platform)
+      }
+      rmSync(cwd, { recursive: true, force: true })
+    }
+
+    const normalizedCwd = cwd.replace(/\\/g, '/')
+    const driveMatch = normalizedCwd.match(/^([A-Za-z]):\/?(.*)$/)
+    const expectedLinuxCwd = driveMatch
+      ? `/mnt/${driveMatch[1].toLowerCase()}${driveMatch[2] ? `/${driveMatch[2]}` : ''}`
+      : '/mnt/c'
+
+    expect(spawnMock).toHaveBeenCalledWith(
+      'wsl.exe',
+      ['-d', 'Ubuntu', '--', 'bash', '-c', `cd '${expectedLinuxCwd}' && exec bash -l`],
+      expect.objectContaining({
+        env: expect.objectContaining({
+          CODEX_HOME: '/home/jin/.local/share/orca/codex-accounts/a/home',
+          ORCA_CODEX_HOME: '/home/jin/.local/share/orca/codex-accounts/a/home',
+          WSLENV: expect.stringContaining('CODEX_HOME')
+        })
+      })
+    )
+  })
+
+  it('preserves an explicit Linux Codex home in daemon WSL terminals', () => {
+    const proc = mockPtyProcess()
+    spawnMock.mockReturnValue(proc)
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')
+
+    Object.defineProperty(process, 'platform', { value: 'win32' })
+
+    try {
+      createPtySubprocess({
+        sessionId: 'test',
+        cols: 80,
+        rows: 24,
+        cwd: '\\\\wsl.localhost\\Ubuntu\\home\\jin\\repo',
+        env: { CODEX_HOME: '/home/jin/.codex-alt' }
+      })
+    } finally {
+      if (platform) {
+        Object.defineProperty(process, 'platform', platform)
+      }
+    }
+
+    expect(spawnMock).toHaveBeenCalledWith(
+      'wsl.exe',
+      ['-d', 'Ubuntu', '--', 'bash', '-c', "cd '/home/jin/repo' && exec bash -l"],
+      expect.objectContaining({
+        env: expect.objectContaining({ CODEX_HOME: '/home/jin/.codex-alt' })
+      })
+    )
+  })
+
+  it('keeps daemon WSL split panes in their distro when cwd is already POSIX', () => {
+    const proc = mockPtyProcess()
+    spawnMock.mockReturnValue(proc)
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')
+
+    Object.defineProperty(process, 'platform', { value: 'win32' })
+
+    try {
+      createPtySubprocess({
+        sessionId: 'repo::\\\\wsl.localhost\\Ubuntu\\home\\jin\\repo@@deadbeef',
+        cols: 80,
+        rows: 24,
+        cwd: '/home/jin/repo/subdir',
+        shellOverride: 'wsl.exe'
+      })
+    } finally {
+      if (platform) {
+        Object.defineProperty(process, 'platform', platform)
+      }
+    }
+
+    expect(validateWorkingDirectoryMock).toHaveBeenCalledWith(
+      '\\\\wsl.localhost\\Ubuntu\\home\\jin\\repo\\subdir'
+    )
+    expect(spawnMock).toHaveBeenCalledWith(
+      'wsl.exe',
+      ['-d', 'Ubuntu', '--', 'bash', '-c', "cd '/home/jin/repo/subdir' && exec bash -l"],
       expect.objectContaining({ cwd: expect.any(String) })
     )
   })

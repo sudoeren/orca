@@ -1,13 +1,16 @@
 import type { GlobalSettings, OrcaHooks } from '../../../shared/types'
+import type { SetupScriptImportCandidate } from '../../../shared/setup-script-imports'
 import { callRuntimeRpc, getActiveRuntimeTarget } from './runtime-rpc-client'
 
 export type HookCheckResult = {
+  status?: 'ok' | 'error'
   hasHooks: boolean
   hooks: OrcaHooks | null
   mayNeedUpdate: boolean
 }
 
 export type IssueCommandReadResult = {
+  status?: 'ok' | 'error'
   localContent: string | null
   sharedContent: string | null
   effectiveContent: string | null
@@ -26,6 +29,22 @@ export async function checkRuntimeHooks(
   return callRuntimeRpc<HookCheckResult>(
     target,
     'repo.hooksCheck',
+    { repo: repoId },
+    { timeoutMs: 15_000 }
+  )
+}
+
+export async function inspectRuntimeSetupScriptImports(
+  settings: Pick<GlobalSettings, 'activeRuntimeEnvironmentId'> | null | undefined,
+  repoId: string
+): Promise<SetupScriptImportCandidate[]> {
+  const target = getActiveRuntimeTarget(settings)
+  if (target.kind !== 'environment') {
+    return window.api.hooks.inspectSetupScriptImports({ repoId })
+  }
+  return callRuntimeRpc<SetupScriptImportCandidate[]>(
+    target,
+    'repo.setupScriptImports',
     { repo: repoId },
     { timeoutMs: 15_000 }
   )

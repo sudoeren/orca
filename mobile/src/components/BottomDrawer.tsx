@@ -22,6 +22,7 @@ import Animated, {
   Extrapolation
 } from 'react-native-reanimated'
 import { colors, spacing } from '../theme/mobile-theme'
+import { useResponsiveLayout } from '../layout/responsive-layout'
 
 const DISMISS_THRESHOLD = 80
 const SPRING_CONFIG = { damping: 28, stiffness: 400 }
@@ -38,9 +39,16 @@ type Props = {
   onClose: () => void
   children: ReactNode
   dragContentToDismiss?: boolean
+  zIndex?: number
 }
 
-export function BottomDrawer({ visible, onClose, children, dragContentToDismiss = false }: Props) {
+export function BottomDrawer({
+  visible,
+  onClose,
+  children,
+  dragContentToDismiss = true,
+  zIndex
+}: Props) {
   const [mounted, setMounted] = useState(visible)
 
   useEffect(() => {
@@ -59,6 +67,7 @@ export function BottomDrawer({ visible, onClose, children, dragContentToDismiss 
       onClose={onClose}
       onHidden={() => setMounted(false)}
       dragContentToDismiss={dragContentToDismiss}
+      zIndex={zIndex}
     >
       {children}
     </MountedBottomDrawer>
@@ -74,7 +83,8 @@ function MountedBottomDrawer({
   onClose,
   onHidden,
   children,
-  dragContentToDismiss = false
+  dragContentToDismiss = true,
+  zIndex = 1000
 }: MountedBottomDrawerProps) {
   const translateY = useSharedValue(0)
   const progress = useSharedValue(0)
@@ -84,6 +94,10 @@ function MountedBottomDrawer({
   const contentDragCanDismiss = useSharedValue(false)
   const { height: screenHeight } = useWindowDimensions()
   const insets = useSafeAreaInsets()
+  // Why: on wide/tablet canvases a full-width sheet looks stretched; cap it and
+  // center it horizontally. Vertical bottom-anchoring (and all the drag/keyboard
+  // transforms below) is unchanged, so phone behavior stays identical.
+  const { isWideLayout, modalMaxWidth } = useResponsiveLayout()
 
   useEffect(() => {
     if (visible) {
@@ -239,17 +253,23 @@ function MountedBottomDrawer({
   )
 
   return (
-    <Animated.View style={[styles.overlay, pointerStyle]} accessibilityViewIsModal aria-modal>
+    <Animated.View
+      style={[styles.overlay, { zIndex, elevation: zIndex }, pointerStyle]}
+      accessibilityViewIsModal
+      aria-modal
+    >
       <GestureHandlerRootView style={styles.root}>
         <Animated.View style={[styles.backdrop, backdropStyle]}>
           <Pressable style={StyleSheet.absoluteFill} onPress={dismiss} />
         </Animated.View>
 
-        <View style={styles.anchor} pointerEvents="box-none">
+        <View style={[styles.anchor, isWideLayout && styles.anchorWide]} pointerEvents="box-none">
           <Animated.View
             style={[
               styles.drawer,
               {
+                width: '100%',
+                maxWidth: isWideLayout ? modalMaxWidth : undefined,
                 maxHeight: screenHeight - insets.top - spacing.lg,
                 paddingBottom: insets.bottom + spacing.lg
               },
@@ -326,6 +346,9 @@ const styles = StyleSheet.create({
   anchor: {
     flex: 1,
     justifyContent: 'flex-end'
+  },
+  anchorWide: {
+    alignItems: 'center'
   },
   drawer: {
     backgroundColor: colors.bgBase,

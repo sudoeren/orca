@@ -38,6 +38,22 @@ describe('buildAgentStartupPlan', () => {
     })
   })
 
+  it('uses Antigravity interactive prompt mode with the agy binary', () => {
+    expect(
+      buildAgentStartupPlan({
+        agent: 'antigravity',
+        prompt: 'Investigate this regression',
+        cmdOverrides: {},
+        platform: 'linux'
+      })
+    ).toEqual({
+      agent: 'antigravity',
+      launchCommand: "agy --prompt-interactive 'Investigate this regression'",
+      expectedProcess: 'agy',
+      followupPrompt: null
+    })
+  })
+
   it('launches aider first and injects the draft prompt after startup', () => {
     expect(
       buildAgentStartupPlan({
@@ -131,6 +147,22 @@ describe('buildAgentStartupPlan', () => {
       launchCommand: 'grok',
       expectedProcess: 'grok',
       followupPrompt: 'Trace the failing test'
+    })
+  })
+
+  it('launches Command Code by its unambiguous binary with a positional prompt', () => {
+    expect(
+      buildAgentStartupPlan({
+        agent: 'command-code',
+        prompt: 'Fix the issue',
+        cmdOverrides: {},
+        platform: 'win32'
+      })
+    ).toEqual({
+      agent: 'command-code',
+      launchCommand: "command-code --trust 'Fix the issue'",
+      expectedProcess: 'command-code',
+      followupPrompt: null
     })
   })
 
@@ -235,12 +267,31 @@ describe('buildAgentDraftLaunchPlan', () => {
       expectedProcess: 'claude'
     })
   })
+
+  it('uses OpenClaude native prefill support for draft launches', () => {
+    expect(
+      buildAgentDraftLaunchPlan({
+        agent: 'openclaude',
+        draft: 'review this',
+        cmdOverrides: {},
+        platform: 'linux'
+      })
+    ).toEqual({
+      agent: 'openclaude',
+      launchCommand: "openclaude --prefill 'review this'",
+      expectedProcess: 'openclaude'
+    })
+  })
 })
 
 describe('isShellProcess', () => {
   it('treats common shells as non-agent foreground processes', () => {
     expect(isShellProcess('bash')).toBe(true)
     expect(isShellProcess('pwsh.exe')).toBe(true)
+    expect(isShellProcess('/bin/zsh')).toBe(true)
+    expect(isShellProcess('C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')).toBe(
+      true
+    )
     expect(isShellProcess('')).toBe(true)
   })
 

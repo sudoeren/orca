@@ -1,4 +1,6 @@
-/* eslint-disable max-lines */
+/* eslint-disable max-lines -- Why: cleanup scanning, safety review, and
+   confirmation stay together so destructive workspace deletion remains
+   auditable. */
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   AlertTriangle,
@@ -21,11 +23,14 @@ import {
   DialogTitle
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import RepoMultiCombobox from '@/components/ui/repo-multi-combobox'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { useMountedRef } from '@/hooks/useMountedRef'
 import { useAppStore } from '@/store'
 import { cn } from '@/lib/utils'
 import { activateAndRevealWorktree } from '@/lib/worktree-activation'
+import { isGitRepoKind } from '../../../../shared/repo-kind'
 import {
   canQueueWorkspaceCleanupCandidate,
   type WorkspaceCleanupBlocker,
@@ -33,14 +38,17 @@ import {
   type WorkspaceCleanupScanError,
   type WorkspaceCleanupTier
 } from '../../../../shared/workspace-cleanup'
+import {
+  resolveWorkspaceCleanupActiveView,
+  type WorkspaceCleanupView,
+  type WorkspaceCleanupViewCounts
+} from './workspace-cleanup-view-selection'
 
 const TIER_LABELS: Record<WorkspaceCleanupTier, string> = {
   ready: 'Suggested cleanup',
   review: 'Needs a closer look',
   protected: 'Not suggested for cleanup'
 }
-
-type CleanupView = WorkspaceCleanupTier | 'hidden'
 
 const BLOCKER_LABELS: Record<WorkspaceCleanupBlocker, string> = {
   'main-worktree': 'Main workspace',
@@ -180,24 +188,52 @@ export default function WorkspaceCleanupDialog(): React.JSX.Element {
 
   const open = activeModal === 'workspace-cleanup'
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set())
-  const [activeView, setActiveView] = useState<CleanupView>('ready')
+  const [activeView, setActiveView] = useState<WorkspaceCleanupView>('ready')
   const [confirming, setConfirming] = useState(false)
   const [removing, setRemoving] = useState(false)
   const [rowFailures, setRowFailures] = useState<Record<string, string>>({})
+  const [repoSelection, setRepoSelection] = useState<ReadonlySet<string>>(() => new Set())
+  const mountedRef = useMountedRef()
+  const eligibleRepos = useMemo(() => repos.filter((repo) => isGitRepoKind(repo)), [repos])
+  const eligibleRepoIds = useMemo(() => eligibleRepos.map((repo) => repo.id), [eligibleRepos])
 
   useEffect(() => {
     if (open) {
       setRowFailures({})
       setActiveView('ready')
       void scanWorkspaceCleanup().catch((err: unknown) => {
-        toast.error('Workspace cleanup scan failed', {
-          description: err instanceof Error ? err.message : String(err)
-        })
+        if (mountedRef.current) {
+          toast.error('Workspace cleanup scan failed', {
+            description: err instanceof Error ? err.message : String(err)
+          })
+        }
       })
     }
-  }, [open, scanWorkspaceCleanup])
+  }, [mountedRef, open, scanWorkspaceCleanup])
+
+  useEffect(() => {
+    if (!open) {
+      return
+    }
+    setRepoSelection(new Set(eligibleRepoIds))
+  }, [eligibleRepoIds, open])
 
   const candidates = useMemo(() => scan?.candidates ?? [], [scan?.candidates])
+  const effectiveRepoSelection = useMemo<ReadonlySet<string>>(() => {
+    if (repoSelection.size > 0 || eligibleRepoIds.length === 0) {
+      return repoSelection
+    }
+    return new Set(eligibleRepoIds)
+  }, [eligibleRepoIds, repoSelection])
+  const filteredCandidates = useMemo(() => {
+    if (
+      effectiveRepoSelection.size === 0 ||
+      effectiveRepoSelection.size === eligibleRepoIds.length
+    ) {
+      return candidates
+    }
+    return candidates.filter((candidate) => effectiveRepoSelection.has(candidate.repoId))
+  }, [candidates, effectiveRepoSelection, eligibleRepoIds.length])
 
   useEffect(() => {
     if (!open || !scan) {
@@ -214,15 +250,15 @@ export default function WorkspaceCleanupDialog(): React.JSX.Element {
   }, [open, scan, scan?.scannedAt, candidates])
 
   const visibleCandidates = useMemo(() => {
-    const rows = candidates.filter((candidate) => !candidate.blockers.includes('dismissed'))
+    const rows = filteredCandidates.filter((candidate) => !candidate.blockers.includes('dismissed'))
     return [...rows].sort(compareCleanupCandidates)
-  }, [candidates])
+  }, [filteredCandidates])
   const hiddenCandidates = useMemo(
     () =>
-      candidates
+      filteredCandidates
         .filter((candidate) => candidate.blockers.includes('dismissed'))
         .sort(compareCleanupCandidates),
-    [candidates]
+    [filteredCandidates]
   )
   const groups = useMemo(
     () => ({
@@ -233,33 +269,52 @@ export default function WorkspaceCleanupDialog(): React.JSX.Element {
     [visibleCandidates]
   )
   const selectedCandidates = useMemo(() => {
-    const byId = new Map(candidates.map((candidate) => [candidate.worktreeId, candidate]))
+    const byId = new Map(filteredCandidates.map((candidate) => [candidate.worktreeId, candidate]))
     return [...selectedIds]
       .map((id) => byId.get(id))
       .filter(
         (candidate): candidate is WorkspaceCleanupCandidate =>
           candidate != null && canQueueWorkspaceCleanupCandidate(candidate)
       )
-  }, [candidates, selectedIds])
+  }, [filteredCandidates, selectedIds])
 
-  const hiddenByKeepCount = candidates.filter((candidate) =>
+  const hiddenByKeepCount = filteredCandidates.filter((candidate) =>
     candidate.blockers.includes('dismissed')
   ).length
+  const cleanupViewCounts = useMemo<WorkspaceCleanupViewCounts>(
+    () => ({
+      ready: groups.ready.length,
+      review: groups.review.length,
+      protected: groups.protected.length,
+      hidden: hiddenCandidates.length
+    }),
+    [groups.protected.length, groups.ready.length, groups.review.length, hiddenCandidates.length]
+  )
+  const resolvedActiveView = resolveWorkspaceCleanupActiveView({
+    requestedView: activeView,
+    counts: cleanupViewCounts,
+    open,
+    loading,
+    hasScan: scan != null
+  })
   const repoNameById = useMemo(
     () => new Map(repos.map((repo) => [repo.id, repo.displayName || repo.path])),
     [repos]
   )
+  const selectedScanErrors = useMemo(
+    () => (scan?.errors ?? []).filter((error) => effectiveRepoSelection.has(error.repoId)),
+    [effectiveRepoSelection, scan?.errors]
+  )
   const scanNoticeMessage = useMemo(
-    () => formatScanNoticeMessage(scan?.errors ?? [], repoNameById),
-    [repoNameById, scan?.errors]
+    () => formatScanNoticeMessage(selectedScanErrors, repoNameById),
+    [repoNameById, selectedScanErrors]
   )
   const readyCount = groups.ready.length
-  const oldCandidateCount = useMemo(
-    () => candidates.filter(isOldWorkspaceCandidate).length,
-    [candidates]
-  )
+  const protectedCount = groups.protected.length
+  const inactiveCount = filteredCandidates.length
+  const hasAnyCandidates = candidates.length > 0
   const initialLoading = loading && !scan
-  const activeRows = activeView === 'hidden' ? hiddenCandidates : groups[activeView]
+  const activeRows = resolvedActiveView === 'hidden' ? hiddenCandidates : groups[resolvedActiveView]
   const activeQueueableRows = useMemo(
     () => activeRows.filter(canQueueWorkspaceCleanupCandidate),
     [activeRows]
@@ -277,33 +332,6 @@ export default function WorkspaceCleanupDialog(): React.JSX.Element {
       ? 'mixed'
       : 'unchecked'
 
-  useEffect(() => {
-    if (!open || loading || !scan) {
-      return
-    }
-    if (activeRows.length > 0) {
-      return
-    }
-    if (readyCount > 0) {
-      setActiveView('ready')
-    } else if (groups.review.length > 0) {
-      setActiveView('review')
-    } else if (groups.protected.length > 0) {
-      setActiveView('protected')
-    } else if (hiddenCandidates.length > 0) {
-      setActiveView('hidden')
-    }
-  }, [
-    activeRows.length,
-    groups.protected.length,
-    groups.review.length,
-    hiddenCandidates.length,
-    loading,
-    open,
-    readyCount,
-    scan
-  ])
-
   const handleOpenChange = useCallback(
     (nextOpen: boolean) => {
       if (!nextOpen && !removing) {
@@ -316,11 +344,13 @@ export default function WorkspaceCleanupDialog(): React.JSX.Element {
   const refresh = useCallback(() => {
     setRowFailures({})
     void scanWorkspaceCleanup().catch((err: unknown) => {
-      toast.error('Workspace cleanup scan failed', {
-        description: err instanceof Error ? err.message : String(err)
-      })
+      if (mountedRef.current) {
+        toast.error('Workspace cleanup scan failed', {
+          description: err instanceof Error ? err.message : String(err)
+        })
+      }
     })
-  }, [scanWorkspaceCleanup])
+  }, [mountedRef, scanWorkspaceCleanup])
 
   const toggleActiveSelection = useCallback(() => {
     if (activeQueueableRows.length === 0) {
@@ -345,19 +375,23 @@ export default function WorkspaceCleanupDialog(): React.JSX.Element {
     (candidate: WorkspaceCleanupCandidate) => {
       void dismissCandidates([candidate])
         .then(() => {
-          setSelectedIds((current) => {
-            const next = new Set(current)
-            next.delete(candidate.worktreeId)
-            return next
-          })
+          if (mountedRef.current) {
+            setSelectedIds((current) => {
+              const next = new Set(current)
+              next.delete(candidate.worktreeId)
+              return next
+            })
+          }
         })
         .catch((err: unknown) => {
-          toast.error('Could not ignore cleanup suggestion', {
-            description: err instanceof Error ? err.message : String(err)
-          })
+          if (mountedRef.current) {
+            toast.error('Could not ignore cleanup suggestion', {
+              description: err instanceof Error ? err.message : String(err)
+            })
+          }
         })
     },
-    [dismissCandidates]
+    [dismissCandidates, mountedRef]
   )
 
   const confirmRemove = useCallback(async () => {
@@ -374,30 +408,40 @@ export default function WorkspaceCleanupDialog(): React.JSX.Element {
       for (const failure of result.failures) {
         nextFailures[failure.worktreeId] = failure.message
       }
-      setRowFailures(nextFailures)
-      setSelectedIds((current) => {
-        const next = new Set(current)
-        for (const id of result.removedIds) {
-          next.delete(id)
-        }
-        return next
-      })
+      if (mountedRef.current) {
+        setRowFailures(nextFailures)
+        setSelectedIds((current) => {
+          const next = new Set(current)
+          for (const id of result.removedIds) {
+            next.delete(id)
+          }
+          return next
+        })
+      }
       if (result.removedIds.length > 0) {
-        toast.success(
-          `Removed ${result.removedIds.length} workspace${result.removedIds.length === 1 ? '' : 's'}`
-        )
+        if (mountedRef.current) {
+          toast.success(
+            `Removed ${result.removedIds.length} workspace${result.removedIds.length === 1 ? '' : 's'}`
+          )
+        }
       }
       if (result.failures.length > 0) {
-        toast.error(
-          `${result.failures.length} workspace${result.failures.length === 1 ? '' : 's'} could not be removed`
-        )
+        if (mountedRef.current) {
+          toast.error(
+            `${result.failures.length} workspace${result.failures.length === 1 ? '' : 's'} could not be removed`
+          )
+        }
       } else {
-        setConfirming(false)
+        if (mountedRef.current) {
+          setConfirming(false)
+        }
       }
     } finally {
-      setRemoving(false)
+      if (mountedRef.current) {
+        setRemoving(false)
+      }
     }
-  }, [removeCandidates, selectedCandidates])
+  }, [mountedRef, removeCandidates, selectedCandidates])
 
   const selectedCount = selectedCandidates.length
 
@@ -448,24 +492,47 @@ export default function WorkspaceCleanupDialog(): React.JSX.Element {
             </DialogHeader>
 
             {initialLoading ? (
-              <div className="flex items-center gap-2 border-b border-border bg-muted/25 px-5 py-3 text-xs text-muted-foreground">
-                <Loader2 className="size-3.5 animate-spin" />
-                Checking inactive workspaces
+              <div className="flex items-start gap-2 border-b border-border bg-muted/25 px-5 py-3">
+                <Loader2 className="mt-0.5 size-3.5 shrink-0 animate-spin text-muted-foreground" />
+                <div className="min-w-0">
+                  <div className="text-xs font-medium text-foreground">
+                    Checking workspace safety
+                  </div>
+                  <div className="mt-0.5 text-xs text-muted-foreground">
+                    Scanning worktrees and git state, then combining open tab, terminal, live agent,
+                    and remote availability signals before suggesting deletions.
+                  </div>
+                </div>
               </div>
-            ) : oldCandidateCount > 0 || hiddenByKeepCount > 0 ? (
+            ) : hasAnyCandidates ? (
               <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border bg-muted/25 px-4 py-2.5">
                 <div className="flex min-w-0 flex-wrap items-center gap-2">
                   <div className="min-w-0 text-sm font-medium text-foreground">
                     {selectedCount} selected
                   </div>
+                  <StatusPill>{inactiveCount} inactive</StatusPill>
                   {readyCount > 0 ? (
                     <StatusPill tone="ready">{readyCount} safe to remove</StatusPill>
                   ) : null}
                   {groups.review.length > 0 ? (
                     <StatusPill tone="review">{groups.review.length} need review</StatusPill>
                   ) : null}
+                  {protectedCount > 0 ? (
+                    <StatusPill>{protectedCount} not suggested</StatusPill>
+                  ) : null}
                 </div>
                 <div className="flex min-w-0 flex-wrap items-center gap-2">
+                  {eligibleRepos.length > 1 ? (
+                    <div className="w-[220px] max-w-full">
+                      <RepoMultiCombobox
+                        repos={eligibleRepos}
+                        selected={effectiveRepoSelection}
+                        onChange={(next) => setRepoSelection(new Set(next))}
+                        onSelectAll={() => setRepoSelection(new Set(eligibleRepoIds))}
+                        triggerClassName="h-8 w-full rounded-md border border-border/60 bg-background px-2 text-xs font-medium shadow-xs hover:bg-accent/60"
+                      />
+                    </div>
+                  ) : null}
                   <Button
                     variant="destructive"
                     size="sm"
@@ -473,7 +540,7 @@ export default function WorkspaceCleanupDialog(): React.JSX.Element {
                     disabled={selectedCount === 0}
                   >
                     <Trash2 className="size-3.5" />
-                    Remove selected
+                    Delete selected
                   </Button>
                 </div>
               </div>
@@ -492,19 +559,14 @@ export default function WorkspaceCleanupDialog(): React.JSX.Element {
 
             <div className="grid min-h-0 flex-1 grid-cols-1 overflow-hidden md:grid-cols-[185px_minmax(0,1fr)]">
               <CleanupViewNav
-                activeView={activeView}
-                counts={{
-                  ready: groups.ready.length,
-                  review: groups.review.length,
-                  protected: groups.protected.length,
-                  hidden: hiddenByKeepCount
-                }}
+                activeView={resolvedActiveView}
+                counts={cleanupViewCounts}
                 onViewChange={setActiveView}
               />
-              <div className="flex min-w-0 flex-col border-t border-border md:border-l md:border-t-0">
+              <div className="flex min-h-0 min-w-0 flex-col border-t border-border md:border-l md:border-t-0">
                 <div className="flex min-h-10 items-center justify-between gap-3 border-b border-border px-3 py-2">
                   <div className="flex min-w-0 items-center gap-2">
-                    {activeView !== 'hidden' && activeQueueableRows.length > 0 ? (
+                    {resolvedActiveView !== 'hidden' && activeQueueableRows.length > 0 ? (
                       <button
                         type="button"
                         role="checkbox"
@@ -513,8 +575,8 @@ export default function WorkspaceCleanupDialog(): React.JSX.Element {
                         }
                         aria-label={
                           allActiveQueueableSelected
-                            ? `Unselect all in ${TIER_LABELS[activeView]}`
-                            : `Select all in ${TIER_LABELS[activeView]}`
+                            ? `Unselect all in ${TIER_LABELS[resolvedActiveView]}`
+                            : `Select all in ${TIER_LABELS[resolvedActiveView]}`
                         }
                         onClick={toggleActiveSelection}
                         className="flex size-4 shrink-0 items-center justify-center rounded border border-border bg-background text-primary hover:bg-accent"
@@ -527,12 +589,12 @@ export default function WorkspaceCleanupDialog(): React.JSX.Element {
                       </button>
                     ) : null}
                     <div className="min-w-0 truncate text-[11px] font-semibold uppercase tracking-[0.05em] text-muted-foreground">
-                      {activeView === 'hidden'
+                      {resolvedActiveView === 'hidden'
                         ? 'Ignored cleanup suggestions'
-                        : TIER_LABELS[activeView]}
+                        : TIER_LABELS[resolvedActiveView]}
                     </div>
                   </div>
-                  {activeView === 'hidden' && hiddenByKeepCount > 0 ? (
+                  {resolvedActiveView === 'hidden' && hiddenByKeepCount > 0 ? (
                     <Button
                       variant="link"
                       size="xs"
@@ -556,7 +618,20 @@ export default function WorkspaceCleanupDialog(): React.JSX.Element {
                     {!loading && scan && candidates.length === 0 && scanNoticeMessage ? (
                       <EmptyState title="No inactive workspaces found in checked repositories." />
                     ) : null}
-                    {!loading && scan && candidates.length > 0 && visibleCandidates.length === 0 ? (
+                    {!loading &&
+                    scan &&
+                    candidates.length > 0 &&
+                    filteredCandidates.length === 0 ? (
+                      <EmptyState
+                        title="No inactive workspaces match the selected repos."
+                        actionLabel="Show all repos"
+                        onAction={() => setRepoSelection(new Set(eligibleRepoIds))}
+                      />
+                    ) : null}
+                    {!loading &&
+                    scan &&
+                    filteredCandidates.length > 0 &&
+                    visibleCandidates.length === 0 ? (
                       <EmptyState
                         title="All cleanup suggestions are ignored."
                         actionLabel="Review ignored workspaces"
@@ -591,7 +666,7 @@ export default function WorkspaceCleanupDialog(): React.JSX.Element {
           </>
         ) : (
           <ConfirmRemove
-            count={selectedCount}
+            candidates={selectedCandidates}
             removing={removing}
             onCancel={() => setConfirming(false)}
             onConfirm={() => void confirmRemove()}
@@ -635,11 +710,11 @@ function CleanupViewNav({
   counts,
   onViewChange
 }: {
-  activeView: CleanupView
-  counts: Record<CleanupView, number>
-  onViewChange: (view: CleanupView) => void
+  activeView: WorkspaceCleanupView
+  counts: WorkspaceCleanupViewCounts
+  onViewChange: (view: WorkspaceCleanupView) => void
 }): React.JSX.Element {
-  const items: { view: CleanupView; label: string }[] = [
+  const items: { view: WorkspaceCleanupView; label: string }[] = [
     { view: 'ready', label: 'Suggested' },
     { view: 'review', label: 'Needs review' },
     { view: 'protected', label: 'Not suggested' },
@@ -895,32 +970,51 @@ function formatContextDetails(candidate: WorkspaceCleanupCandidate): string | nu
 }
 
 function ConfirmRemove({
-  count,
+  candidates,
   removing,
   onCancel,
   onConfirm
 }: {
-  count: number
+  candidates: WorkspaceCleanupCandidate[]
   removing: boolean
   onCancel: () => void
   onConfirm: () => void
 }): React.JSX.Element {
+  const count = candidates.length
+  const noun = count === 1 ? 'workspace' : 'workspaces'
   return (
     <>
       <DialogHeader className="border-b border-border px-5 py-4">
-        <DialogTitle className="text-base">
-          Remove {count} workspace{count === 1 ? '' : 's'}?
-        </DialogTitle>
-        <DialogDescription className="mt-2 text-xs leading-5">
-          Removing a workspace deletes its working tree folder, local Orca metadata, terminal
-          history, browser workspace state, and the local branch when the existing git deletion path
-          decides that branch is no longer used.
-        </DialogDescription>
+        <div className="flex items-start gap-3">
+          <div className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-md border border-destructive/25 bg-destructive/10 text-destructive">
+            <AlertTriangle className="size-4" />
+          </div>
+          <div className="min-w-0">
+            <DialogTitle className="text-base">
+              Delete {count} {noun}?
+            </DialogTitle>
+            <DialogDescription className="mt-1.5 text-xs leading-5">
+              This permanently deletes their local files. You can&apos;t undo this.
+            </DialogDescription>
+          </div>
+        </div>
       </DialogHeader>
-      <div className="flex-1 px-5 py-4 text-sm">
-        Cleanup rechecks each selected workspace before deletion. Suggested rows use the normal
-        git-safe removal path; not suggested rows may need forced worktree removal and are reported
-        if they cannot be removed.
+      <div className="flex min-h-0 flex-1 flex-col">
+        <div className="flex items-center justify-between border-b border-border px-5 py-2.5">
+          <div className="text-[11px] font-semibold uppercase tracking-[0.05em] text-muted-foreground">
+            {count} {noun} to delete
+          </div>
+          <div className="text-xs text-muted-foreground">Sorted by oldest activity</div>
+        </div>
+        <ScrollArea className="min-h-0 flex-1">
+          {candidates.map((candidate, index) => (
+            <ConfirmRemoveRow
+              key={candidate.worktreeId}
+              candidate={candidate}
+              last={index === candidates.length - 1}
+            />
+          ))}
+        </ScrollArea>
       </div>
       <DialogFooter className="border-t border-border px-5 py-3">
         <Button variant="outline" onClick={onCancel} disabled={removing}>
@@ -928,11 +1022,60 @@ function ConfirmRemove({
         </Button>
         <Button variant="destructive" onClick={onConfirm} disabled={removing || count === 0}>
           {removing ? <Loader2 className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
-          Remove {count}
+          Delete {count} {noun}
         </Button>
       </DialogFooter>
     </>
   )
+}
+
+function ConfirmRemoveRow({
+  candidate,
+  last
+}: {
+  candidate: WorkspaceCleanupCandidate
+  last: boolean
+}): React.JSX.Element {
+  const dirtyLabel = getDirtyGitLabel(candidate)
+  const branchDiffersFromName = candidate.branch !== candidate.displayName
+  return (
+    <div className={cn('border-b border-border/60 px-5 py-2.5', last && 'border-b-0')}>
+      <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
+        <span className="min-w-0 truncate text-sm font-medium">{candidate.displayName}</span>
+        <span className="text-xs text-muted-foreground">
+          Last active {formatRelativeTime(candidate.lastActivityAt)}
+        </span>
+        {dirtyLabel ? <StatusPill tone="destructive">{dirtyLabel}</StatusPill> : null}
+      </div>
+      <div className="mt-0.5 flex min-w-0 flex-wrap items-baseline gap-x-2 text-xs text-muted-foreground">
+        <span className="min-w-0 truncate">{candidate.repoName}</span>
+        {branchDiffersFromName ? (
+          <>
+            <span aria-hidden="true">·</span>
+            <span className="min-w-0 truncate font-mono">{candidate.branch}</span>
+          </>
+        ) : null}
+      </div>
+      <div className="mt-0.5 min-w-0 truncate font-mono text-[11px] text-muted-foreground/80">
+        {candidate.path}
+      </div>
+    </div>
+  )
+}
+
+function getDirtyGitLabel(candidate: WorkspaceCleanupCandidate): string | null {
+  if (candidate.git.upstreamAhead && candidate.git.upstreamAhead > 0) {
+    return `${candidate.git.upstreamAhead} unpushed commit${
+      candidate.git.upstreamAhead === 1 ? '' : 's'
+    }`
+  }
+  if (candidate.git.clean === false) {
+    return 'Uncommitted changes'
+  }
+  if (candidate.git.clean == null) {
+    return 'Git status unknown'
+  }
+  return null
 }
 
 function SkeletonRows(): React.JSX.Element {

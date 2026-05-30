@@ -62,13 +62,10 @@ function graphqlValueForFieldMutation(value: GitHubProjectFieldMutationValue): s
       return 'number: $value'
     case 'date':
       return 'date: $value'
-    default:
-      // Why: defensive default. If a new mutation kind is added to the type
-      // but not handled here, returning undefined would silently produce a
-      // broken GraphQL query. Throw so updateProjectItemFieldValue can map it
-      // to a validation_error rather than dispatching a malformed mutation.
-      throw new UnknownFieldMutationKindError((value as { kind: string }).kind)
   }
+  // Why: keep a runtime guard for malformed IPC payloads while lint enforces
+  // that every typed mutation kind is handled above.
+  throw new UnknownFieldMutationKindError((value as { kind: string }).kind)
 }
 
 function mutationValueVar(value: GitHubProjectFieldMutationValue): {
@@ -86,11 +83,10 @@ function mutationValueVar(value: GitHubProjectFieldMutationValue): {
       return { type: 'Float!', val: value.number }
     case 'date':
       return { type: 'Date!', val: value.date }
-    default:
-      // Why: see graphqlValueForFieldMutation — surface unknown kinds loudly
-      // instead of returning undefined and dispatching an invalid mutation.
-      throw new UnknownFieldMutationKindError((value as { kind: string }).kind)
   }
+  // Why: see graphqlValueForFieldMutation — surface unknown kinds loudly
+  // instead of returning undefined and dispatching an invalid mutation.
+  throw new UnknownFieldMutationKindError((value as { kind: string }).kind)
 }
 
 export async function updateProjectItemFieldValue(
@@ -839,7 +835,7 @@ export async function getWorkItemDetailsBySlug(
     // Why: PR files/checks/review-thread tabs depend on a local repo path and
     // are out of Project-mode slug scope for v1. Omit them here; the dialog
     // branches on their absence and hides those tabs.
-    ...(args.type === 'issue' ? { assignees } : {})
+    assignees
   }
   return { ok: true, details }
 }

@@ -42,6 +42,36 @@ export type CrashReportCreateInput = Omit<
   breadcrumbs?: CrashReportBreadcrumbInput[]
 }
 
+export type ReactErrorBoundarySurface =
+  | 'app-root'
+  | 'web-root'
+  | 'workspace-shell'
+  | 'sidebar'
+  | 'terminal-workbench'
+  | 'right-sidebar'
+  | 'page'
+  | 'modal'
+  | 'overlay'
+  | 'rich-markdown-editor'
+
+export type ReactErrorBoundaryReportArgs = {
+  boundaryId: string
+  surface: ReactErrorBoundarySurface
+  errorName: string
+  errorMessage: string
+  errorStack?: string
+  componentStack?: string
+  activeView?: string
+  activeModal?: string | null
+  activeTabType?: string | null
+  activeRightSidebarTab?: string | null
+  hasActiveWorktree?: boolean
+}
+
+export type ReactErrorBoundaryReportResult =
+  | { ok: true; report: CrashReportRecord | null; deduped: boolean }
+  | { ok: false; error: string }
+
 export type CrashReportSubmitArgs = {
   reportId?: string
   notes?: string
@@ -55,8 +85,12 @@ export type CrashReportSubmitResult =
   | { ok: false; status: number | null; error: string; report?: CrashReportRecord }
 
 const MAX_STRING_DETAIL_LENGTH = 240
+const MAX_STACK_DETAIL_LENGTH = 4_000
 const MAX_BREADCRUMB_NAME_LENGTH = 80
 const MAX_BREADCRUMBS = 30
+const MAX_FORMATTED_REPORT_LENGTH = 64_000
+const FORMATTED_REPORT_TRUNCATION_SUFFIX =
+  '\n\n[Crash report truncated to fit feedback endpoint limits.]'
 const SECRET_PATTERNS = [
   /\b(gh[pousr]_[A-Za-z0-9_]{20,})\b/g,
   /\b(sk-[A-Za-z0-9_-]{20,})\b/g,
@@ -84,7 +118,18 @@ export function isCrashReportReason(reason: string): boolean {
   ].includes(reason)
 }
 
-export function sanitizeCrashReportString(value: string): string {
+export function isReactErrorBoundaryReport(report: CrashReportRecord): boolean {
+  return (
+    report.source === 'renderer' &&
+    report.processType === 'react-render' &&
+    report.reason === 'react-error-boundary'
+  )
+}
+
+export function sanitizeCrashReportString(
+  value: string,
+  maxLength = MAX_STRING_DETAIL_LENGTH
+): string {
   let sanitized = value
   for (const pattern of PATH_PATTERNS) {
     sanitized = sanitized.replace(pattern, '[redacted-path]')
@@ -97,9 +142,13 @@ export function sanitizeCrashReportString(value: string): string {
       return match.includes('@') ? '[redacted-credential]@' : '[redacted-secret]'
     })
   }
-  return sanitized.length > MAX_STRING_DETAIL_LENGTH
-    ? `${sanitized.slice(0, MAX_STRING_DETAIL_LENGTH)}...`
-    : sanitized
+  return sanitized.length > maxLength ? `${sanitized.slice(0, maxLength)}...` : sanitized
+}
+
+function maxDetailStringLengthForKey(key: string): number {
+  return /(?:^|_)(?:stack|component_stack|error_stack)$/i.test(key)
+    ? MAX_STACK_DETAIL_LENGTH
+    : MAX_STRING_DETAIL_LENGTH
 }
 
 export function sanitizeCrashReportDetails(
@@ -108,7 +157,7 @@ export function sanitizeCrashReportDetails(
   const sanitized: Record<string, CrashReportDetailValue> = {}
   for (const [key, value] of Object.entries(details)) {
     if (typeof value === 'string') {
-      sanitized[key] = sanitizeCrashReportString(value)
+      sanitized[key] = sanitizeCrashReportString(value, maxDetailStringLengthForKey(key))
     } else if (typeof value === 'number' && Number.isFinite(value)) {
       sanitized[key] = value
     } else if (typeof value === 'boolean' || value === null) {
@@ -185,5 +234,15 @@ export function formatCrashReportText(report: CrashReportRecord, notes?: string)
     lines.push('', 'User notes:', sanitizeCrashReportString(trimmedNotes))
   }
 
-  return lines.join('\n')
+  return truncateFormattedCrashReport(lines.join('\n'))
+}
+
+function truncateFormattedCrashReport(text: string): string {
+  if (text.length <= MAX_FORMATTED_REPORT_LENGTH) {
+    return text
+  }
+  // Why: the feedback endpoint accepts larger crash bodies and handles
+  // Slack-specific attachments server-side. Keep local reports below that API cap.
+  const budget = MAX_FORMATTED_REPORT_LENGTH - FORMATTED_REPORT_TRUNCATION_SUFFIX.length
+  return `${text.slice(0, Math.max(0, budget)).trimEnd()}${FORMATTED_REPORT_TRUNCATION_SUFFIX}`
 }

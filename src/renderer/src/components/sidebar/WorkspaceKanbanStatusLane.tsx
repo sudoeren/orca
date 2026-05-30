@@ -64,7 +64,7 @@ export default function WorkspaceKanbanStatusLane({
   const meta = getWorkspaceStatusVisualMeta(status)
   const createTooltip = canCreateWorktree
     ? `New workspace in ${status.label}`
-    : 'Add a Git project to create worktrees'
+    : 'Add a project to create workspaces'
   const createButton = (
     <Button
       type="button"
@@ -88,7 +88,8 @@ export default function WorkspaceKanbanStatusLane({
         'relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden rounded-md border border-t-2 border-sidebar-border transition-colors',
         meta.border,
         meta.laneTint,
-        isDragTarget && 'border-sidebar-ring bg-sidebar-accent/70'
+        isDragTarget && 'border-sidebar-ring bg-sidebar-accent/70',
+        'data-[workspace-board-external-drag-target=true]:border-sidebar-ring data-[workspace-board-external-drag-target=true]:bg-sidebar-accent/70'
       )}
       onDragOver={(event) => onDragOver(event, status.id)}
       onDragLeave={onDragLeave}
@@ -138,7 +139,10 @@ export default function WorkspaceKanbanStatusLane({
         </Tooltip>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-1.5 py-2 scrollbar-sleek">
+      <div
+        data-workspace-board-lane-scroll=""
+        className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-1.5 py-2 scrollbar-sleek"
+      >
         {items.length > 0 ? (
           <div className="space-y-2">
             {items.map((worktree) => {

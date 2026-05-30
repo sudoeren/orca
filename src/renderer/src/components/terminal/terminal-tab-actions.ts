@@ -50,58 +50,6 @@ export function createNewTerminalTab(
   state.setTabBarOrder(activeWorktreeId, order)
 }
 
-export function closeTerminalTab(tabId: string): void {
-  const state = useAppStore.getState()
-  const owningWorktreeEntry = Object.entries(state.tabsByWorktree).find(([, worktreeTabs]) =>
-    worktreeTabs.some((tab) => tab.id === tabId)
-  )
-  const owningWorktreeId = owningWorktreeEntry?.[0] ?? null
-
-  if (!owningWorktreeId) {
-    return
-  }
-
-  const runtimeEnvironmentId = state.settings?.activeRuntimeEnvironmentId?.trim()
-  if (isWebRuntimeSessionActive(runtimeEnvironmentId)) {
-    // Why: paired web tabs are host-owned. Closing locally leaves the host to
-    // re-publish the same stale surface on the next session-tabs snapshot.
-    void closeWebRuntimeSessionTab({
-      worktreeId: owningWorktreeId,
-      tabId,
-      environmentId: runtimeEnvironmentId
-    })
-    return
-  }
-
-  const currentTabs = state.tabsByWorktree[owningWorktreeId] ?? []
-  if (currentTabs.length <= 1) {
-    state.closeTab(tabId)
-    if (state.activeWorktreeId === owningWorktreeId) {
-      // Why: only deactivate the worktree when no tabs of any kind remain.
-      // Editor files are a separate tab type; closing the last terminal tab
-      // should switch to the editor view instead of tearing down the workspace.
-      const worktreeFile = state.openFiles.find((f) => f.worktreeId === owningWorktreeId)
-      if (worktreeFile) {
-        state.setActiveFile(worktreeFile.id)
-        state.setActiveTabType('editor')
-      } else {
-        state.setActiveWorktree(null)
-      }
-    }
-    return
-  }
-
-  if (state.activeWorktreeId === owningWorktreeId && tabId === state.activeTabId) {
-    const currentIndex = currentTabs.findIndex((tab) => tab.id === tabId)
-    const nextTab = currentTabs[currentIndex + 1] ?? currentTabs[currentIndex - 1]
-    if (nextTab) {
-      state.setActiveTab(nextTab.id)
-    }
-  }
-
-  state.closeTab(tabId)
-}
-
 export function closeOtherTerminalTabs(tabId: string, activeWorktreeId: string | null): void {
   if (!activeWorktreeId) {
     return
@@ -109,9 +57,21 @@ export function closeOtherTerminalTabs(tabId: string, activeWorktreeId: string |
   const state = useAppStore.getState()
   const currentTabs = state.tabsByWorktree[activeWorktreeId] ?? []
   state.setActiveTab(tabId)
+  const runtimeEnvironmentId = state.settings?.activeRuntimeEnvironmentId?.trim()
+  const closeHostTerminalTabs = isWebRuntimeSessionActive(runtimeEnvironmentId)
   for (const tab of currentTabs) {
     if (tab.id !== tabId) {
-      state.closeTab(tab.id)
+      if (closeHostTerminalTabs) {
+        // Why: paired web tabs are host-owned; local-only bulk close leaves
+        // the host to re-publish the supposedly closed terminal tabs.
+        void closeWebRuntimeSessionTab({
+          worktreeId: activeWorktreeId,
+          tabId: tab.id,
+          environmentId: runtimeEnvironmentId
+        })
+      } else {
+        state.closeTab(tab.id)
+      }
     }
   }
 }
@@ -124,6 +84,8 @@ export function closeTerminalTabsToRight(tabId: string, activeWorktreeId: string
   const state = useAppStore.getState()
   const currentTerminalTabs = state.tabsByWorktree[activeWorktreeId] ?? []
   const currentEditorFiles = state.openFiles.filter((f) => f.worktreeId === activeWorktreeId)
+  const runtimeEnvironmentId = state.settings?.activeRuntimeEnvironmentId?.trim()
+  const closeHostTerminalTabs = isWebRuntimeSessionActive(runtimeEnvironmentId)
   const terminalIds = currentTerminalTabs.map((t) => t.id)
   const terminalIdSet = new Set(terminalIds)
   const orderedIds = reconcileTabOrder(
@@ -139,7 +101,17 @@ export function closeTerminalTabsToRight(tabId: string, activeWorktreeId: string
   const rightIds = orderedIds.slice(index + 1)
   for (const id of rightIds) {
     if (terminalIdSet.has(id)) {
-      state.closeTab(id)
+      if (closeHostTerminalTabs) {
+        // Why: paired web tabs are host-owned; local-only bulk close leaves
+        // the host to re-publish the supposedly closed terminal tabs.
+        void closeWebRuntimeSessionTab({
+          worktreeId: activeWorktreeId,
+          tabId: id,
+          environmentId: runtimeEnvironmentId
+        })
+      } else {
+        state.closeTab(id)
+      }
     } else {
       useAppStore.getState().closeFile(id)
     }
@@ -164,12 +136,6 @@ export function activateTerminalTab(tabId: string): void {
   }
   s.setActiveTab(tabId)
   s.setActiveTabType('terminal')
-}
-
-export function activateEditorFile(fileId: string): void {
-  const s = useAppStore.getState()
-  s.setActiveFile(fileId)
-  s.setActiveTabType('editor')
 }
 
 export function toggleTerminalPaneExpand(tabId: string): void {

@@ -2,10 +2,13 @@ import type {
   CheckStatus,
   GitLabIssueInfo,
   GitLabWorkItem,
-  MRCheckDetail,
   MRInfo,
   MRState
 } from '../../shared/types'
+import {
+  mapGitLabPipelineJobStatusToCheckStatus,
+  mapGitLabPipelineJobStatusToConclusion
+} from '../../shared/gitlab-pipeline-checks'
 
 // ── Pipeline job mapping (GitLab REST `/pipelines/:id/jobs`) ────────
 // Why: GitLab pipeline jobs roughly map to GitHub check-runs, but use a
@@ -13,49 +16,8 @@ import type {
 // into PRCheckDetail's status + conclusion shape so the renderer can
 // share a row with the GitHub side.
 
-export function mapPipelineJobStatusToCheckStatus(status: string): MRCheckDetail['status'] {
-  const s = status?.toLowerCase()
-  if (s === 'created' || s === 'pending' || s === 'waiting_for_resource' || s === 'preparing') {
-    return 'queued'
-  }
-  if (s === 'running') {
-    return 'in_progress'
-  }
-  return 'completed'
-}
-
-export function mapPipelineJobStatusToConclusion(status: string): MRCheckDetail['conclusion'] {
-  const s = status?.toLowerCase()
-  if (s === 'success') {
-    return 'success'
-  }
-  if (s === 'failed') {
-    return 'failure'
-  }
-  if (s === 'canceled' || s === 'canceling') {
-    return 'cancelled'
-  }
-  if (s === 'skipped') {
-    return 'skipped'
-  }
-  // Why: 'manual' jobs require user trigger and never auto-complete; we
-  // surface them as neutral rather than pending so they don't stall the
-  // top-level rollup at "pending" forever.
-  if (s === 'manual') {
-    return 'neutral'
-  }
-  if (
-    s === 'created' ||
-    s === 'pending' ||
-    s === 'running' ||
-    s === 'waiting_for_resource' ||
-    s === 'preparing' ||
-    s === 'scheduled'
-  ) {
-    return 'pending'
-  }
-  return null
-}
+export const mapPipelineJobStatusToCheckStatus = mapGitLabPipelineJobStatusToCheckStatus
+export const mapPipelineJobStatusToConclusion = mapGitLabPipelineJobStatusToConclusion
 
 // ── MR state mapping ────────────────────────────────────────────────
 // Why: glab returns the API state directly. Apply the draft flag (or a
@@ -94,6 +56,7 @@ export function mapGitLabIssueInfo(data: {
   web_url?: string
   url?: string
   labels?: { name: string }[] | string[]
+  updated_at?: string
   description?: string | null
   author?: { username?: string | null; avatar_url?: string | null } | null
 }): GitLabIssueInfo {
@@ -107,6 +70,7 @@ export function mapGitLabIssueInfo(data: {
     state: data.state?.toLowerCase() === 'opened' ? 'opened' : 'closed',
     url: data.web_url ?? data.url ?? '',
     labels,
+    ...(data.updated_at ? { updatedAt: data.updated_at } : {}),
     // Why: same description / author optional plumbing as mapMRInfo —
     // list payloads strip these so callers can tell "absent" from "blank".
     ...(typeof data.description === 'string' ? { description: data.description } : {}),
@@ -245,7 +209,11 @@ type GitLabMRRawForWorkItem = {
   target_project_id?: number
 }
 
-export function mapMRToWorkItem(data: GitLabMRRawForWorkItem, repoId: string): GitLabWorkItem {
+export function mapMRToWorkItem(
+  data: GitLabMRRawForWorkItem,
+  repoId: string,
+  projectRef?: GitLabWorkItem['projectRef']
+): GitLabWorkItem {
   const labels = (data.labels ?? []).map((l) => (typeof l === 'string' ? l : l.name))
   const number = data.iid ?? 0
   return {
@@ -266,7 +234,8 @@ export function mapMRToWorkItem(data: GitLabMRRawForWorkItem, repoId: string): G
       data.source_project_id !== undefined &&
       data.target_project_id !== undefined &&
       data.source_project_id !== data.target_project_id,
-    repoId
+    repoId,
+    ...(projectRef ? { projectRef } : {})
   }
 }
 
@@ -284,7 +253,8 @@ type GitLabIssueRawForWorkItem = {
 
 export function mapIssueToWorkItem(
   data: GitLabIssueRawForWorkItem,
-  repoId: string
+  repoId: string,
+  projectRef?: GitLabWorkItem['projectRef']
 ): GitLabWorkItem {
   const labels = (data.labels ?? []).map((l) => (typeof l === 'string' ? l : l.name))
   const number = data.iid ?? 0
@@ -301,7 +271,8 @@ export function mapIssueToWorkItem(
     labels,
     updatedAt: data.updated_at ?? '',
     author: data.author?.username ?? null,
-    repoId
+    repoId,
+    ...(projectRef ? { projectRef } : {})
   }
 }
 

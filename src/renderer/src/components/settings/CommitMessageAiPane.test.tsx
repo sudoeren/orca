@@ -2,8 +2,17 @@ import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { beforeEach, describe, expect, it } from 'vitest'
 import type { GlobalSettings } from '../../../../shared/types'
+import type { SourceControlAiSettings } from '../../../../shared/source-control-ai-types'
+import {
+  getCommitMessageModelDiscoveryHostKey,
+  getCommitMessageModelDiscoveryHostKeyForScope
+} from '../../../../shared/commit-message-host-key'
 import { useAppStore } from '../../store'
-import { CommitMessageAiPane } from './CommitMessageAiPane'
+import {
+  CommitMessageAiPane,
+  getCommitMessageSettingsPaneDiscoveryHostKey,
+  mergeDiscoveredModelsIntoCommitMessageConfig
+} from './CommitMessageAiPane'
 import { COMMIT_MESSAGE_AI_PANE_SEARCH_ENTRIES } from './commit-message-ai-search'
 
 function renderPane(settings: GlobalSettings): string {
@@ -37,10 +46,10 @@ describe('CommitMessageAiPane', () => {
   it('renders only the opt-in control before the feature is enabled', () => {
     const markup = renderPane(buildSettings())
 
-    expect(markup).toContain('AI Commit Messages')
-    expect(markup).toContain('Enable AI commit messages')
+    expect(markup).toContain('Source Control AI')
+    expect(markup).toContain('Enable Source Control AI')
     expect(markup).toContain('aria-checked="false"')
-    expect(markup).not.toContain('Which agent drafts your commit messages')
+    expect(markup).not.toContain('Orca invokes this CLI')
     expect(markup).not.toContain('Thinking effort')
   })
 
@@ -59,13 +68,34 @@ describe('CommitMessageAiPane', () => {
     )
 
     expect(markup).toContain('aria-checked="true"')
-    expect(markup).toContain('Which agent drafts your commit messages')
-    expect(markup).toContain('Model')
+    expect(markup).toContain('Orca invokes this CLI')
+    expect(markup).toContain('Default model')
     expect(markup).toContain('Thinking effort')
+    expect(markup).toContain('Commit message model')
+    expect(markup).toContain('PR details model')
+    expect(markup).not.toContain('Branch name model')
     expect(markup).toContain('Higher effort produces more careful messages')
     expect(markup).toContain('Use Conventional Commits.')
     expect(markup).toContain('Save')
     expect(markup).toContain('Saved')
+  })
+
+  it('keeps the agent and model selectors aligned for long labels', () => {
+    const markup = renderPane(
+      buildSettings({
+        commitMessageAi: {
+          enabled: true,
+          agentId: 'copilot',
+          selectedModelByAgent: { copilot: 'gpt-5.5' },
+          selectedThinkingByModel: {},
+          customPrompt: '',
+          customAgentCommand: ''
+        }
+      })
+    )
+
+    expect(markup.match(/w-\[260px\]/g)).toHaveLength(2)
+    expect(markup.match(/shrink-0/g)?.length ?? 0).toBeGreaterThanOrEqual(2)
   })
 
   it('renders custom command settings for custom agents', () => {
@@ -82,7 +112,7 @@ describe('CommitMessageAiPane', () => {
       })
     )
 
-    expect(markup).toContain('AI Commit Messages')
+    expect(markup).toContain('Source Control AI')
     expect(markup).toContain('Custom command')
     expect(markup).toContain('ollama run llama3.1 {prompt}')
   })
@@ -90,7 +120,7 @@ describe('CommitMessageAiPane', () => {
   it('shows an unconfigured state when the default agent is unsupported', () => {
     const markup = renderPane(
       buildSettings({
-        defaultTuiAgent: 'gemini',
+        defaultTuiAgent: 'aider',
         commitMessageAi: {
           enabled: true,
           agentId: null,
@@ -103,10 +133,29 @@ describe('CommitMessageAiPane', () => {
     )
 
     expect(markup).toContain('Not configured')
-    expect(markup).toContain('Your default agent is Gemini')
-    expect(markup).toContain('Choose Claude, Codex, or Custom')
+    expect(markup).toContain('Your default agent is Aider')
+    expect(markup).toContain('Choose a supported agent or Custom')
     expect(markup).not.toContain('Which model the selected agent uses')
     expect(markup).not.toContain('Thinking effort')
+  })
+
+  it('shows Gemini as coming soon instead of a selectable generator', () => {
+    const markup = renderPane(
+      buildSettings({
+        commitMessageAi: {
+          enabled: true,
+          agentId: 'gemini',
+          selectedModelByAgent: {},
+          selectedThinkingByModel: {},
+          customPrompt: '',
+          customAgentCommand: ''
+        }
+      })
+    )
+
+    expect(markup).toContain('Gemini')
+    expect(markup).toContain('Gemini Source Control AI is coming soon')
+    expect(markup).not.toContain('Which model Source Control AI uses')
   })
 
   it('keeps custom command discoverable in settings search metadata', () => {
@@ -117,5 +166,86 @@ describe('CommitMessageAiPane', () => {
     expect(customCommandEntry?.keywords).toEqual(
       expect.arrayContaining(['custom', 'command', 'ollama'])
     )
+  })
+
+  it('merges discovered models without clobbering newer settings fields', () => {
+    const config: SourceControlAiSettings = {
+      enabled: true,
+      agentId: 'cursor',
+      selectedModelByAgent: { cursor: 'stale-model', codex: 'gpt-5.5' },
+      selectedThinkingByModel: { 'gpt-5.5': 'low' },
+      instructionsByOperation: { commitMessage: 'Use Conventional Commits.' },
+      customAgentCommand: '',
+      discoveredModelsByAgent: {}
+    }
+
+    const merged = mergeDiscoveredModelsIntoCommitMessageConfig(
+      config,
+      'cursor',
+      [{ id: 'auto', label: 'Auto' }],
+      'auto'
+    )
+
+    expect(merged.instructionsByOperation.commitMessage).toBe('Use Conventional Commits.')
+    expect(merged.agentId).toBe('cursor')
+    expect(merged.selectedModelByAgent).toEqual({
+      cursor: 'auto',
+      codex: 'gpt-5.5'
+    })
+    expect(merged.discoveredModelsByAgent?.cursor).toEqual([{ id: 'auto', label: 'Auto' }])
+    expect(merged.discoveredModelsByAgentByHost?.local?.cursor).toEqual([
+      { id: 'auto', label: 'Auto' }
+    ])
+  })
+
+  it('keeps SSH discovered models out of the legacy local cache', () => {
+    const config: SourceControlAiSettings = {
+      enabled: true,
+      agentId: 'cursor',
+      selectedModelByAgent: { cursor: 'auto' },
+      selectedThinkingByModel: {},
+      instructionsByOperation: {},
+      customAgentCommand: '',
+      discoveredModelsByAgent: { cursor: [{ id: 'auto', label: 'Auto' }] },
+      selectedModelByAgentByHost: {},
+      discoveredModelsByAgentByHost: {}
+    }
+
+    const merged = mergeDiscoveredModelsIntoCommitMessageConfig(
+      config,
+      'cursor',
+      [{ id: 'remote-only', label: 'Remote Only' }],
+      'remote-only',
+      'ssh:conn-1'
+    )
+
+    expect(merged.selectedModelByAgent.cursor).toBe('auto')
+    expect(merged.discoveredModelsByAgent?.cursor).toEqual([{ id: 'auto', label: 'Auto' }])
+    expect(merged.selectedModelByAgentByHost?.['ssh:conn-1']?.cursor).toBe('remote-only')
+    expect(merged.discoveredModelsByAgentByHost?.['ssh:conn-1']?.cursor).toEqual([
+      { id: 'remote-only', label: 'Remote Only' }
+    ])
+  })
+
+  it('keys model discovery cache by execution host', () => {
+    expect(getCommitMessageModelDiscoveryHostKey(null)).toBe('local')
+    expect(getCommitMessageModelDiscoveryHostKey('ssh-1')).toBe('ssh:ssh-1')
+    expect(getCommitMessageModelDiscoveryHostKey(undefined)).toBe('unknown')
+    expect(getCommitMessageModelDiscoveryHostKeyForScope('runtime:env-1')).toBe('runtime:env-1')
+    expect(getCommitMessageModelDiscoveryHostKeyForScope('ssh-1')).toBe('ssh:ssh-1')
+  })
+
+  it('keeps local active worktree discovery scoped to local, not unknown', () => {
+    expect(getCommitMessageSettingsPaneDiscoveryHostKey(buildSettings(), null, true)).toBe('local')
+    expect(getCommitMessageSettingsPaneDiscoveryHostKey(buildSettings(), undefined, true)).toBe(
+      'unknown'
+    )
+    expect(
+      getCommitMessageSettingsPaneDiscoveryHostKey(
+        buildSettings({ activeRuntimeEnvironmentId: 'env-1' }),
+        null,
+        true
+      )
+    ).toBe('runtime:env-1')
   })
 })

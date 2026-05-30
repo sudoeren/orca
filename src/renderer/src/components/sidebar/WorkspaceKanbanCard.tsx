@@ -1,18 +1,24 @@
-import React, { useCallback, useMemo } from 'react'
-import { Pin } from 'lucide-react'
+import React, { useCallback, useMemo, useRef, useState } from 'react'
+import { Pin, Trash2 } from 'lucide-react'
 import { useAppStore } from '@/store'
 import { Badge } from '@/components/ui/badge'
 import { HoverCard, HoverCardContent, HoverCardTrigger } from '@/components/ui/hover-card'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { activateAndRevealWorktree } from '@/lib/worktree-activation'
-import { getWorktreeStatusLabel } from '@/lib/worktree-status'
+import { RepoBadgeMark } from '@/components/repo/RepoBadgeLabel'
 import { cn } from '@/lib/utils'
 import type { Repo, Worktree } from '../../../../shared/types'
-import StatusIndicator from './StatusIndicator'
 import WorktreeCard from './WorktreeCard'
+import { WorktreeActivityStatusIndicator } from './WorktreeActivityStatusIndicator'
 import WorktreeContextMenu from './WorktreeContextMenu'
-import { useWorktreeActivityStatus } from './use-worktree-activity-status'
+import { getWorkspaceKanbanDetailsHoverOpenState } from './workspace-kanban-details-hover'
 import { writeWorkspaceDragData } from './workspace-status'
+import { WorktreeTitleInlineRename } from './WorktreeTitleInlineRename'
+import { runWorktreeDelete } from './delete-worktree-flow'
+import {
+  canShowWorkspaceDeleteQuickAction,
+  useWorkspaceDeleteModifierPressed
+} from './workspace-delete-quick-action'
 
 type WorkspaceKanbanCardProps = {
   worktree: Worktree
@@ -107,8 +113,13 @@ function WorkspaceKanbanCompactCard({
   onContextMenuSelect
 }: Omit<WorkspaceKanbanCardProps, 'compact'>): React.JSX.Element {
   const deleteState = useAppStore((s) => s.deleteStateByWorktreeId[worktree.id])
+  const updateWorktreeMeta = useAppStore((s) => s.updateWorktreeMeta)
+  const openModal = useAppStore((s) => s.openModal)
   const isDeleting = deleteState?.isDeleting ?? false
-  const status = useWorktreeActivityStatus(worktree.id)
+  const deleteModifierPressed = useWorkspaceDeleteModifierPressed()
+  const [detailsOpen, setDetailsOpen] = useState(false)
+  const [titleRenaming, setTitleRenaming] = useState(false)
+  const contextMenuOpenRef = useRef(false)
   const contextWorktrees = useMemo(
     () =>
       isSelected && selectedWorktrees && selectedWorktrees.length > 0
@@ -126,7 +137,7 @@ function WorkspaceKanbanCompactCard({
   }, [isDeleting, onActivate, worktree.id])
 
   const handleClick = useCallback(
-    (event: React.MouseEvent<HTMLButtonElement>) => {
+    (event: React.MouseEvent<HTMLElement>) => {
       const selectionOnly = onSelectionGesture(event, worktree.id)
       if (selectionOnly) {
         event.preventDefault()
@@ -138,8 +149,19 @@ function WorkspaceKanbanCompactCard({
     [handleActivate, onSelectionGesture, worktree.id]
   )
 
+  const handleKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLElement>) => {
+      if (titleRenaming || isDeleting || (event.key !== 'Enter' && event.key !== ' ')) {
+        return
+      }
+      event.preventDefault()
+      handleActivate()
+    },
+    [handleActivate, isDeleting, titleRenaming]
+  )
+
   const handleDragStart = useCallback(
-    (event: React.DragEvent<HTMLButtonElement>) => {
+    (event: React.DragEvent<HTMLElement>) => {
       if (isDeleting) {
         event.preventDefault()
         return
@@ -153,21 +175,99 @@ function WorkspaceKanbanCompactCard({
     [contextWorktrees, isDeleting, isSelected, worktree.id]
   )
 
+  const handleRenameTitle = useCallback(
+    (displayName: string) => updateWorktreeMeta(worktree.id, { displayName }),
+    [updateWorktreeMeta, worktree.id]
+  )
+
+  const handleDoubleClick = useCallback(() => {
+    openModal('edit-meta', {
+      worktreeId: worktree.id,
+      currentDisplayName: worktree.displayName,
+      currentIssue: worktree.linkedIssue,
+      currentPR: worktree.linkedPR,
+      currentComment: worktree.comment
+    })
+  }, [
+    openModal,
+    worktree.comment,
+    worktree.displayName,
+    worktree.id,
+    worktree.linkedIssue,
+    worktree.linkedPR
+  ])
+
+  const handleDetailsOpenChange = useCallback((requestedOpen: boolean) => {
+    setDetailsOpen(
+      getWorkspaceKanbanDetailsHoverOpenState({
+        contextMenuOpen: contextMenuOpenRef.current,
+        requestedOpen
+      })
+    )
+  }, [])
+
+  const handleContextMenuOpenChange = useCallback((open: boolean) => {
+    contextMenuOpenRef.current = open
+    if (open) {
+      // Why: the preview sits beside the compact card, so it should disappear
+      // as soon as the card's context menu becomes the active surface.
+      setDetailsOpen(false)
+    }
+  }, [])
+
+  const handleContextMenuSelect = useCallback(
+    (event: React.MouseEvent<HTMLElement>) => {
+      setDetailsOpen(false)
+      return onContextMenuSelect(event, worktree)
+    },
+    [onContextMenuSelect, worktree]
+  )
+  const showDeleteQuickAction = canShowWorkspaceDeleteQuickAction({
+    deleteModifierPressed,
+    isDeleting,
+    isMainWorktree: worktree.isMainWorktree
+  })
+  const stopQuickActionPropagation = useCallback(
+    (event: React.SyntheticEvent<HTMLButtonElement>) => {
+      event.stopPropagation()
+    },
+    []
+  )
+  const handleDeleteQuickAction = useCallback(
+    (event: React.MouseEvent<HTMLButtonElement>) => {
+      event.preventDefault()
+      event.stopPropagation()
+      if (showDeleteQuickAction) {
+        runWorktreeDelete(worktree.id)
+      }
+    },
+    [showDeleteQuickAction, worktree.id]
+  )
+
   return (
     <WorktreeContextMenu
       worktree={worktree}
       selectedWorktrees={contextWorktrees}
-      onContextMenuSelect={(event) => onContextMenuSelect(event, worktree)}
+      onContextMenuSelect={handleContextMenuSelect}
+      onOpenChange={handleContextMenuOpenChange}
     >
-      <HoverCard openDelay={450} closeDelay={100}>
+      <HoverCard
+        open={detailsOpen}
+        onOpenChange={handleDetailsOpenChange}
+        openDelay={450}
+        closeDelay={100}
+      >
         <HoverCardTrigger asChild>
-          <button
-            type="button"
-            draggable={nativeDragEnabled && !isDeleting}
+          <div
+            role="button"
+            tabIndex={isDeleting ? -1 : 0}
+            draggable={nativeDragEnabled && !isDeleting && !titleRenaming}
             onDragStart={nativeDragEnabled ? handleDragStart : undefined}
             onClick={handleClick}
+            onDoubleClick={handleDoubleClick}
+            onKeyDown={handleKeyDown}
             className={cn(
-              'flex h-8 w-full min-w-0 cursor-pointer items-center rounded-md border px-2 text-left text-[12px] outline-none transition-colors',
+              'group relative flex h-8 w-full min-w-0 cursor-pointer items-center rounded-md border px-2 text-left text-[12px] outline-none transition-colors',
               isActive
                 ? 'border-sidebar-ring bg-sidebar-accent text-sidebar-accent-foreground'
                 : isSelected
@@ -176,6 +276,8 @@ function WorkspaceKanbanCompactCard({
               isActive && isSelected && 'ring-1 ring-sidebar-ring/35',
               'data-[workspace-board-card-area-selected=true]:border-sidebar-ring/50 data-[workspace-board-card-area-selected=true]:bg-sidebar-accent/75 data-[workspace-board-card-area-selected=true]:ring-1 data-[workspace-board-card-area-selected=true]:ring-sidebar-ring/30',
               !nativeDragEnabled && !isDeleting && '!cursor-grab',
+              showDeleteQuickAction && 'pr-7',
+              titleRenaming && '!border-transparent !bg-transparent !ring-0 cursor-default',
               isDeleting && 'cursor-not-allowed opacity-50 grayscale'
             )}
             data-workspace-board-card-mode="compact"
@@ -185,11 +287,17 @@ function WorkspaceKanbanCompactCard({
               nativeDragEnabled || isDeleting ? undefined : 'true'
             }
             aria-label={`Open ${worktree.displayName}`}
+            aria-disabled={isDeleting ? true : undefined}
             aria-busy={isDeleting}
           >
-            <StatusIndicator status={status} aria-hidden="true" className="mr-1" />
-            <span className="sr-only">{getWorktreeStatusLabel(status)}</span>
-            <span className="min-w-0 flex-1 truncate">{worktree.displayName}</span>
+            <WorktreeActivityStatusIndicator worktreeId={worktree.id} className="mr-1" />
+            <WorktreeTitleInlineRename
+              displayName={worktree.displayName}
+              disabled={isDeleting}
+              className="flex-1 text-[12px]"
+              onEditingChange={setTitleRenaming}
+              onRename={handleRenameTitle}
+            />
             {repo ? (
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -197,10 +305,7 @@ function WorkspaceKanbanCompactCard({
                     className="ml-2 flex max-w-[25%] shrink-0 items-center gap-1 rounded-[4px] border border-border bg-accent px-1.5 py-0.5 leading-none dark:border-border/60 dark:bg-accent/50"
                     data-workspace-board-repo-badge=""
                   >
-                    <span
-                      className="size-1.5 shrink-0 rounded-full"
-                      style={{ backgroundColor: repo.badgeColor }}
-                    />
+                    <RepoBadgeMark color={repo.badgeColor} />
                     <span className="min-w-0 truncate text-[10px] font-semibold lowercase text-foreground">
                       {repo.displayName}
                     </span>
@@ -211,9 +316,38 @@ function WorkspaceKanbanCompactCard({
                 </TooltipContent>
               </Tooltip>
             ) : null}
-          </button>
+            {showDeleteQuickAction && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    data-workspace-board-preserve-open=""
+                    onPointerDown={stopQuickActionPropagation}
+                    onKeyDown={stopQuickActionPropagation}
+                    onClick={handleDeleteQuickAction}
+                    className={cn(
+                      'absolute right-1 top-1 z-20 inline-flex size-5 items-center justify-center rounded border border-sidebar-border bg-sidebar/95 text-muted-foreground opacity-0 shadow-xs transition-colors transition-opacity',
+                      'group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100',
+                      'hover:bg-destructive/10 hover:text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sidebar-ring'
+                    )}
+                    aria-label="Delete workspace"
+                  >
+                    <Trash2 className="size-3.5" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="top" sideOffset={4}>
+                  Delete workspace
+                </TooltipContent>
+              </Tooltip>
+            )}
+          </div>
         </HoverCardTrigger>
-        <HoverCardContent side="right" align="start" sideOffset={8} className="w-72 p-1.5">
+        <HoverCardContent
+          side="right"
+          align="start"
+          sideOffset={8}
+          className="w-72 p-1.5 data-[state=closed]:hidden"
+        >
           <WorktreeCard
             worktree={worktree}
             repo={repo}

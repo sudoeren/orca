@@ -66,14 +66,24 @@ function formatStyles(styles: BrowserGrabComputedStyles): string[] {
   return lines
 }
 
+// Why: annotation snippets come from page DOM; avoid spreading every backtick
+// run into Math.max when generated HTML contains many fence characters.
+function maxBacktickRunLength(content: string, floor: number): number {
+  let maxRun = floor
+  for (const match of content.matchAll(/`+/g)) {
+    maxRun = Math.max(maxRun, match[0].length)
+  }
+  return maxRun
+}
+
 function fence(language: string, content: string): string[] {
-  const maxRun = Math.max(3, ...Array.from(content.matchAll(/`+/g), (match) => match[0].length))
+  const maxRun = maxBacktickRunLength(content, 3)
   const marker = '`'.repeat(maxRun + 1)
   return [`${marker}${language}`, content, marker]
 }
 
 function inlineCode(content: string): string {
-  const maxRun = Math.max(0, ...Array.from(content.matchAll(/`+/g), (match) => match[0].length))
+  const maxRun = maxBacktickRunLength(content, 0)
   const marker = '`'.repeat(maxRun + 1)
   const padding = content.startsWith('`') || content.endsWith('`') ? ' ' : ''
   return `${marker}${padding}${content}${padding}${marker}`
@@ -104,7 +114,6 @@ export function formatBrowserAnnotationsAsMarkdown(annotations: BrowserPageAnnot
 
     lines.push(`### ${index + 1}. ${annotationElementLabel(payload)}`)
     lines.push(`**Intent:** ${annotation.intent}`)
-    lines.push(`**Priority:** ${annotation.priority}`)
     lines.push(`**Selector:** ${inlineCode(target.selector)}`)
     if (target.elementPath) {
       lines.push(`**Location:** ${inlineCode(target.elementPath)}`)

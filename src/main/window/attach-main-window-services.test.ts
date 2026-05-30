@@ -1,11 +1,15 @@
+/* eslint-disable max-lines -- Why: attachMainWindowServices centralizes main-window IPC wiring; keeping its integration-style mocks together avoids brittle cross-file setup. */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const {
   onMock,
   removeAllListenersMock,
+  removeListenerMock,
   setPermissionRequestHandlerMock,
   setPermissionCheckHandlerMock,
   setDisplayMediaRequestHandlerMock,
+  handleMock,
+  removeHandlerMock,
   systemPreferencesAskForMediaAccessMock,
   systemPreferencesGetMediaAccessStatusMock,
   registerRepoHandlersMock,
@@ -19,9 +23,12 @@ const {
 } = vi.hoisted(() => ({
   onMock: vi.fn(),
   removeAllListenersMock: vi.fn(),
+  removeListenerMock: vi.fn(),
   setPermissionRequestHandlerMock: vi.fn(),
   setPermissionCheckHandlerMock: vi.fn(),
   setDisplayMediaRequestHandlerMock: vi.fn(),
+  handleMock: vi.fn(),
+  removeHandlerMock: vi.fn(),
   systemPreferencesAskForMediaAccessMock: vi.fn(),
   systemPreferencesGetMediaAccessStatusMock: vi.fn(),
   registerRepoHandlersMock: vi.fn(),
@@ -47,8 +54,13 @@ vi.mock('electron', () => ({
   ipcMain: {
     on: onMock,
     removeAllListeners: removeAllListenersMock,
-    removeHandler: vi.fn(),
-    handle: vi.fn()
+    removeListener: removeListenerMock,
+    removeHandler: removeHandlerMock,
+    handle: handleMock
+  },
+  powerMonitor: {
+    on: vi.fn(),
+    off: vi.fn()
   }
 }))
 
@@ -89,8 +101,11 @@ type MainWindowStub = {
   isDestroyed?: MockFn
   on: MockFn
   webContents: {
+    id?: number
+    isDestroyed?: MockFn
     on: MockFn
     send?: MockFn
+    reload?: MockFn
     session: {
       setPermissionRequestHandler: MockFn
       setPermissionCheckHandler: MockFn
@@ -107,9 +122,13 @@ type RuntimeStub = {
 
 function createMainWindow(extraWebContents: { on?: MockFn; send?: MockFn } = {}): MainWindowStub {
   return {
+    isDestroyed: vi.fn(() => false),
     on: vi.fn(),
     webContents: {
+      id: 1,
+      isDestroyed: vi.fn(() => false),
       on: vi.fn(),
+      reload: vi.fn(),
       session: {
         setPermissionRequestHandler: setPermissionRequestHandlerMock,
         setPermissionCheckHandler: setPermissionCheckHandlerMock
@@ -136,6 +155,9 @@ describe('attachMainWindowServices', () => {
   beforeEach(() => {
     onMock.mockReset()
     removeAllListenersMock.mockReset()
+    removeListenerMock.mockReset()
+    handleMock.mockReset()
+    removeHandlerMock.mockReset()
     setPermissionRequestHandlerMock.mockReset()
     setPermissionCheckHandlerMock.mockReset()
     setDisplayMediaRequestHandlerMock.mockReset()
@@ -153,10 +175,106 @@ describe('attachMainWindowServices', () => {
       setPermissionRequestHandler: setPermissionRequestHandlerMock,
       setPermissionCheckHandler: setPermissionCheckHandlerMock,
       setDisplayMediaRequestHandler: setDisplayMediaRequestHandlerMock,
-      on: vi.fn()
+      on: vi.fn(),
+      removeListener: vi.fn()
     })
     systemPreferencesAskForMediaAccessMock.mockResolvedValue(true)
     systemPreferencesGetMediaAccessStatusMock.mockReturnValue('granted')
+  })
+
+  it('reloads the app renderer through main and marks expected renderer teardown', async () => {
+    const onBeforeRendererReload = vi.fn()
+    const mainWindow = createMainWindow()
+
+    attachMainWindowServices(
+      mainWindow as never,
+      createStore(),
+      createRuntime() as never,
+      undefined,
+      undefined,
+      { onBeforeRendererReload }
+    )
+
+    expect(removeHandlerMock).toHaveBeenCalledWith('app:reload')
+    const reloadHandler = handleMock.mock.calls.find(([channel]) => channel === 'app:reload')?.[1]
+    expect(reloadHandler).toBeTypeOf('function')
+
+    await reloadHandler?.({ sender: mainWindow.webContents })
+
+    expect(onBeforeRendererReload).toHaveBeenCalledWith({
+      webContentsId: 1,
+      ignoreCache: false
+    })
+    expect(mainWindow.webContents.reload).toHaveBeenCalledTimes(1)
+  })
+
+  it('ignores app reload requests from non-main webContents', async () => {
+    const onBeforeRendererReload = vi.fn()
+    const mainWindow = createMainWindow()
+
+    attachMainWindowServices(
+      mainWindow as never,
+      createStore(),
+      createRuntime() as never,
+      undefined,
+      undefined,
+      { onBeforeRendererReload }
+    )
+
+    const reloadHandler = handleMock.mock.calls.find(([channel]) => channel === 'app:reload')?.[1]
+    await reloadHandler?.({ sender: { id: 999 } })
+
+    expect(onBeforeRendererReload).not.toHaveBeenCalled()
+    expect(mainWindow.webContents.reload).not.toHaveBeenCalled()
+  })
+
+  it('ignores app reload requests after the main window is destroyed without rereading webContents', () => {
+    const onBeforeRendererReload = vi.fn()
+    const mainWindow = createMainWindow()
+    const mainWebContents = mainWindow.webContents
+
+    attachMainWindowServices(
+      mainWindow as never,
+      createStore(),
+      createRuntime() as never,
+      undefined,
+      undefined,
+      { onBeforeRendererReload }
+    )
+
+    const reloadHandler = handleMock.mock.calls.find(([channel]) => channel === 'app:reload')?.[1]
+    mainWindow.isDestroyed?.mockReturnValue(true)
+    Object.defineProperty(mainWindow, 'webContents', {
+      get: () => {
+        throw new Error('webContents should not be read after registration')
+      }
+    })
+
+    expect(() => reloadHandler?.({ sender: mainWebContents })).not.toThrow()
+
+    expect(onBeforeRendererReload).not.toHaveBeenCalled()
+    expect(mainWebContents.reload).not.toHaveBeenCalled()
+  })
+
+  it('ignores app reload requests after the main webContents is destroyed', async () => {
+    const onBeforeRendererReload = vi.fn()
+    const mainWindow = createMainWindow()
+
+    attachMainWindowServices(
+      mainWindow as never,
+      createStore(),
+      createRuntime() as never,
+      undefined,
+      undefined,
+      { onBeforeRendererReload }
+    )
+
+    const reloadHandler = handleMock.mock.calls.find(([channel]) => channel === 'app:reload')?.[1]
+    mainWindow.webContents.isDestroyed?.mockReturnValue(true)
+    await reloadHandler?.({ sender: mainWindow.webContents })
+
+    expect(onBeforeRendererReload).not.toHaveBeenCalled()
+    expect(mainWindow.webContents.reload).not.toHaveBeenCalled()
   })
 
   it('only allows the explicit permission allowlist', async () => {
@@ -203,7 +321,8 @@ describe('attachMainWindowServices', () => {
       setPermissionRequestHandler: setPermissionRequestHandlerMock,
       setPermissionCheckHandler: setPermissionCheckHandlerMock,
       setDisplayMediaRequestHandler: setDisplayMediaRequestHandlerMock,
-      on: browserSessionOnMock
+      on: browserSessionOnMock,
+      removeListener: vi.fn()
     })
 
     const mainWindowOnMock = vi.fn()
@@ -265,12 +384,38 @@ describe('attachMainWindowServices', () => {
     })
   })
 
+  it('replaces the persistent browser-session download handler on re-attach', () => {
+    const browserSessionOnMock = vi.fn()
+    const browserSessionRemoveListenerMock = vi.fn()
+    sessionFromPartitionMock.mockReturnValue({
+      setPermissionRequestHandler: setPermissionRequestHandlerMock,
+      setPermissionCheckHandler: setPermissionCheckHandlerMock,
+      setDisplayMediaRequestHandler: setDisplayMediaRequestHandlerMock,
+      on: browserSessionOnMock,
+      removeListener: browserSessionRemoveListenerMock
+    })
+
+    attachMainWindowServices(createMainWindow() as never, createStore(), createRuntime() as never)
+    attachMainWindowServices(createMainWindow() as never, createStore(), createRuntime() as never)
+
+    const downloadOnCalls = browserSessionOnMock.mock.calls.filter(
+      ([eventName]) => eventName === 'will-download'
+    )
+    const downloadRemoveCalls = browserSessionRemoveListenerMock.mock.calls.filter(
+      ([eventName]) => eventName === 'will-download'
+    )
+    expect(downloadOnCalls).toHaveLength(2)
+    expect(downloadRemoveCalls).toHaveLength(2)
+    expect(downloadRemoveCalls[1][1]).toBe(downloadOnCalls[0][1])
+  })
+
   it('clears browser guest registrations when the main window closes', () => {
     sessionFromPartitionMock.mockReturnValue({
       setPermissionRequestHandler: setPermissionRequestHandlerMock,
       setPermissionCheckHandler: setPermissionCheckHandlerMock,
       setDisplayMediaRequestHandler: setDisplayMediaRequestHandlerMock,
-      on: vi.fn()
+      on: vi.fn(),
+      removeListener: vi.fn()
     })
     const mainWindowOnMock = vi.fn()
     const mainWindow = createMainWindow()
@@ -284,6 +429,28 @@ describe('attachMainWindowServices', () => {
     expect(closedHandler).toBeTypeOf('function')
     closedHandler?.()
     expect(browserManagerUnregisterAllMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('removes the native file-drop relay when the main window closes', () => {
+    const mainWindowOnMock = vi.fn()
+    const mainWindow = createMainWindow({ send: vi.fn() })
+    mainWindow.on = mainWindowOnMock
+
+    attachMainWindowServices(mainWindow as never, createStore(), createRuntime() as never)
+
+    const channel = 'terminal:file-dropped-from-preload'
+    const relayHandler = onMock.mock.calls.find(([event]) => event === channel)?.[1]
+    expect(relayHandler).toBeTypeOf('function')
+    expect(removeAllListenersMock).toHaveBeenCalledWith(channel)
+
+    const closedHandlers = mainWindowOnMock.mock.calls
+      .filter(([event]) => event === 'closed')
+      .map(([, handler]) => handler as () => void)
+    for (const handler of closedHandlers) {
+      handler()
+    }
+
+    expect(removeListenerMock).toHaveBeenCalledWith(channel, relayHandler)
   })
 
   it('forwards runtime notifier events to the renderer', () => {

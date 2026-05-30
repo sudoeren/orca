@@ -1,13 +1,18 @@
 import { ipcMain, shell, dialog } from 'electron'
 import { spawn } from 'node:child_process'
-import { constants, copyFile, stat } from 'node:fs/promises'
-import { basename, isAbsolute, normalize, win32 } from 'node:path'
+import { constants, copyFile, readFile, stat } from 'node:fs/promises'
+import { basename, extname, isAbsolute, normalize, win32 } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { ShellOpenLocalPathResult } from '../../shared/shell-open-types'
+import { MAX_REPO_ICON_UPLOAD_BYTES } from '../../shared/repo-icon'
 import { resolveCliCommand } from '../codex-cli/command'
 import { getSpawnArgsForWindows } from '../win32-utils'
 
 export const EXTERNAL_EDITOR_CLI_COMMAND = 'code'
+
+const REPO_ICON_IMAGE_MIME_TYPES: Record<string, string> = {
+  '.png': 'image/png'
+}
 
 async function pathExists(pathValue: string): Promise<boolean> {
   try {
@@ -79,21 +84,31 @@ async function launchExternalEditor(pathValue: string, command?: string): Promis
       windowsHide: true
     })
     let settled = false
-    const settle = (callback: () => void): void => {
+
+    function cleanup(): void {
+      child.off('error', onError)
+      child.off('spawn', onSpawn)
+    }
+
+    function settle(callback: () => void): void {
       if (settled) {
         return
       }
       settled = true
+      cleanup()
       callback()
     }
 
-    child.once('error', (error) => {
+    function onError(error: Error): void {
       settle(() => rejectPromise(error))
-    })
-    child.once('spawn', () => {
+    }
+
+    function onSpawn(): void {
       child.unref()
       settle(resolvePromise)
-    })
+    }
+    child.once('error', onError)
+    child.once('spawn', onSpawn)
   })
 }
 
@@ -110,6 +125,19 @@ async function openInExternalEditor(
     return { ok: true }
   } catch {
     return { ok: false, reason: 'launch-failed' }
+  }
+}
+
+async function openWithSystemDefault(pathValue: string): Promise<boolean> {
+  const target = await validateLocalPathTarget(pathValue)
+  if (!target.ok) {
+    return false
+  }
+  try {
+    const errorMessage = await shell.openPath(target.path)
+    return errorMessage.length === 0
+  } catch {
+    return false
   }
 }
 
@@ -144,16 +172,8 @@ export function registerShellHandlers(): void {
     return shell.openExternal(parsed.toString())
   })
 
-  ipcMain.handle('shell:openFilePath', async (_event, filePath: string) => {
-    const target = await validateLocalPathTarget(filePath)
-    if (!target.ok) {
-      return
-    }
-    try {
-      await shell.openPath(target.path)
-    } catch {
-      // Why: legacy file-open IPC is best-effort; callers already treat failure as a no-op.
-    }
+  ipcMain.handle('shell:openFilePath', async (_event, filePath: string): Promise<boolean> => {
+    return openWithSystemDefault(filePath)
   })
 
   ipcMain.handle('shell:openFileUri', async (_event, rawUri: string) => {
@@ -185,11 +205,7 @@ export function registerShellHandlers(): void {
       return
     }
 
-    try {
-      await shell.openPath(target.path)
-    } catch {
-      // Why: legacy file-open IPC is best-effort; callers already treat failure as a no-op.
-    }
+    await openWithSystemDefault(target.path)
   })
 
   ipcMain.handle('shell:pathExists', async (_event, filePath: string): Promise<boolean> => {
@@ -236,6 +252,37 @@ export function registerShellHandlers(): void {
     }
     return result.filePaths[0]
   })
+
+  ipcMain.handle(
+    'shell:pickRepoIconImage',
+    async (): Promise<{ dataUrl: string; fileName: string } | null> => {
+      const result = await dialog.showOpenDialog({
+        properties: ['openFile'],
+        filters: [{ name: 'Repo icon images', extensions: ['png'] }]
+      })
+      if (result.canceled || result.filePaths.length === 0) {
+        return null
+      }
+
+      const filePath = result.filePaths[0]
+      const extension = extname(filePath).toLowerCase()
+      const mimeType = REPO_ICON_IMAGE_MIME_TYPES[extension]
+      if (!mimeType) {
+        throw new Error('Repo icons must be PNG files.')
+      }
+
+      const stats = await stat(filePath)
+      if (stats.size > MAX_REPO_ICON_UPLOAD_BYTES) {
+        throw new Error('Repo icon image must be 256KB or smaller.')
+      }
+
+      const buffer = await readFile(filePath)
+      return {
+        dataUrl: `data:${mimeType};base64,${buffer.toString('base64')}`,
+        fileName: basename(filePath)
+      }
+    }
+  )
 
   ipcMain.handle('shell:pickAudio', async (): Promise<string | null> => {
     const result = await dialog.showOpenDialog({

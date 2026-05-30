@@ -106,9 +106,13 @@ export default function Search(): React.JSX.Element {
     })
   }, [cancelSeededInputSelectionFrame])
 
-  // Focus input on mount
-  useEffect(() => {
-    inputRef.current?.focus()
+  const setSearchInputRef = useCallback((el: HTMLInputElement | null): void => {
+    inputRef.current = el
+    // Why: focusing belongs to the input mount; the object ref still backs
+    // seeded-search selection and result keyboard handlers.
+    if (el) {
+      el.focus()
+    }
   }, [])
 
   // Cleanup debounce timer on unmount
@@ -242,12 +246,13 @@ export default function Search(): React.JSX.Element {
       return
     }
 
-    // Why: Cmd/Ctrl+Shift+F can seed the query before this lazy panel mounts.
-    // The one-shot request lets the mounted panel run the real runtime search.
+    // Why: Cmd/Ctrl+Shift+F can seed the query or the include pattern (Find in
+    // Folder) before this lazy panel mounts. The one-shot request lets the
+    // mounted panel run the real runtime search and steal focus to the input.
     if (fileSearchQuery.trim()) {
       executeSearch(fileSearchQuery)
-      scheduleSeededInputSelection()
     }
+    scheduleSeededInputSelection()
     consumeFileSearchSeedRequest(activeWorktreeId, fileSearchSeedRequestId)
   }, [
     activeWorktreeId,
@@ -315,7 +320,7 @@ export default function Search(): React.JSX.Element {
   if (!activeWorktreeId) {
     return (
       <div className="flex items-center justify-center h-full text-muted-foreground text-xs">
-        Select a worktree to search
+        Select a workspace to search
       </div>
     )
   }
@@ -323,7 +328,7 @@ export default function Search(): React.JSX.Element {
   return (
     <div className="flex flex-col h-full">
       <SearchHeader
-        inputRef={inputRef}
+        inputRef={setSearchInputRef}
         includeInputRef={includeInputRef}
         excludeInputRef={excludeInputRef}
         query={fileSearchQuery}

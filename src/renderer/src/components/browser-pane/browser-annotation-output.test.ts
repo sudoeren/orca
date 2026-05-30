@@ -82,7 +82,7 @@ describe('formatBrowserAnnotationsAsMarkdown', () => {
     expect(markdown).toContain('**Source:** src/components/PricingCta.tsx:42:8')
     expect(markdown).toContain('**React:** <App> <PricingCta>')
     expect(markdown).toContain('**Intent:** change')
-    expect(markdown).toContain('**Priority:** important')
+    expect(markdown).not.toContain('**Priority:**')
     expect(markdown).toContain('- font-size: 16px')
     expect(markdown).toContain('**Feedback:** Make this primary action more obvious.')
   })
@@ -108,6 +108,26 @@ describe('formatBrowserAnnotationsAsMarkdown', () => {
 
     expect(markdown).toContain('**Selector:** ``button[data-label="Save `draft`"]``')
     expect(markdown).toContain('**Classes:** `` primary `generated` ``')
+  })
+
+  it('formats page snippets with many backtick runs', () => {
+    const annotation = makeAnnotation()
+    const manyBacktickRuns = Array.from({ length: 130_000 }, () => '`').join(' ')
+
+    expect(() =>
+      formatBrowserAnnotationsAsMarkdown([
+        makeAnnotation({
+          payload: {
+            ...annotation.payload,
+            target: {
+              ...annotation.payload.target,
+              selector: `button[data-label="${manyBacktickRuns}"]`,
+              htmlSnippet: `<button>${manyBacktickRuns}</button>`
+            }
+          }
+        })
+      ])
+    ).not.toThrow()
   })
 
   it('collapses page-controlled newlines before putting text in headings and lists', () => {

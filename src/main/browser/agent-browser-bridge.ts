@@ -54,6 +54,7 @@ import type {
 const EXEC_TIMEOUT_MS = 90_000
 const CONSECUTIVE_TIMEOUT_LIMIT = 3
 const WAIT_PROCESS_TIMEOUT_GRACE_MS = 1_000
+const STALE_SESSION_CLOSE_TIMEOUT_MS = 3_000
 
 type SessionState = {
   proxy: CdpWsProxy
@@ -84,6 +85,11 @@ type AgentBrowserExecOptions = {
   envOverrides?: NodeJS.ProcessEnv
   timeoutMs?: number
   timeoutError?: BrowserError
+}
+
+type EnqueueTargetedCommandOptions = {
+  ensureSession?: boolean
+  ensureVisible?: boolean
 }
 
 type AgentBrowserBridgeOptions = {
@@ -163,6 +169,22 @@ function parseShellArgs(input: string): string[] {
     args.push(current)
   }
   return args
+}
+
+function stripAgentBrowserTargetArgs(args: string[]): string[] {
+  const stripped: string[] = []
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]
+    if (arg === '--cdp' || arg === '--session') {
+      index++
+      continue
+    }
+    if (arg.startsWith('--cdp=') || arg.startsWith('--session=')) {
+      continue
+    }
+    stripped.push(arg)
+  }
+  return stripped
 }
 
 // Why: agent-browser returns generic error messages for stale/unknown refs.
@@ -388,10 +410,10 @@ export class AgentBrowserBridge {
   private readonly sessions = new Map<string, SessionState>()
   private readonly commandQueues = new Map<string, QueuedCommand[]>()
   private readonly processingQueues = new Set<string>()
-  // Why: screenshot prep temporarily changes shared renderer visibility/focus
-  // state. Per-session queues only serialize commands within one browser tab, so
-  // concurrent screenshots on different tabs can otherwise interleave
-  // ensureWebviewVisible()/restore and blank each other's capture.
+  // Why: screenshot prep temporarily changes shared renderer paintability state.
+  // Per-session queues only serialize commands within one browser tab, so
+  // concurrent screenshots on different tabs can otherwise interleave hidden
+  // surface leases and blank each other's capture.
   private screenshotTurn: Promise<void> = Promise.resolve()
   private readonly agentBrowserBin: string
   // Why: when a process swap destroys a session that had active intercept patterns,
@@ -684,10 +706,10 @@ export class AgentBrowserBridge {
     // directly via JS and dispatch input/change events for React/framework compat.
     return this.enqueueTargetedCommand(worktreeId, browserPageId, async (sessionName) => {
       await this.execAgentBrowser(sessionName, ['focus', element])
-      const escaped = value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")
+      const serializedValue = JSON.stringify(value)
       await this.execAgentBrowser(sessionName, [
         'eval',
-        `(() => { const el = document.activeElement; if (el) { const nativeSetter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value')?.set; if (nativeSetter) { nativeSetter.call(el, '${escaped}'); } else { el.value = '${escaped}'; } el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); } })()`
+        `(() => { const el = document.activeElement; if (el) { const nativeSetter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value')?.set; if (nativeSetter) { nativeSetter.call(el, ${serializedValue}); } else { el.value = ${serializedValue}; } el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); } })()`
       ])
       return { filled: element } as BrowserFillResult
     })
@@ -1114,19 +1136,33 @@ export class AgentBrowserBridge {
       }
       wc.reload()
       await new Promise<void>((resolve) => {
-        const onFinish = (): void => {
+        let settled = false
+        let fallbackTimer: ReturnType<typeof setTimeout> | null = null
+
+        const finish = (): void => {
+          if (settled) {
+            return
+          }
+          settled = true
           wc.removeListener('did-finish-load', onFinish)
           wc.removeListener('did-fail-load', onFail)
+          if (fallbackTimer) {
+            clearTimeout(fallbackTimer)
+            fallbackTimer = null
+          }
           resolve()
         }
-        const onFail = (): void => {
-          wc.removeListener('did-finish-load', onFinish)
-          wc.removeListener('did-fail-load', onFail)
-          resolve()
-        }
+        const onFinish = (): void => finish()
+        const onFail = (): void => finish()
+
         wc.on('did-finish-load', onFinish)
         wc.on('did-fail-load', onFail)
-        setTimeout(onFinish, 10_000)
+        // Why: successful reloads must clear the fallback timer; otherwise each
+        // reload retains the webContents and listeners until the 10s timeout fires.
+        fallbackTimer = setTimeout(finish, 10_000)
+        if (typeof fallbackTimer.unref === 'function') {
+          fallbackTimer.unref()
+        }
       })
       return { url: wc.getURL(), title: wc.getTitle() }
     })
@@ -1139,9 +1175,14 @@ export class AgentBrowserBridge {
   ): Promise<BrowserScreenshotResult> {
     // Why: agent-browser writes the screenshot to a temp file and returns
     // { "path": "/tmp/screenshot-xxx.png" }. We read the file and return base64.
-    return this.enqueueTargetedCommand(worktreeId, browserPageId, async (sessionName) => {
-      return this.captureScreenshotCommand(sessionName, ['screenshot'], 300, format)
-    })
+    return this.enqueueTargetedCommand(
+      worktreeId,
+      browserPageId,
+      async (sessionName) => {
+        return this.captureScreenshotCommand(sessionName, ['screenshot'], 300, format)
+      },
+      { ensureVisible: false }
+    )
   }
 
   async fullPageScreenshot(
@@ -1149,14 +1190,19 @@ export class AgentBrowserBridge {
     worktreeId?: string,
     browserPageId?: string
   ): Promise<BrowserScreenshotResult> {
-    return this.enqueueTargetedCommand(worktreeId, browserPageId, async (sessionName, target) => {
-      return this.captureFullPageScreenshotCommand(
-        sessionName,
-        target.webContentsId,
-        500,
-        format === 'jpeg' ? 'jpeg' : 'png'
-      )
-    })
+    return this.enqueueTargetedCommand(
+      worktreeId,
+      browserPageId,
+      async (sessionName, target) => {
+        return this.captureFullPageScreenshotCommand(
+          sessionName,
+          target.webContentsId,
+          500,
+          format === 'jpeg' ? 'jpeg' : 'png'
+        )
+      },
+      { ensureVisible: false }
+    )
   }
 
   private readScreenshotFromResult(raw: unknown, format?: string): BrowserScreenshotResult {
@@ -1180,12 +1226,12 @@ export class AgentBrowserBridge {
     return this.withSerializedScreenshotAccess(async () => {
       const session = this.sessions.get(sessionName)
       const restore = session
-        ? await this.browserManager.ensureWebviewVisible(session.webContentsId)
+        ? await this.browserManager.acquireAutomationVisibility(session.webContentsId)
         : () => {}
       try {
-        // Why: after focusing the window and unhiding the webview, the compositor
+        // Why: after acquiring the hidden paintability lease, the compositor
         // needs a short settle period to produce a painted frame. Waiting inside
-        // the global screenshot lock prevents another tab from stealing visible
+        // the global screenshot lock prevents another tab from changing lease
         // state before the current capture actually hits CDP.
         await new Promise((r) => setTimeout(r, settleMs))
         const raw = await this.execAgentBrowser(sessionName, commandArgs)
@@ -1205,11 +1251,11 @@ export class AgentBrowserBridge {
     return this.withSerializedScreenshotAccess(async () => {
       const session = this.sessions.get(sessionName)
       const restore = session
-        ? await this.browserManager.ensureWebviewVisible(session.webContentsId)
+        ? await this.browserManager.acquireAutomationVisibility(session.webContentsId)
         : () => {}
       try {
         // Why: full-page capture still depends on the guest compositor producing
-        // a fresh frame. Wait after activating the target webview so the direct
+        // a fresh frame. Wait after the target webview is paintable so the direct
         // CDP capture sees the live page instead of a stale surface.
         await new Promise((r) => setTimeout(r, settleMs))
         const wc = this.getWebContents(webContentsId)
@@ -1665,12 +1711,9 @@ export class AgentBrowserBridge {
 
   async exec(command: string, worktreeId?: string, browserPageId?: string): Promise<unknown> {
     return this.enqueueTargetedCommand(worktreeId, browserPageId, async (sessionName) => {
-      // Why: strip --cdp and --session from raw command to prevent session/target injection
-      const sanitized = command
-        .replace(/--cdp\s+\S+/g, '')
-        .replace(/--session\s+\S+/g, '')
-        .trim()
-      const args = parseShellArgs(sanitized)
+      // Why: strip target/session flags from raw passthrough commands so a
+      // caller cannot override Orca's selected browser page or CDP proxy.
+      const args = stripAgentBrowserTargetArgs(parseShellArgs(command.trim()))
       return await this.execAgentBrowser(sessionName, args)
     })
   }
@@ -1691,8 +1734,11 @@ export class AgentBrowserBridge {
     worktreeId: string | undefined,
     execute: (sessionName: string) => Promise<T>
   ): Promise<T> {
-    return this.enqueueTargetedCommand(worktreeId, undefined, async (sessionName) =>
-      execute(sessionName)
+    return this.enqueueTargetedCommand(
+      worktreeId,
+      undefined,
+      async (sessionName) => execute(sessionName),
+      { ensureVisible: false }
     )
   }
 
@@ -1700,7 +1746,7 @@ export class AgentBrowserBridge {
     worktreeId: string | undefined,
     browserPageId: string | undefined,
     execute: (sessionName: string, target: ResolvedBrowserCommandTarget) => Promise<T>,
-    options: { ensureSession?: boolean } = {}
+    options: EnqueueTargetedCommandOptions = {}
   ): Promise<T> {
     const target = this.resolveCommandTarget(worktreeId, browserPageId)
     const sessionName = `orca-tab-${target.browserPageId}`
@@ -1716,12 +1762,38 @@ export class AgentBrowserBridge {
         this.commandQueues.set(sessionName, queue)
       }
       queue.push({
-        execute: (() => execute(sessionName, target)) as () => Promise<unknown>,
+        execute: (() =>
+          this.executeWithVisibleTarget(
+            sessionName,
+            target,
+            execute,
+            options
+          )) as () => Promise<unknown>,
         resolve: resolve as (value: unknown) => void,
         reject
       })
       this.processQueue(sessionName)
     })
+  }
+
+  private async executeWithVisibleTarget<T>(
+    sessionName: string,
+    target: ResolvedBrowserCommandTarget,
+    execute: (sessionName: string, target: ResolvedBrowserCommandTarget) => Promise<T>,
+    options: EnqueueTargetedCommandOptions
+  ): Promise<T> {
+    if (options.ensureVisible === false) {
+      return execute(sessionName, target)
+    }
+
+    // Why: inactive browser panes are display:none in the renderer; the
+    // automation lease makes only this target paintable without selecting it.
+    const restore = await this.browserManager.acquireAutomationVisibility(target.webContentsId)
+    try {
+      return await execute(sessionName, target)
+    } finally {
+      restore()
+    }
   }
 
   private async processQueue(sessionName: string): Promise<void> {
@@ -1859,11 +1931,7 @@ export class AgentBrowserBridge {
       // across Orca restarts. A stale session ignores --cdp (already initialized) and
       // connects to the dead port. Must await close so the daemon forgets the session
       // before we pass --cdp with the new port.
-      await new Promise<void>((resolve) => {
-        execFile(this.agentBrowserBin, ['--session', sessionName, 'close'], { timeout: 3000 }, () =>
-          resolve()
-        )
-      })
+      await this.closeStaleAgentBrowserSession(sessionName)
 
       const proxy = new CdpWsProxy(wc)
       const cdpEndpoint = await proxy.start()
@@ -1987,7 +2055,12 @@ export class AgentBrowserBridge {
       args.push('--cdp', String(port))
     }
 
-    args.push(...commandArgs, '--json')
+    // Why: exec passthrough can produce a large argv array; spreading it into
+    // push risks V8 argument limits before execFile receives the command.
+    for (const commandArg of commandArgs) {
+      args.push(commandArg)
+    }
+    args.push('--json')
 
     const stdout = await this.runAgentBrowserRaw(sessionName, args, execOptions)
     const translated = translateResult(stdout)
@@ -2037,6 +2110,40 @@ export class AgentBrowserBridge {
 
   private createPageUnavailableError(sessionName: string): BrowserError {
     return new BrowserError('browser_tab_not_found', pageUnavailableMessageForSession(sessionName))
+  }
+
+  private closeStaleAgentBrowserSession(sessionName: string): Promise<void> {
+    return new Promise((resolve) => {
+      let child: ReturnType<typeof execFile> | null = null
+      let settled = false
+
+      const finish = (): void => {
+        if (settled) {
+          return
+        }
+        settled = true
+        clearTimeout(timeout)
+        resolve()
+      }
+
+      // Why: this is best-effort daemon cleanup before creating a fresh session;
+      // a wedged close command must not block the real browser action.
+      const timeout = setTimeout(() => {
+        child?.kill()
+        finish()
+      }, STALE_SESSION_CLOSE_TIMEOUT_MS)
+
+      try {
+        child = execFile(
+          this.agentBrowserBin,
+          ['--session', sessionName, 'close'],
+          { timeout: STALE_SESSION_CLOSE_TIMEOUT_MS },
+          finish
+        )
+      } catch {
+        finish()
+      }
+    })
   }
 
   private createCommandError(

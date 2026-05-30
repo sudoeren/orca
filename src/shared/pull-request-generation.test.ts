@@ -8,6 +8,7 @@ import {
 const context: PullRequestDraftContext = {
   branch: 'feature/pr-details',
   base: 'main',
+  branchChangedByPreparation: false,
   currentTitle: 'Feature pr details',
   currentBody: '- Add form',
   currentDraft: false,
@@ -23,7 +24,7 @@ describe('buildPullRequestFieldsPrompt', () => {
     expect(prompt).toContain('Return ONLY compact JSON')
     expect(prompt).toContain('Head branch: feature/pr-details')
     expect(prompt).toContain('Current base: main')
-    expect(prompt).toContain('Additional instructions from user:')
+    expect(prompt).toContain('Additional user prompt:')
     expect(prompt).toContain('Use conventional PR titles.')
   })
 })

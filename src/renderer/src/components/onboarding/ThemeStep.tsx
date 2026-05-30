@@ -3,6 +3,7 @@ import { Check, Monitor, Moon, Settings2, Sun } from 'lucide-react'
 import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
 import { track } from '@/lib/telemetry'
+import { useMountedRef } from '@/hooks/useMountedRef'
 import type {
   DiscoveryStatusEmitted,
   GhosttyImportPreview,
@@ -15,6 +16,17 @@ type ThemeStepProps = {
   onThemeChange: (theme: GlobalSettings['theme']) => void
   settings: GlobalSettings | null
   updateSettings: (updates: Partial<GlobalSettings>) => Promise<void>
+}
+
+export function applyOnboardingThemeSelection(
+  id: GlobalSettings['theme'],
+  onThemeChange: (theme: GlobalSettings['theme']) => void,
+  updateSettings: (updates: Partial<GlobalSettings>) => Promise<void>
+): void {
+  onThemeChange(id)
+  // Why: later onboarding controls also save settings. Persist the theme at
+  // selection time so those unrelated writes cannot reapply the old theme.
+  void updateSettings({ theme: id })
 }
 
 // The two UI-only states (`'idle'`, `'detecting'`) never fire telemetry. The
@@ -52,6 +64,7 @@ function fieldGroupCountBucket(count: number): '0' | '1-3' | '4-7' | '8+' {
 export function ThemeStep({ theme, onThemeChange, settings, updateSettings }: ThemeStepProps) {
   const [importing, setImporting] = useState(false)
   const [discovery, setDiscovery] = useState<DiscoveryState>({ status: 'idle' })
+  const mountedRef = useMountedRef()
 
   // Why: read-only IPC. Auto-detect on step mount so the user sees a clear
   // "we found your Ghostty config" prompt instead of a buried Import button.
@@ -118,7 +131,9 @@ export function ThemeStep({ theme, onThemeChange, settings, updateSettings }: Th
     try {
       const resolved = preview.found ? preview : await window.api.settings.previewGhosttyImport()
       if (!resolved.found || Object.keys(resolved.diff).length === 0) {
-        toast.info('No Ghostty settings found to import')
+        if (mountedRef.current) {
+          toast.info('No Ghostty settings found to import')
+        }
         track('onboarding_ghostty_import_failed', { reason: 'empty_diff' })
         return
       }
@@ -135,22 +150,28 @@ export function ThemeStep({ theme, onThemeChange, settings, updateSettings }: Th
       })
       // Why: parent controller holds local `theme` state that overwrites
       // settings.theme on Continue; sync it so the import isn't clobbered.
-      if (resolved.diff.theme) {
+      if (resolved.diff.theme && mountedRef.current) {
         onThemeChange(resolved.diff.theme)
       }
       const importedFields = humanFields(resolved.diff)
-      setDiscovery({ status: 'imported', fields: importedFields })
+      if (mountedRef.current) {
+        setDiscovery({ status: 'imported', fields: importedFields })
+      }
       track('onboarding_ghostty_discovered', {
         state: 'imported',
         field_group_count_bucket: fieldGroupCountBucket(importedFields.length)
       })
     } catch (err) {
-      toast.error('Failed to import Ghostty settings', {
-        description: err instanceof Error ? err.message : String(err)
-      })
+      if (mountedRef.current) {
+        toast.error('Failed to import Ghostty settings', {
+          description: err instanceof Error ? err.message : String(err)
+        })
+      }
       track('onboarding_ghostty_import_failed', { reason: 'unknown' })
     } finally {
-      setImporting(false)
+      if (mountedRef.current) {
+        setImporting(false)
+      }
     }
   }
 
@@ -179,7 +200,7 @@ export function ThemeStep({ theme, onThemeChange, settings, updateSettings }: Th
                   ? 'border-violet-500/60 bg-violet-500/10 ring-2 ring-violet-500/30'
                   : 'border-border bg-muted/30 hover:bg-muted/60'
               )}
-              onClick={() => onThemeChange(id)}
+              onClick={() => applyOnboardingThemeSelection(id, onThemeChange, updateSettings)}
             >
               <div className="relative mb-3 h-24 overflow-hidden rounded-lg border border-border">
                 <ChromePreview variant={id} />

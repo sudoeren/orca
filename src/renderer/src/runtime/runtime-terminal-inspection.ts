@@ -1,4 +1,5 @@
 import type { GlobalSettings } from '../../../shared/types'
+import type { RuntimeTerminalSend } from '../../../shared/runtime-types'
 import { RuntimeRpcCallError, callRuntimeRpc, getActiveRuntimeTarget } from './runtime-rpc-client'
 import {
   getRemoteRuntimePtyEnvironmentId,
@@ -93,4 +94,41 @@ export function sendRuntimePtyInput(
     // flushes a final input event. The next host snapshot will reattach.
   })
   return true
+}
+
+export async function sendRuntimePtyInputVerified(
+  settings: Pick<GlobalSettings, 'activeRuntimeEnvironmentId'> | null | undefined,
+  ptyId: string,
+  data: string
+): Promise<boolean> {
+  const ownerEnvironmentId = getRemoteRuntimePtyEnvironmentId(ptyId)
+  const target = ownerEnvironmentId
+    ? ({ kind: 'environment', environmentId: ownerEnvironmentId } as const)
+    : getActiveRuntimeTarget(settings)
+  const terminal = getRemoteRuntimeTerminalHandle(ptyId)
+  if (target.kind !== 'environment' || !terminal) {
+    const accepted = await window.api.pty.writeAccepted(ptyId, data)
+    if (!accepted) {
+      window.api.pty.write(ptyId, data)
+      // Why: SSH/local fallback writes are fire-and-forget. Callers use this
+      // boolean to continue UX flow, while hook telemetry confirms real turns.
+      return true
+    }
+    return accepted
+  }
+
+  try {
+    const result = await callRuntimeRpc<{ send: RuntimeTerminalSend }>(
+      target,
+      'terminal.send',
+      { terminal, text: data, client: { id: 'orca-desktop', type: 'desktop' } },
+      { timeoutMs: 15_000 }
+    )
+    return result.send.accepted === true
+  } catch (error) {
+    if (isTerminalGoneError(error)) {
+      return false
+    }
+    throw error
+  }
 }

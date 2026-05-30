@@ -19,12 +19,21 @@ describe('crash-reporting shared helpers', () => {
   })
 
   it('keeps details on a strict primitive allowlist', () => {
+    const longStack = [
+      'Error: boom',
+      ...Array.from(
+        { length: 80 },
+        (_, index) => `at Component${index} (/Users/alice/project/src/file-${index}.tsx:1:1)`
+      )
+    ].join('\n')
+
     expect(
       sanitizeCrashReportDetails({
         name: 'GPU /home/alice/repo',
         code: 9,
         crashed: true,
         missing: null,
+        error_stack: longStack,
         nested: { nope: true },
         infinite: Number.POSITIVE_INFINITY
       })
@@ -32,8 +41,12 @@ describe('crash-reporting shared helpers', () => {
       name: 'GPU [redacted-path]',
       code: 9,
       crashed: true,
-      missing: null
+      missing: null,
+      error_stack: expect.stringContaining('[redacted-path]')
     })
+    expect(
+      String(sanitizeCrashReportDetails({ error_stack: longStack }).error_stack).length
+    ).toBeGreaterThan(240)
   })
 
   it('sanitizes breadcrumb data and caps to the latest thirty entries', () => {
@@ -99,5 +112,32 @@ describe('crash-reporting shared helpers', () => {
     expect(text).toContain('[redacted-path]')
     expect(text).not.toContain('Route:')
     expect(text).not.toContain('URL:')
+  })
+
+  it('caps formatted reports to the crash endpoint limit', () => {
+    const report: CrashReportRecord = {
+      id: 'crash-oversized',
+      createdAt: '2026-05-16T01:00:00.000Z',
+      status: 'pending',
+      source: 'renderer',
+      processType: 'renderer',
+      reason: 'crashed',
+      exitCode: 5,
+      appVersion: '1.0.0',
+      platform: 'darwin',
+      osRelease: '25.0.0',
+      arch: 'arm64',
+      electronVersion: '41.0.0',
+      chromeVersion: '141.0.0',
+      details: Object.fromEntries(
+        Array.from({ length: 400 }, (_, index) => [`detail_${index}`, 'x'.repeat(240)])
+      ),
+      breadcrumbs: []
+    }
+
+    const text = formatCrashReportText(report)
+
+    expect(text.length).toBeLessThanOrEqual(64_000)
+    expect(text).toContain('[Crash report truncated to fit feedback endpoint limits.]')
   })
 })
