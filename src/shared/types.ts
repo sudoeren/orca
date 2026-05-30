@@ -1987,6 +1987,9 @@ export type GlobalSettings = {
   /** Experimental: replaces the New Tab menu's static preview row with a
    *  command-style launcher for terminals, detected agents, URLs, and files. */
   experimentalUnifiedNewTabLauncher: boolean
+  /** Experimental: hover an inline agent status row to open its terminal
+   *  without switching workspaces. */
+  experimentalAgentTerminalPopover: boolean
   /** Active non-local runtime environment for client-routed RPC. `null`
    *  preserves the current local desktop behavior. */
   activeRuntimeEnvironmentId?: string | null

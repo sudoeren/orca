@@ -1,62 +1,59 @@
-import { useLayoutEffect, useState } from 'react'
+import {
+  clearTerminalPortalSlot,
+  findTerminalPortal,
+  publishTerminalPortalSlot,
+  useTerminalPortals,
+  type TerminalPortalTarget
+} from '../terminal-pane/terminal-portal-registry'
 
-export type ActivityTerminalPortalTarget = {
-  slotId: string
-  requestToken: string
-  target: HTMLElement
-  worktreeId: string
-  tabId: string
-  // Why: each Activity thread targets one stable terminal leaf inside a tab.
-  // Carry the durable paneKey across this boundary; TerminalPane resolves it
-  // to the current numeric PaneManager handle immediately before isolation.
-  paneKey: string
-  forceUnavailable?: boolean
-  active: boolean
-}
+export type ActivityTerminalPortalTarget = Omit<
+  TerminalPortalTarget,
+  'purpose' | 'paneRouteKey' | 'publishOrder'
+>
 
-let currentTargets: ActivityTerminalPortalTarget[] = []
-const subscribers = new Set<(targets: ActivityTerminalPortalTarget[]) => void>()
+const activitySlots = new Map<string, string>()
 
-// Why: the portal target is published with its {worktreeId, tabId} already
-// attached so consumers don't have to derive routing from the global
-// activeTabId/activeWorktreeId. The activity page knows which agent pane it
-// wants to display; deriving from global active state introduced a race where
-// repo/worktree updates landed before the matching setActiveTab, briefly
-// portaling a different terminal into the activity slot ("flash" of the wrong
-// terminal for a few ms).
+// Why: Activity still owns its two-slot snapshot API, but the underlying
+// registry is shared so other terminal popout surfaces can coexist safely.
 export function setActivityTerminalPortals(targets: ActivityTerminalPortalTarget[]): void {
-  if (currentTargets === targets) {
-    return
+  const nextSlots = new Set<string>()
+  for (const target of targets) {
+    nextSlots.add(target.slotId)
+    publishTerminalPortalSlot({
+      ...target,
+      purpose: 'activity',
+      paneRouteKey: {
+        worktreeId: target.worktreeId,
+        tabId: target.tabId,
+        paneKey: target.paneKey
+      }
+    })
+    activitySlots.set(target.slotId, target.requestToken)
   }
-  currentTargets = targets
-  for (const subscriber of subscribers) {
-    subscriber(targets)
+  for (const [slotId, requestToken] of activitySlots) {
+    if (nextSlots.has(slotId)) {
+      continue
+    }
+    clearTerminalPortalSlot(slotId, requestToken)
+    activitySlots.delete(slotId)
   }
 }
 
 export function useActivityTerminalPortals(enabled: boolean): ActivityTerminalPortalTarget[] {
-  const [targets, setTargets] = useState<ActivityTerminalPortalTarget[]>(
-    enabled ? currentTargets : []
-  )
-
-  useLayoutEffect(() => {
-    if (!enabled) {
-      setTargets([])
-      return
-    }
-    setTargets(currentTargets)
-    const subscriber = (next: ActivityTerminalPortalTarget[]): void => setTargets(next)
-    subscribers.add(subscriber)
-    return () => {
-      subscribers.delete(subscriber)
-    }
-  }, [enabled])
-
-  return targets
+  return useTerminalPortals(enabled)
+    .filter((target) => target.purpose === 'activity')
+    .map(
+      ({
+        purpose: _purpose,
+        paneRouteKey: _paneRouteKey,
+        publishOrder: _publishOrder,
+        ...target
+      }) => target
+    )
 }
 
 export function findActivityTerminalPortal(
-  targets: ActivityTerminalPortalTarget[],
+  targets: readonly (ActivityTerminalPortalTarget | TerminalPortalTarget)[],
   query: {
     worktreeId: string
     tabId: string
@@ -65,7 +62,25 @@ export function findActivityTerminalPortal(
     requestToken?: string
   }
 ): ActivityTerminalPortalTarget | null {
-  const matchingTab = targets.filter(
+  const terminalTargets = targets
+    .filter((target): target is TerminalPortalTarget => 'purpose' in target)
+    .filter((target) => target.purpose === 'activity')
+  if (terminalTargets.length > 0) {
+    const found = findTerminalPortal(terminalTargets, { ...query, purpose: 'activity' })
+    if (!found) {
+      return null
+    }
+    const {
+      purpose: _purpose,
+      paneRouteKey: _paneRouteKey,
+      publishOrder: _publishOrder,
+      ...target
+    } = found
+    return target
+  }
+
+  const activityTargets = targets as ActivityTerminalPortalTarget[]
+  const matchingTab = activityTargets.filter(
     (target) => target.worktreeId === query.worktreeId && target.tabId === query.tabId
   )
   if (

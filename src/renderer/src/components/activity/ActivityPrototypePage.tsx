@@ -1,7 +1,7 @@
 /* eslint-disable max-lines -- Why: this prototype keeps the real-data adapter
 and current visual skeleton together until the next refinement pass decides
 which pieces become production modules. */
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useState } from 'react'
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useShallow } from 'zustand/react/shallow'
 import {
   Bell,
@@ -53,6 +53,12 @@ import {
   setActivityTerminalPortals,
   type ActivityTerminalPortalTarget
 } from './activity-terminal-portal'
+import {
+  TerminalPortalStatusChip,
+  TerminalPortalUnavailableNotice,
+  useTerminalPortalLoadingLabel,
+  useTerminalPortalStatus
+} from '../terminal-pane/terminal-portal-readiness'
 import type { Repo, TerminalTab, Worktree } from '../../../../shared/types'
 import { FLOATING_TERMINAL_WORKTREE_ID } from '../../../../shared/constants'
 import {
@@ -124,21 +130,13 @@ type ActivityThreadGroup = {
   threads: AgentPaneThread[]
 }
 
-type ActivityTerminalPortalReadiness = {
-  target: HTMLElement | null
-  paneKey: string | null
-  status: 'loading' | 'ready' | 'unavailable'
-}
-
-type ActivityTerminalPortalDomStatus = {
-  hasSelectedRoot: boolean
-  ready: boolean
-  unavailable: boolean
-}
-
 type ActivityTerminalPortalSlotId = 'primary' | 'secondary'
+type ActivityTerminalPortalTokenState = {
+  signature: string
+  target: HTMLElement
+  token: number
+}
 
-const ACTIVITY_TERMINAL_LOADING_LABEL_DELAY_MS = 180
 const ACTIVITY_THREAD_RESPONSE_RENDER_PREVIEW_MAX_LENGTH = 320
 const ACTIVITY_STATUS_GROUP_ORDER: ActivityStatusGroupId[] = [
   'working',
@@ -177,43 +175,6 @@ function formatRelativeTime(timestamp: number): string {
   return relativeTimeFormatter.format(diffDays, 'day')
 }
 
-function findActivityTerminalPane(
-  root: HTMLElement,
-  leafId: string
-): { foundAnyPane: boolean; pane: HTMLElement | null } {
-  let foundAnyPane = false
-  for (const candidate of root.querySelectorAll<HTMLElement>('[data-leaf-id]')) {
-    foundAnyPane = true
-    if (candidate.dataset.leafId === leafId) {
-      return { foundAnyPane, pane: candidate }
-    }
-  }
-  return { foundAnyPane, pane: null }
-}
-
-function hasInlineDisplayNoneBetween(element: HTMLElement, root: HTMLElement): boolean {
-  let current: HTMLElement | null = element
-  while (current) {
-    if (current.style.display === 'none') {
-      return true
-    }
-    if (current === root) {
-      return false
-    }
-    current = current.parentElement
-  }
-  return false
-}
-
-function hasUnhiddenSiblingPane(root: HTMLElement, selectedPane: HTMLElement): boolean {
-  for (const candidate of root.querySelectorAll<HTMLElement>('[data-leaf-id]')) {
-    if (candidate !== selectedPane && !hasInlineDisplayNoneBetween(candidate, root)) {
-      return true
-    }
-  }
-  return false
-}
-
 function truncatePreservingSurrogates(value: string, maxLength: number): string {
   if (value.length <= maxLength) {
     return value
@@ -241,167 +202,10 @@ export function activityThreadResponseRenderPreview({
   ).trimEnd()}...`
 }
 
-function getSelectedActivityTerminalPortalStatus(
-  target: HTMLElement,
-  paneKey: string
-): ActivityTerminalPortalDomStatus {
-  const parsed = parsePaneKey(paneKey)
-  if (!parsed) {
-    return { hasSelectedRoot: false, ready: false, unavailable: true }
-  }
-  let selectedRoot: HTMLElement | null = null
-  for (const candidate of target.querySelectorAll<HTMLElement>('[data-terminal-tab-id]')) {
-    if (candidate.dataset.terminalTabId === parsed.tabId) {
-      selectedRoot = candidate
-      break
-    }
-  }
-  if (!selectedRoot) {
-    return { hasSelectedRoot: false, ready: false, unavailable: false }
-  }
-
-  const { foundAnyPane, pane: selectedPane } = findActivityTerminalPane(selectedRoot, parsed.leafId)
-  if (!selectedPane) {
-    return { hasSelectedRoot: true, ready: false, unavailable: foundAnyPane }
-  }
-
-  const unavailable = hasInlineDisplayNoneBetween(selectedPane, selectedRoot)
-  const hasUnisolatedSibling = hasUnhiddenSiblingPane(selectedRoot, selectedPane)
-  const isVisibleRoot =
-    !unavailable && (selectedPane.offsetParent !== null || selectedPane.getClientRects().length > 0)
-  const hasPtyBinding =
-    selectedPane.hasAttribute('data-pty-id') ||
-    selectedPane.querySelector<HTMLElement>('[data-pty-id]') !== null
-  const hasXtermScreen = selectedPane.querySelector<HTMLElement>('.xterm-screen') !== null
-  return {
-    hasSelectedRoot: true,
-    ready: isVisibleRoot && !hasUnisolatedSibling && hasPtyBinding && hasXtermScreen,
-    unavailable
-  }
-}
-
-function useActivityTerminalPortalStatus(
-  target: HTMLElement | null,
-  paneKey: string | null,
-  forceUnavailable = false
-): ActivityTerminalPortalReadiness['status'] {
-  const [readiness, setReadiness] = useState<ActivityTerminalPortalReadiness>({
-    target: null,
-    paneKey: null,
-    status: 'loading'
-  })
-
-  useLayoutEffect(() => {
-    if (!target || !paneKey) {
-      setReadiness((prev) =>
-        prev.target === null && prev.paneKey === null && prev.status === 'loading'
-          ? prev
-          : { target: null, paneKey: null, status: 'loading' }
-      )
-      return
-    }
-    if (forceUnavailable) {
-      setReadiness((prev) =>
-        prev.target === target && prev.paneKey === paneKey && prev.status === 'unavailable'
-          ? prev
-          : { target, paneKey, status: 'unavailable' }
-      )
-      return
-    }
-
-    let disposed = false
-    let readyFrame: number | null = null
-    let sawUnreadySelectedRoot = false
-
-    const updateReadiness = (status: ActivityTerminalPortalReadiness['status']): void => {
-      setReadiness((prev) =>
-        prev.target === target && prev.paneKey === paneKey && prev.status === status
-          ? prev
-          : { target, paneKey, status }
-      )
-    }
-
-    const cancelReadyFrame = (): void => {
-      if (readyFrame !== null) {
-        cancelAnimationFrame(readyFrame)
-        readyFrame = null
-      }
-    }
-
-    const checkReadiness = (): void => {
-      const status = getSelectedActivityTerminalPortalStatus(target, paneKey)
-      if (status.unavailable) {
-        cancelReadyFrame()
-        updateReadiness('unavailable')
-        return
-      }
-      if (status.ready) {
-        if (!sawUnreadySelectedRoot) {
-          cancelReadyFrame()
-          updateReadiness('ready')
-          return
-        }
-        if (readyFrame !== null) {
-          return
-        }
-        // Why: the PTY id can appear before xterm has painted replayed output.
-        // Waiting one frame keeps Activity's cover in place for the blank canvas
-        // frame without moving terminal lifecycle work into global layout effects.
-        readyFrame = requestAnimationFrame(() => {
-          readyFrame = null
-          if (!disposed && getSelectedActivityTerminalPortalStatus(target, paneKey).ready) {
-            updateReadiness('ready')
-          }
-        })
-        return
-      }
-      if (status.hasSelectedRoot) {
-        sawUnreadySelectedRoot = true
-      }
-      cancelReadyFrame()
-      updateReadiness('loading')
-    }
-
-    updateReadiness('loading')
-    checkReadiness()
-
-    const observer = new MutationObserver(checkReadiness)
-    observer.observe(target, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: ['data-terminal-tab-id', 'data-leaf-id', 'data-pty-id', 'style']
-    })
-
-    return () => {
-      disposed = true
-      cancelReadyFrame()
-      observer.disconnect()
-    }
-  }, [target, paneKey, forceUnavailable])
-
-  return readiness.target === target && readiness.paneKey === paneKey ? readiness.status : 'loading'
-}
-
 function otherActivityTerminalSlot(
   slotId: ActivityTerminalPortalSlotId
 ): ActivityTerminalPortalSlotId {
   return slotId === 'primary' ? 'secondary' : 'primary'
-}
-
-function useActivityTerminalLoadingLabel(loading: boolean): boolean {
-  const [visible, setVisible] = useState(false)
-
-  useEffect(() => {
-    if (!loading) {
-      setVisible(false)
-      return
-    }
-    const timer = setTimeout(() => setVisible(true), ACTIVITY_TERMINAL_LOADING_LABEL_DELAY_MS)
-    return () => clearTimeout(timer)
-  }, [loading])
-
-  return visible
 }
 
 function agentTitle(event: ActivityEvent): string {
@@ -1238,6 +1042,9 @@ export default function ActivityPrototypePage(): React.JSX.Element {
     useState<ActivityTerminalPortalSlotId>('primary')
   const [primaryPortalTargetEl, setPrimaryPortalTargetEl] = useState<HTMLElement | null>(null)
   const [secondaryPortalTargetEl, setSecondaryPortalTargetEl] = useState<HTMLElement | null>(null)
+  const portalTokenBySlotRef = useRef<
+    Record<ActivityTerminalPortalSlotId, ActivityTerminalPortalTokenState | null>
+  >({ primary: null, secondary: null })
   // Why (default width): the thread cards are the primary surface in the
   // Activity view; the terminal is supplementary. A narrow list squeezed the
   // prompts to truncated single-liners and made the per-card actions feel
@@ -1373,12 +1180,12 @@ export default function ActivityPrototypePage(): React.JSX.Element {
   } satisfies Record<ActivityTerminalPortalSlotId, HTMLElement | null>
   const activePortalTargetEl = portalTargetBySlot[activePortalSlotId]
   const inactivePortalTargetEl = portalTargetBySlot[inactivePortalSlotId]
-  const visiblePortalStatus = useActivityTerminalPortalStatus(
+  const visiblePortalStatus = useTerminalPortalStatus(
     activePortalTargetEl,
     visibleThread?.paneKey ?? null,
     visibleThread?.migrationUnsupportedPtyId !== undefined
   )
-  const stagedPortalStatus = useActivityTerminalPortalStatus(
+  const stagedPortalStatus = useTerminalPortalStatus(
     inactivePortalTargetEl,
     stagedThread?.paneKey ?? null,
     stagedThread?.migrationUnsupportedPtyId !== undefined
@@ -1387,7 +1194,7 @@ export default function ActivityPrototypePage(): React.JSX.Element {
   const visiblePortalUnavailable = visiblePortalStatus === 'unavailable'
   const stagedPortalReady = stagedPortalStatus === 'ready'
   const stagedPortalUnavailable = stagedPortalStatus === 'unavailable'
-  const showTerminalLoadingLabel = useActivityTerminalLoadingLabel(
+  const showTerminalLoadingLabel = useTerminalPortalLoadingLabel(
     Boolean(visibleThread && !stagedThread && !visiblePortalReady)
   )
 
@@ -1398,6 +1205,26 @@ export default function ActivityPrototypePage(): React.JSX.Element {
   const setSecondaryPortalTarget = useCallback((target: HTMLElement | null): void => {
     setSecondaryPortalTargetEl(target)
   }, [])
+
+  const getPortalRequestToken = useCallback(
+    (
+      slotId: ActivityTerminalPortalSlotId,
+      thread: AgentPaneThread,
+      target: HTMLElement
+    ): string => {
+      const signature = `${thread.worktree.id}\0${thread.tab.id}\0${thread.paneKey}\0${Number(
+        thread.migrationUnsupportedPtyId !== undefined
+      )}\0${target.dataset.activityTerminalSlotId ?? ''}`
+      const current = portalTokenBySlotRef.current[slotId]
+      if (current?.signature === signature && current.target === target) {
+        return String(current.token)
+      }
+      const nextToken = (current?.token ?? 0) + 1
+      portalTokenBySlotRef.current[slotId] = { signature, target, token: nextToken }
+      return String(nextToken)
+    },
+    []
+  )
 
   // Why (no flash on selection): publish the portal descriptor with the
   // selected thread's worktreeId+tabId directly, instead of letting Terminal
@@ -1416,7 +1243,11 @@ export default function ActivityPrototypePage(): React.JSX.Element {
     if (visibleThread && activePortalTargetEl) {
       descriptors.push({
         slotId: activePortalSlotId,
-        requestToken: `${activePortalSlotId}:${visibleThread.paneKey}`,
+        requestToken: getPortalRequestToken(
+          activePortalSlotId,
+          visibleThread,
+          activePortalTargetEl
+        ),
         target: activePortalTargetEl,
         worktreeId: visibleThread.worktree.id,
         tabId: visibleThread.tab.id,
@@ -1428,7 +1259,11 @@ export default function ActivityPrototypePage(): React.JSX.Element {
     if (stagedThread && inactivePortalTargetEl) {
       descriptors.push({
         slotId: inactivePortalSlotId,
-        requestToken: `${inactivePortalSlotId}:${stagedThread.paneKey}`,
+        requestToken: getPortalRequestToken(
+          inactivePortalSlotId,
+          stagedThread,
+          inactivePortalTargetEl
+        ),
         target: inactivePortalTargetEl,
         worktreeId: stagedThread.worktree.id,
         tabId: stagedThread.tab.id,
@@ -1441,6 +1276,7 @@ export default function ActivityPrototypePage(): React.JSX.Element {
   }, [
     activePortalSlotId,
     activePortalTargetEl,
+    getPortalRequestToken,
     inactivePortalSlotId,
     inactivePortalTargetEl,
     stagedThread,
@@ -1761,12 +1597,13 @@ export default function ActivityPrototypePage(): React.JSX.Element {
                 // Why: retained threads can outlive their tab; portal needs a live TerminalPane to render into.
                 if (!selectedHasLiveTab) {
                   return (
-                    <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 p-4 text-sm text-muted-foreground">
-                      <TerminalSquare className="size-7" />
-                      {storeData.worktreeMap.has(selectedThread.worktree.id)
-                        ? 'Agent terminal closed. Open a new terminal in this workspace to continue.'
-                        : 'Standalone terminal unavailable in Activity.'}
-                    </div>
+                    <TerminalPortalUnavailableNotice
+                      reason={
+                        storeData.worktreeMap.has(selectedThread.worktree.id)
+                          ? 'closed'
+                          : 'standalone'
+                      }
+                    />
                   )
                 }
                 return (
@@ -1799,15 +1636,9 @@ export default function ActivityPrototypePage(): React.JSX.Element {
                         aria-hidden="true"
                       >
                         {visiblePortalUnavailable ? (
-                          <div className="ml-3 mt-3 inline-flex items-center gap-2 rounded-md border border-border bg-background/85 px-2 py-1 text-xs text-muted-foreground shadow-xs">
-                            <span className="h-3 w-1.5 rounded-sm bg-muted-foreground/70" />
-                            <span>Terminal unavailable</span>
-                          </div>
+                          <TerminalPortalStatusChip status="unavailable" />
                         ) : showTerminalLoadingLabel ? (
-                          <div className="ml-3 mt-3 inline-flex items-center gap-2 rounded-md border border-border bg-background/85 px-2 py-1 text-xs text-muted-foreground shadow-xs">
-                            <span className="h-3 w-1.5 animate-pulse rounded-sm bg-muted-foreground/70" />
-                            <span>Connecting terminal...</span>
-                          </div>
+                          <TerminalPortalStatusChip status="loading" />
                         ) : null}
                       </div>
                     ) : null}

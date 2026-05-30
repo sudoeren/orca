@@ -8,7 +8,13 @@ import {
   waitForPaneIdentitySnapshot,
   type PaneIdentitySnapshot
 } from './helpers/terminal'
-import { ensureTerminalVisible, waitForActiveWorktree, waitForSessionReady } from './helpers/store'
+import {
+  ensureTerminalVisible,
+  getActiveWorktreeId,
+  switchToOtherWorktree,
+  waitForActiveWorktree,
+  waitForSessionReady
+} from './helpers/store'
 
 type SeededActivityThread = {
   paneKey: string
@@ -34,6 +40,18 @@ type SplitGroupTerminal = {
   sourceGroupId: string
   groupId: string
   tabId: string
+}
+
+type TerminalPopoverDomSnapshot = {
+  activeWorktreeId: string | null
+  tabIds: string[]
+  ptyIdsByLeafId: Record<string, string>
+  popoverText: string
+  hasArrow: boolean
+  terminalRootCountForTab: number
+  terminalRootInsidePopover: boolean
+  leafIdsInsidePopover: string[]
+  hasXtermScreen: boolean
 }
 
 async function seedActivityThread(
@@ -157,6 +175,15 @@ async function enableInlineAgentCards(page: Page): Promise<void> {
   })
 }
 
+async function enableAgentTerminalPopover(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    const settings = await window.api.settings.set({ experimentalAgentTerminalPopover: true })
+    // Why: settings persistence is async to the main process; update the
+    // renderer store in-place so the next hover observes the experimental flag.
+    window.__store?.setState({ settings })
+  })
+}
+
 async function enableActivityAgentsView(page: Page): Promise<void> {
   await page.evaluate(async () => {
     const settings = await window.api.settings.set({ experimentalActivity: true })
@@ -166,6 +193,55 @@ async function enableActivityAgentsView(page: Page): Promise<void> {
   })
 }
 
+async function seedRetainedAgentRow(
+  page: Page,
+  worktreeId: string,
+  thread: SeededActivityThread,
+  startedAt: number
+): Promise<void> {
+  await page.evaluate(
+    ({ worktreeId, thread, startedAt }) => {
+      const store = window.__store
+      if (!store) {
+        throw new Error('window.__store is not available')
+      }
+      const tab = {
+        id: thread.paneKey.split(':')[0],
+        ptyId: null,
+        worktreeId,
+        title: 'Retained stale terminal',
+        customTitle: null,
+        color: null,
+        sortOrder: 10_000,
+        createdAt: startedAt
+      }
+      const entry = {
+        state: 'done' as const,
+        prompt: thread.prompt,
+        agentType: 'codex' as const,
+        paneKey: thread.paneKey,
+        updatedAt: startedAt,
+        stateStartedAt: startedAt,
+        stateHistory: []
+      }
+
+      store.setState((state) => ({
+        retainedAgentsByPaneKey: {
+          ...state.retainedAgentsByPaneKey,
+          [thread.paneKey]: {
+            worktreeId,
+            entry,
+            tab,
+            agentType: 'codex' as const,
+            startedAt
+          }
+        }
+      }))
+    },
+    { worktreeId, thread, startedAt }
+  )
+}
+
 async function clickWorkspaceCardAgentRow(page: Page, prompt: string): Promise<void> {
   const rowLabel = page
     .getByRole('group', { name: 'Agents' })
@@ -173,6 +249,51 @@ async function clickWorkspaceCardAgentRow(page: Page, prompt: string): Promise<v
     .first()
   await expect(rowLabel).toBeVisible({ timeout: 10_000 })
   await rowLabel.click()
+}
+
+async function readTerminalPopoverDomSnapshot(
+  page: Page,
+  tabId: string
+): Promise<TerminalPopoverDomSnapshot> {
+  return page.evaluate((tabId) => {
+    const store = window.__store
+    const activeWorktreeId = store?.getState().activeWorktreeId ?? null
+    const tabIds = activeWorktreeId
+      ? (store?.getState().tabsByWorktree[activeWorktreeId] ?? []).map((tab) => tab.id)
+      : []
+    const ptyIdsByLeafId = store?.getState().terminalLayoutsByTabId[tabId]?.ptyIdsByLeafId ?? {}
+    const popover = document.querySelector<HTMLElement>('[data-agent-terminal-popover-content]')
+    const terminalRootsForTab = Array.from(
+      document.querySelectorAll<HTMLElement>(`[data-terminal-tab-id="${tabId}"]`)
+    )
+    const terminalRootInsidePopover =
+      popover !== null && terminalRootsForTab.some((root) => popover.contains(root))
+    const leafIdsInsidePopover = popover
+      ? Array.from(popover.querySelectorAll<HTMLElement>('[data-leaf-id]')).map(
+          (pane) => pane.dataset.leafId ?? ''
+        )
+      : []
+
+    return {
+      activeWorktreeId,
+      tabIds,
+      ptyIdsByLeafId,
+      popoverText: popover?.innerText ?? '',
+      hasArrow: Boolean(popover?.querySelector('[data-slot="popover-arrow"]')),
+      terminalRootCountForTab: terminalRootsForTab.length,
+      terminalRootInsidePopover,
+      leafIdsInsidePopover,
+      hasXtermScreen: Boolean(popover?.querySelector('.xterm-screen'))
+    }
+  }, tabId)
+}
+
+async function readTerminalTabContent(page: Page, tabId: string): Promise<string> {
+  return page.evaluate((tabId) => {
+    const manager = window.__paneManagers?.get(tabId)
+    const pane = manager?.getActivePane?.() ?? manager?.getPanes?.()[0] ?? null
+    return pane?.serializeAddon?.serialize?.() ?? ''
+  }, tabId)
 }
 
 async function readActivePaneSelection(page: Page): Promise<ActivePaneSelection> {
@@ -367,6 +488,264 @@ test.describe('Activity Agent Pane Isolation', () => {
         activeTabId: snapshot.tabId,
         activeLeafId: second.leafId
       })
+  })
+
+  test('hovering the workspace-card agent row portals the existing terminal with a right-side arrow', async ({
+    orcaPage
+  }) => {
+    const snapshot = await waitForPaneIdentitySnapshot(orcaPage, 1)
+    const pane = snapshot.panes[0]
+    if (!pane) {
+      throw new Error('Agent terminal popover test needs a mounted terminal pane')
+    }
+    const now = Date.now()
+    const thread: SeededActivityThread = {
+      paneKey: `${snapshot.tabId}:${pane.leafId}`,
+      leafId: pane.leafId,
+      prompt: `AGENT_POPOVER_ROW_HITBOX_${now}`
+    }
+    await seedActivityThread(
+      orcaPage,
+      thread,
+      'Codex row popover pane',
+      'blocked',
+      'Popover terminal is waiting for input.',
+      now
+    )
+    await enableInlineAgentCards(orcaPage)
+    await enableAgentTerminalPopover(orcaPage)
+
+    const before = await readTerminalPopoverDomSnapshot(orcaPage, snapshot.tabId)
+    const rowLabel = orcaPage
+      .getByRole('group', { name: 'Agents' })
+      .locator(`span[title="${thread.prompt}"]`)
+      .first()
+    await expect(rowLabel).toBeVisible({ timeout: 10_000 })
+
+    // Why: this hovers the row text, not the status dot. The regression was a
+    // dot-sized trigger that made the row hitbox feel broken.
+    await rowLabel.hover()
+    await expect(orcaPage.locator('[data-agent-terminal-popover-content]').first()).toBeVisible({
+      timeout: 10_000
+    })
+    await expect(orcaPage.getByRole('button', { name: 'Focus terminal input' })).toHaveCount(0)
+
+    const content = orcaPage.locator('[data-agent-terminal-popover-content]').first()
+    await expect(content.getByRole('heading', { name: thread.prompt })).toBeVisible()
+    await expect(content.locator('[data-slot="popover-arrow"]')).toBeVisible()
+    await expect(content).not.toContainText(
+      'Agent terminal closed. Open a new terminal in this workspace to continue.'
+    )
+
+    await expect
+      .poll(async () => readTerminalPopoverDomSnapshot(orcaPage, snapshot.tabId), {
+        timeout: 10_000,
+        message: 'Agent terminal did not portal into the popover'
+      })
+      .toMatchObject({
+        activeWorktreeId: before.activeWorktreeId,
+        tabIds: before.tabIds,
+        ptyIdsByLeafId: before.ptyIdsByLeafId,
+        hasArrow: true,
+        terminalRootCountForTab: 1,
+        terminalRootInsidePopover: true,
+        leafIdsInsidePopover: [thread.leafId],
+        hasXtermScreen: true
+      })
+
+    const rowBox = await rowLabel
+      .locator('xpath=ancestor::*[@data-agent-terminal-popover-anchor]')
+      .boundingBox()
+    const popoverBox = await content.boundingBox()
+    const arrowBox = await content.locator('[data-slot="popover-arrow"]').boundingBox()
+    expect(rowBox, 'agent row popover anchor should have a bounding box').not.toBeNull()
+    expect(popoverBox, 'agent terminal popover should have a bounding box').not.toBeNull()
+    expect(arrowBox, 'agent terminal popover arrow should have a bounding box').not.toBeNull()
+    expect(popoverBox!.x).toBeGreaterThan(rowBox!.x + rowBox!.width - 2)
+    const rowCenterY = rowBox!.y + rowBox!.height / 2
+    const popoverCenterY = popoverBox!.y + popoverBox!.height / 2
+    const arrowCenterY = arrowBox!.y + arrowBox!.height / 2
+    expect(Math.abs(popoverCenterY - rowCenterY)).toBeLessThanOrEqual(2)
+    expect(Math.abs(arrowCenterY - rowCenterY)).toBeLessThanOrEqual(2)
+
+    // Why: the active terminal can move focus while being portaled. Keep the
+    // row hovered long enough to catch focus-driven dismissals that make the
+    // popover appear briefly and then disappear for normal users.
+    await orcaPage.waitForTimeout(1_500)
+    await expect(content).toBeVisible()
+    await expect
+      .poll(async () => readTerminalPopoverDomSnapshot(orcaPage, snapshot.tabId), {
+        timeout: 5_000,
+        message: 'Agent terminal popover did not remain open after the terminal focused itself'
+      })
+      .toMatchObject({
+        terminalRootCountForTab: 1,
+        terminalRootInsidePopover: true,
+        leafIdsInsidePopover: [thread.leafId],
+        hasXtermScreen: true
+      })
+
+    await content.locator('.xterm-screen').click({ position: { x: 12, y: 12 } })
+    await orcaPage.waitForTimeout(600)
+    await expect(content).toBeVisible()
+    await expect
+      .poll(async () => readTerminalPopoverDomSnapshot(orcaPage, snapshot.tabId), {
+        timeout: 5_000,
+        message: 'Agent terminal popover did not remain open after clicking the portaled xterm'
+      })
+      .toMatchObject({
+        terminalRootCountForTab: 1,
+        terminalRootInsidePopover: true,
+        leafIdsInsidePopover: [thread.leafId],
+        hasXtermScreen: true
+      })
+  })
+
+  test('background workspace terminal popover accepts input without switching workspaces', async ({
+    orcaPage
+  }) => {
+    const sourceWorktreeId = await waitForActiveWorktree(orcaPage)
+    const snapshot = await waitForPaneIdentitySnapshot(orcaPage, 1)
+    const pane = snapshot.panes[0]
+    if (!pane) {
+      throw new Error('Background popover interaction test needs a mounted terminal pane')
+    }
+    const now = Date.now()
+    const thread: SeededActivityThread = {
+      paneKey: `${snapshot.tabId}:${pane.leafId}`,
+      leafId: pane.leafId,
+      prompt: `AGENT_POPOVER_BACKGROUND_INPUT_${now}`
+    }
+    await seedActivityThread(
+      orcaPage,
+      thread,
+      'Codex background popover pane',
+      'blocked',
+      'Background workspace terminal is waiting for input.',
+      now
+    )
+    await enableInlineAgentCards(orcaPage)
+    await enableAgentTerminalPopover(orcaPage)
+
+    const otherWorktreeId = await switchToOtherWorktree(orcaPage, sourceWorktreeId)
+    test.skip(otherWorktreeId === null, 'Need at least two worktrees for background popover input')
+    await expect
+      .poll(async () => getActiveWorktreeId(orcaPage), { timeout: 5_000 })
+      .toBe(otherWorktreeId)
+
+    const rowLabel = orcaPage
+      .getByRole('group', { name: 'Agents' })
+      .locator(`span[title="${thread.prompt}"]`)
+      .first()
+    await expect(rowLabel).toBeVisible({ timeout: 10_000 })
+    await rowLabel.hover()
+
+    const content = orcaPage.locator('[data-agent-terminal-popover-content]').first()
+    await expect(content.getByRole('heading', { name: thread.prompt })).toBeVisible({
+      timeout: 10_000
+    })
+    await expect
+      .poll(async () => readTerminalPopoverDomSnapshot(orcaPage, snapshot.tabId), {
+        timeout: 10_000,
+        message: 'Background agent terminal did not portal into the popover'
+      })
+      .toMatchObject({
+        activeWorktreeId: otherWorktreeId,
+        terminalRootInsidePopover: true,
+        leafIdsInsidePopover: [thread.leafId],
+        hasXtermScreen: true
+      })
+
+    const marker = `POPOVER_BACKGROUND_TYPED_${Date.now()}`
+    await content.locator('.xterm-screen').click({ position: { x: 12, y: 12 } })
+    await orcaPage.keyboard.type(marker)
+
+    await expect
+      .poll(async () => (await readTerminalTabContent(orcaPage, snapshot.tabId)).includes(marker), {
+        timeout: 10_000,
+        message: 'Typed text did not reach the background portaled terminal'
+      })
+      .toBe(true)
+    await expect
+      .poll(async () => getActiveWorktreeId(orcaPage), { timeout: 5_000 })
+      .toBe(otherWorktreeId)
+    await expect(content).toBeVisible()
+  })
+
+  test('hovering between adjacent workspace-card agent rows keeps one terminal popover open', async ({
+    orcaPage
+  }) => {
+    await splitActiveTerminalPane(orcaPage, 'vertical')
+    await waitForPaneCount(orcaPage, 2)
+    const snapshot = await waitForPaneIdentitySnapshot(orcaPage, 2)
+    const [first, second] = await seedActivityThreadsForSplitPanes(orcaPage, snapshot)
+    await enableInlineAgentCards(orcaPage)
+    await enableAgentTerminalPopover(orcaPage)
+
+    const agentsGroup = orcaPage.getByRole('group', { name: 'Agents' })
+    const firstLabel = agentsGroup.locator(`span[title="${first.prompt}"]`).first()
+    const secondLabel = agentsGroup.locator(`span[title="${second.prompt}"]`).first()
+    await expect(firstLabel).toBeVisible({ timeout: 10_000 })
+    await expect(secondLabel).toBeVisible({ timeout: 10_000 })
+
+    const popovers = orcaPage.locator('[data-agent-terminal-popover-content]')
+    await firstLabel.hover()
+    await expect(orcaPage.getByRole('heading', { name: first.prompt })).toBeVisible({
+      timeout: 10_000
+    })
+    await expect(popovers).toHaveCount(1)
+
+    await secondLabel.hover()
+    await expect(orcaPage.getByRole('heading', { name: second.prompt })).toBeVisible({
+      timeout: 10_000
+    })
+
+    // Why: adjacent row hover should transfer ownership immediately. A delayed
+    // close leaves two portaled terminal popovers visible while users move
+    // through a dense agent list.
+    const visiblePopoverCount = await popovers.evaluateAll(
+      (nodes) =>
+        nodes.filter((node) => {
+          const element = node as HTMLElement
+          const style = window.getComputedStyle(element)
+          const rect = element.getBoundingClientRect()
+          return style.display !== 'none' && style.visibility !== 'hidden' && rect.height > 0
+        }).length
+    )
+    expect(visiblePopoverCount).toBe(1)
+    expect(await orcaPage.getByRole('heading', { name: first.prompt }).count()).toBe(0)
+  })
+
+  test('stale retained agent rows do not open a closed-terminal popover on hover', async ({
+    orcaPage
+  }) => {
+    const worktreeId = await waitForActiveWorktree(orcaPage)
+    const now = Date.now()
+    const staleThread: SeededActivityThread = {
+      paneKey: `stale-tab-${now}:stale-leaf-${now}`,
+      leafId: `stale-leaf-${now}`,
+      prompt: `AGENT_POPOVER_STALE_ROW_${now}`
+    }
+    await seedRetainedAgentRow(orcaPage, worktreeId, staleThread, now)
+    await enableInlineAgentCards(orcaPage)
+    await enableAgentTerminalPopover(orcaPage)
+
+    const rowLabel = orcaPage
+      .getByRole('group', { name: 'Agents' })
+      .locator(`span[title="${staleThread.prompt}"]`)
+      .first()
+    await expect(rowLabel).toBeVisible({ timeout: 10_000 })
+    await rowLabel.hover()
+
+    // Why: HOVER_OPEN_DELAY_MS is 120ms. Wait beyond it so this catches rows
+    // that are incorrectly wired and open the old closed-terminal fallback.
+    await orcaPage.waitForTimeout(350)
+    await expect(orcaPage.locator('[data-agent-terminal-popover-content]')).toHaveCount(0)
+    await expect(
+      orcaPage.getByText(
+        'Agent terminal closed. Open a new terminal in this workspace to continue.'
+      )
+    ).toHaveCount(0)
   })
 
   test('workspace card agent rows focus the matching split-group terminal pane', async ({

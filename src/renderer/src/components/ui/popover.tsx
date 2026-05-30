@@ -17,6 +17,10 @@ function PopoverAnchor(props: React.ComponentProps<typeof PopoverPrimitive.Ancho
   return <PopoverPrimitive.Anchor data-slot="popover-anchor" {...props} />
 }
 
+function PopoverArrow(props: React.ComponentProps<typeof PopoverPrimitive.Arrow>) {
+  return <PopoverPrimitive.Arrow data-slot="popover-arrow" {...props} />
+}
+
 function PopoverContent({
   className,
   align = 'center',
@@ -105,4 +109,4 @@ function PopoverContent({
   )
 }
 
-export { Popover, PopoverAnchor, PopoverContent, PopoverTrigger }
+export { Popover, PopoverAnchor, PopoverArrow, PopoverContent, PopoverTrigger }

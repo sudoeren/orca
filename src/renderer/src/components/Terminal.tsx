@@ -61,10 +61,10 @@ import { focusTerminalTabSurface } from '@/lib/focus-terminal-tab-surface'
 import { appendUniqueOpenFileIds } from './terminal/unsaved-close-queue'
 import CodexRestartChip from './CodexRestartChip'
 import {
-  findActivityTerminalPortal,
-  useActivityTerminalPortals,
-  type ActivityTerminalPortalTarget
-} from './activity/activity-terminal-portal'
+  findTerminalPortal,
+  useTerminalPortals,
+  type TerminalPortalTarget
+} from './terminal-pane/terminal-portal-registry'
 import { isRemoteRuntimePtyId } from '@/runtime/runtime-terminal-inspection'
 import {
   activateWebRuntimeSessionTab,
@@ -160,9 +160,7 @@ function Terminal(): React.JSX.Element | null {
   // activeTabId here used to flash the wrong terminal — selectThread updates
   // the store in multiple steps and intermediate renders briefly pointed the
   // portal at the new worktree's stale last-active tab.
-  const activityTerminalPortals: ActivityTerminalPortalTarget[] = useActivityTerminalPortals(
-    activeView === 'activity'
-  )
+  const terminalPortals: TerminalPortalTarget[] = useTerminalPortals(true)
 
   const tabs = useMemo(
     () => (activeWorktreeId ? (tabsByWorktree[activeWorktreeId] ?? []) : []),
@@ -1553,7 +1551,7 @@ function Terminal(): React.JSX.Element | null {
                   focusedGroupId={activeGroupIdByWorktree[worktree.id]}
                   isVisible={isVisible}
                   shouldMeasureHiddenWorktree={shouldMeasureHiddenWorktree}
-                  activityTerminalPortals={activityTerminalPortals}
+                  terminalPortals={terminalPortals}
                 />
               )
             })}
@@ -1616,11 +1614,11 @@ function Terminal(): React.JSX.Element | null {
                   >
                     <CodexRestartChip worktreeId={worktree.id} />
                     {(tabsByWorktree[worktree.id] ?? []).map((tab) => {
-                      const activityTerminalPortal = findActivityTerminalPortal(
-                        activityTerminalPortals,
-                        { worktreeId: worktree.id, tabId: tab.id }
-                      )
-                      const isActivityPortalTab = activityTerminalPortal !== null
+                      const terminalPortal = findTerminalPortal(terminalPortals, {
+                        worktreeId: worktree.id,
+                        tabId: tab.id
+                      })
+                      const isPortalTab = terminalPortal !== null
                       const isActiveTerminalTab =
                         isVisible && tab.id === activeTabId && activeTabType === 'terminal'
                       const terminalPane = (
@@ -1629,25 +1627,25 @@ function Terminal(): React.JSX.Element | null {
                           tabId={tab.id}
                           worktreeId={worktree.id}
                           cwd={worktree.path}
-                          isActive={isActiveTerminalTab || activityTerminalPortal?.active === true}
+                          isActive={isActiveTerminalTab || terminalPortal?.active === true}
                           // Why: the activity page hosts this existing pane via
                           // portal while the workspace surface remains hidden.
                           // Keeping `isVisible` true for the portaled tab lets
                           // xterm fit and stream foreground output in-place.
-                          isVisible={isActiveTerminalTab || isActivityPortalTab}
+                          isVisible={isActiveTerminalTab || isPortalTab}
                           // Why: when portaled to Activity for a specific agent
                           // pane, isolate that leaf so split siblings stay
                           // hidden. Workspace renders pass null → no override.
-                          isolatedPaneKey={activityTerminalPortal?.paneKey ?? null}
+                          isolatedPaneKey={terminalPortal?.paneKey ?? null}
                           onPtyExit={(ptyId) => handlePtyExit(tab.id, ptyId)}
                           onCloseTab={() => handleCloseTab(tab.id)}
                         />
                       )
-                      if (activityTerminalPortal) {
+                      if (terminalPortal) {
                         return createPortal(
                           terminalPane,
-                          activityTerminalPortal.target,
-                          `activity-terminal-${tab.id}`
+                          terminalPortal.target,
+                          `terminal-portal-${tab.id}`
                         )
                       }
                       return terminalPane
@@ -1809,7 +1807,7 @@ const WorktreeSplitSurface = React.memo(function WorktreeSplitSurface({
   focusedGroupId,
   isVisible,
   shouldMeasureHiddenWorktree,
-  activityTerminalPortals
+  terminalPortals
 }: {
   worktreeId: string
   worktreePath: string
@@ -1817,7 +1815,7 @@ const WorktreeSplitSurface = React.memo(function WorktreeSplitSurface({
   focusedGroupId?: string
   isVisible: boolean
   shouldMeasureHiddenWorktree: boolean
-  activityTerminalPortals: ActivityTerminalPortalTarget[]
+  terminalPortals: TerminalPortalTarget[]
 }): React.JSX.Element {
   const browserPageIds = useAppStore(
     useShallow((state) =>
@@ -1854,7 +1852,7 @@ const WorktreeSplitSurface = React.memo(function WorktreeSplitSurface({
         worktreeId={worktreeId}
         worktreePath={worktreePath}
         isWorktreeActive={isVisible}
-        activityTerminalPortals={activityTerminalPortals}
+        terminalPortals={terminalPortals}
       />
       <BrowserPaneOverlayLayer worktreeId={worktreeId} isWorktreeActive={isVisible} />
     </div>

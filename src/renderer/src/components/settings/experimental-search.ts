@@ -99,6 +99,21 @@ export const EXPERIMENTAL_PANE_SEARCH_ENTRIES: SettingsSearchEntry[] = [
       'url',
       'file'
     ]
+  },
+  {
+    title: 'Agent terminal popover',
+    description: 'Hover an agent status in a worktree card to open its terminal.',
+    keywords: [
+      'experimental',
+      'agent',
+      'terminal',
+      'popover',
+      'hover',
+      'status',
+      'worktree',
+      'workspace',
+      'sidebar'
+    ]
   }
 ]
 
@@ -119,5 +134,6 @@ export const EXPERIMENTAL_SEARCH_ENTRY = {
   terminalAttention: findEntry('Terminal attention'),
   compactWorktreeCards: findEntry('Compact worktree cards'),
   symlinks: findEntry('Symlinks on worktrees'),
-  unifiedNewTabLauncher: findEntry('Smart New Tab menu')
+  unifiedNewTabLauncher: findEntry('Smart New Tab menu'),
+  agentTerminalPopover: findEntry('Agent terminal popover')
 } as const

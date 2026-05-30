@@ -14,11 +14,16 @@ let mockAgents: unknown[] = [
   }
 ]
 let mockFocusedAgentPaneKey: string | null = null
+let mockExperimentalAgentTerminalPopover = false
+let mockLiveTabIds = ['tab-1']
 
 vi.mock('@/store', () => ({
   useAppStore: (selector: (state: unknown) => unknown) =>
     selector({
       acknowledgedAgentsByPaneKey: {},
+      settings: { experimentalAgentTerminalPopover: mockExperimentalAgentTerminalPopover },
+      tabsByWorktree: { 'wt-1': mockLiveTabIds.map((id) => ({ id })) },
+      migrationUnsupportedByPtyId: {},
       dropAgentStatus: vi.fn(),
       dismissRetainedAgent: vi.fn(),
       acknowledgeAgents: vi.fn()
@@ -39,34 +44,46 @@ vi.mock('@/components/dashboard/DashboardAgentRow', () => ({
     isFocusedPane,
     childAgentCount,
     childAgentsExpanded,
-    onToggleChildAgents
+    onToggleChildAgents,
+    renderRowPopover
   }: {
     agent: { paneKey: string }
     isFocusedPane?: boolean
     childAgentCount?: number
     childAgentsExpanded?: boolean
     onToggleChildAgents?: () => void
-  }) => (
-    <div
-      data-testid="agent-row"
-      data-focused={isFocusedPane ? 'true' : 'false'}
-      data-pane-key={agent.paneKey}
-    >
-      {agent.paneKey}
-      {typeof childAgentCount === 'number' && childAgentCount > 0 ? (
-        <button
-          type="button"
-          aria-label={`${childAgentsExpanded ? 'Hide' : 'Show'} ${childAgentCount} child ${
-            childAgentCount === 1 ? 'agent' : 'agents'
-          }`}
-          aria-expanded={childAgentsExpanded ?? false}
-          onClick={onToggleChildAgents}
-        >
-          +{childAgentCount}
-        </button>
-      ) : null}
-    </div>
-  )
+    renderRowPopover?: (args: {
+      children: ReactNode
+      agentName: string
+      statusLabel: string
+    }) => ReactNode
+  }) => {
+    const row = (
+      <div
+        data-testid="agent-row"
+        data-focused={isFocusedPane ? 'true' : 'false'}
+        data-pane-key={agent.paneKey}
+        data-popover={renderRowPopover ? 'true' : 'false'}
+      >
+        {agent.paneKey}
+        {typeof childAgentCount === 'number' && childAgentCount > 0 ? (
+          <button
+            type="button"
+            aria-label={`${childAgentsExpanded ? 'Hide' : 'Show'} ${childAgentCount} child ${
+              childAgentCount === 1 ? 'agent' : 'agents'
+            }`}
+            aria-expanded={childAgentsExpanded ?? false}
+            onClick={onToggleChildAgents}
+          >
+            +{childAgentCount}
+          </button>
+        ) : null}
+      </div>
+    )
+    return renderRowPopover
+      ? renderRowPopover({ children: row, agentName: agent.paneKey, statusLabel: 'Working' })
+      : row
+  }
 }))
 
 vi.mock('./focused-agent-row-highlight', () => ({
@@ -80,11 +97,13 @@ vi.mock('@/components/ui/tooltip', () => ({
 }))
 
 describe('WorktreeCardAgents', () => {
+  const leafId = '44444444-4444-4444-8444-444444444444'
+
   beforeEach(() => {
     vi.clearAllMocks()
     mockAgents = [
       {
-        paneKey: 'tab-1:1',
+        paneKey: `tab-1:${leafId}`,
         tab: { id: 'tab-1' },
         state: 'working',
         entry: {
@@ -94,6 +113,8 @@ describe('WorktreeCardAgents', () => {
       }
     ]
     mockFocusedAgentPaneKey = null
+    mockExperimentalAgentTerminalPopover = false
+    mockLiveTabIds = ['tab-1']
   })
 
   it('renders ordinary rows in a labeled group without a child disclosure', async () => {
@@ -112,7 +133,7 @@ describe('WorktreeCardAgents', () => {
     mockFocusedAgentPaneKey = 'tab-1:2'
     mockAgents = [
       {
-        paneKey: 'tab-1:1',
+        paneKey: `tab-1:${leafId}`,
         tab: { id: 'tab-1' },
         entry: {
           stateStartedAt: 1000
@@ -130,7 +151,7 @@ describe('WorktreeCardAgents', () => {
 
     const markup = renderToStaticMarkup(<WorktreeCardAgents worktreeId="wt-1" />)
 
-    expect(markup).toContain('data-focused="false" data-pane-key="tab-1:1"')
+    expect(markup).toContain(`data-focused="false" data-pane-key="tab-1:${leafId}"`)
     expect(markup).toContain('data-focused="true" data-pane-key="tab-1:2"')
   })
 
@@ -243,5 +264,55 @@ describe('WorktreeCardAgents', () => {
     const markup = renderToStaticMarkup(<WorktreeCardAgents worktreeId="wt-1" />)
 
     expect(markup).toBe('')
+  })
+
+  it('only wires terminal popovers when enabled, live, and the pane key matches the tab', async () => {
+    mockExperimentalAgentTerminalPopover = true
+    mockAgents = [
+      {
+        paneKey: `tab-1:${leafId}`,
+        tab: { id: 'tab-1' },
+        state: 'working',
+        entry: {
+          stateStartedAt: 1000,
+          orchestration: undefined
+        }
+      },
+      {
+        paneKey: 'tab-2:1',
+        tab: { id: 'tab-other' },
+        state: 'working',
+        entry: {
+          stateStartedAt: 1000,
+          orchestration: undefined
+        }
+      },
+      {
+        paneKey: 'legacy',
+        tab: { id: 'legacy' },
+        state: 'working',
+        entry: {
+          stateStartedAt: 1000,
+          orchestration: undefined
+        }
+      },
+      {
+        paneKey: 'tab-stale:1',
+        tab: { id: 'tab-stale' },
+        state: 'done',
+        entry: {
+          stateStartedAt: 1000,
+          orchestration: undefined
+        }
+      }
+    ]
+    const { default: WorktreeCardAgents } = await import('./WorktreeCardAgents')
+
+    const markup = renderToStaticMarkup(<WorktreeCardAgents worktreeId="wt-1" />)
+
+    expect(markup).toContain(`data-pane-key="tab-1:${leafId}" data-popover="true"`)
+    expect(markup).toContain('data-pane-key="tab-2:1" data-popover="false"')
+    expect(markup).toContain('data-pane-key="legacy" data-popover="false"')
+    expect(markup).toContain('data-pane-key="tab-stale:1" data-popover="false"')
   })
 })

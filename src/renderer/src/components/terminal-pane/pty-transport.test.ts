@@ -688,6 +688,54 @@ describe('createIpcPtyTransport', () => {
     expect(transport.getPtyId()).toBeNull()
   })
 
+  it('does not kill a pending spawn when the transport was only detached', async () => {
+    const { createIpcPtyTransport } = await import('./pty-transport')
+    const spawnControls: { resolve: ((value: { id: string }) => void) | null } = { resolve: null }
+    const spawnPromise = new Promise<{ id: string }>((resolve) => {
+      spawnControls.resolve = resolve
+    })
+    const spawnMock = vi.fn().mockReturnValue(spawnPromise)
+    const killMock = vi.fn()
+
+    ;(globalThis as { window: typeof window }).window = {
+      ...originalWindow,
+      api: {
+        ...originalWindow?.api,
+        pty: {
+          ...originalWindow?.api?.pty,
+          spawn: spawnMock,
+          write: vi.fn(),
+          resize: vi.fn(),
+          kill: killMock,
+          onData: vi.fn((callback: (payload: { id: string; data: string }) => void) => {
+            onData = callback
+            return () => {}
+          }),
+          onReplay: vi.fn(() => () => {}),
+          onExit: vi.fn((callback: (payload: { id: string; code: number }) => void) => {
+            onExit = callback
+            return () => {}
+          })
+        }
+      }
+    } as unknown as typeof window
+
+    const transport = createIpcPtyTransport()
+    const connectPromise = transport.connect({
+      url: '',
+      callbacks: {}
+    })
+
+    transport.detach?.()
+    if (!spawnControls.resolve) {
+      throw new Error('Expected spawn resolver to be captured')
+    }
+    spawnControls.resolve({ id: 'pty-late' })
+
+    await expect(connectPromise).resolves.toBe('pty-late')
+    expect(killMock).not.toHaveBeenCalled()
+  })
+
   it('unregisterPtyDataHandlers prevents final data burst from triggering notifications', async () => {
     const { createIpcPtyTransport, unregisterPtyDataHandlers } = await import('./pty-transport')
     const onTitleChange = vi.fn()

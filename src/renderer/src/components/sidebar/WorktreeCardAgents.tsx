@@ -1,4 +1,6 @@
 import React, { useCallback, useMemo, useState } from 'react'
+import { flushSync } from 'react-dom'
+import { useShallow } from 'zustand/react/shallow'
 import { useAppStore } from '@/store'
 import { activateAndRevealWorktree } from '@/lib/worktree-activation'
 import { activateTabAndFocusPane } from '@/lib/activate-tab-and-focus-pane'
@@ -10,6 +12,13 @@ import type { DashboardAgentRow as DashboardAgentRowData } from '@/components/da
 import { parsePaneKey } from '../../../../shared/stable-pane-id'
 import { dismissStaleAgentRowByKey } from '../terminal-pane/stale-agent-row'
 import { useFocusedAgentPaneKey } from './focused-agent-row-highlight'
+
+// Why: the terminal popover is experimental and default-off. Keep its Radix /
+// portal dependencies off the normal inline-agent render path until enabled.
+const LazyAgentTerminalPopover = React.lazy(async () => {
+  const module = await import('./AgentTerminalPopover')
+  return { default: module.AgentTerminalPopover }
+})
 
 type Props = {
   worktreeId: string
@@ -119,6 +128,15 @@ const WorktreeCardAgentsBody = React.memo(function WorktreeCardAgentsBody({
   const dropAgentStatus = useAppStore((s) => s.dropAgentStatus)
   const dismissRetainedAgent = useAppStore((s) => s.dismissRetainedAgent)
   const focusedAgentPaneKey = useFocusedAgentPaneKey(worktreeId)
+  const agentTerminalPopoverEnabled = useAppStore(
+    (s) => s.settings?.experimentalAgentTerminalPopover === true
+  )
+  const liveTerminalTabIds = useAppStore(
+    useShallow((s) => (s.tabsByWorktree[worktreeId] ?? []).map((tab) => tab.id))
+  )
+  const liveTerminalTabIdSet = useMemo(() => new Set(liveTerminalTabIds), [liveTerminalTabIds])
+  const [activePopoverSlotId, setActivePopoverSlotId] = useState<string | null>(null)
+  const popoverRequestCounterRef = React.useRef(0)
 
   // Why: subscribe to the ack map reference (Object.is equality) and derive
   // per-agent unvisited flags locally. Keeps the inline list's bold/mute
@@ -212,6 +230,18 @@ const WorktreeCardAgentsBody = React.memo(function WorktreeCardAgentsBody({
     e.stopPropagation()
   }, [])
 
+  const claimPopoverSlot = useCallback((slotId: string): string => {
+    const requestToken = String(++popoverRequestCounterRef.current)
+    // Why: AgentTerminalPopover immediately derives visibility from the
+    // parent-owned active slot. Commit the ownership transfer before the child
+    // flips its local open state, or dense row-to-row hover can close the new
+    // popover against stale parent props.
+    flushSync(() => {
+      setActivePopoverSlotId(slotId)
+    })
+    return requestToken
+  }, [])
+
   // Why: when any root row has a disclosure chevron, leaf siblings reserve a
   // matching leading spacer so the state-dot column stays aligned across the
   // card. Without this, parent rows shift right by the chevron's width while
@@ -235,6 +265,13 @@ const WorktreeCardAgentsBody = React.memo(function WorktreeCardAgentsBody({
     const expanded = expandedLineageParents.has(agent.paneKey)
     const descendantAncestorPaneKeys = new Set(ancestorPaneKeys)
     descendantAncestorPaneKeys.add(agent.paneKey)
+    const parsedPaneKey = parsePaneKey(agent.paneKey)
+    const terminalPopoverSlotId =
+      agentTerminalPopoverEnabled &&
+      liveTerminalTabIdSet.has(agent.tab.id) &&
+      parsedPaneKey?.tabId === agent.tab.id
+        ? `agent-popover:${worktreeId}:${agent.tab.id}:${agent.paneKey}`
+        : null
     return (
       <React.Fragment key={agent.paneKey}>
         <DashboardAgentRow
@@ -268,6 +305,26 @@ const WorktreeCardAgentsBody = React.memo(function WorktreeCardAgentsBody({
           // see anyRootHasChildren above.
           reserveDisclosureGutter={anyRootHasChildren && !hasChildAgents}
           isFocusedPane={agent.paneKey === focusedAgentPaneKey}
+          renderRowPopover={
+            terminalPopoverSlotId
+              ? ({ children, agentName, statusLabel }) => (
+                  <React.Suspense fallback={children}>
+                    <LazyAgentTerminalPopover
+                      worktreeId={worktreeId}
+                      tabId={agent.tab.id}
+                      paneKey={agent.paneKey}
+                      agentName={agentName}
+                      statusLabel={statusLabel}
+                      slotId={terminalPopoverSlotId}
+                      activeSlotId={activePopoverSlotId}
+                      claimSlot={claimPopoverSlot}
+                    >
+                      {children}
+                    </LazyAgentTerminalPopover>
+                  </React.Suspense>
+                )
+              : undefined
+          }
           // Why: the disclosure variant uses chevron + indentation to show
           // hierarchy. The legacy L-connector / vertical-trunk decorations
           // are pinned to a fixed left offset that doesn't match the

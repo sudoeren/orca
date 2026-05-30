@@ -4,10 +4,7 @@ import { useShallow } from 'zustand/react/shallow'
 import type { Tab, TabGroup, TerminalTab } from '../../../../shared/types'
 import { useAppStore } from '../../store'
 import { tabGroupBodyAnchorName } from '../tab-group/tab-group-body-anchor'
-import {
-  findActivityTerminalPortal,
-  type ActivityTerminalPortalTarget
-} from '../activity/activity-terminal-portal'
+import { findTerminalPortal, type TerminalPortalTarget } from './terminal-portal-registry'
 import TerminalPane from './TerminalPane'
 
 type TerminalOverlayAssignment = {
@@ -18,7 +15,7 @@ type TerminalOverlayAssignment = {
 const EMPTY_TERMINAL_TABS: readonly TerminalTab[] = []
 const EMPTY_UNIFIED_TABS: readonly Tab[] = []
 const EMPTY_GROUPS: readonly TabGroup[] = []
-const EMPTY_ACTIVITY_PORTALS: ActivityTerminalPortalTarget[] = []
+const EMPTY_TERMINAL_PORTALS: TerminalPortalTarget[] = []
 
 type TerminalOverlaySlotProps = {
   terminalTabId: string
@@ -28,7 +25,7 @@ type TerminalOverlaySlotProps = {
   groupId: string | undefined
   isVisible: boolean
   isActive: boolean
-  activityTerminalPortal: ActivityTerminalPortalTarget | null
+  terminalPortal: TerminalPortalTarget | null
   onFocusOwningGroup: ((groupId: string) => void) | undefined
   consumeSuppressedPtyExit: (ptyId: string) => boolean
   closeTab: (tabId: string) => void
@@ -43,7 +40,7 @@ const TerminalOverlaySlot = memo(function TerminalOverlaySlot({
   groupId,
   isVisible,
   isActive,
-  activityTerminalPortal,
+  terminalPortal,
   onFocusOwningGroup,
   consumeSuppressedPtyExit,
   closeTab,
@@ -90,12 +87,12 @@ const TerminalOverlaySlot = memo(function TerminalOverlaySlot({
       tabId={terminalTabId}
       worktreeId={worktreeId}
       cwd={worktreePath}
-      isActive={isActive || activityTerminalPortal?.active === true}
+      isActive={isActive || terminalPortal?.active === true}
       // Why: split-group changes reparent TabGroupPanel subtrees. Keeping the
       // TerminalPane mounted here preserves alt-screen TUI state while this
       // flag still lets hidden tabs throttle rendering.
-      isVisible={isVisible || activityTerminalPortal !== null}
-      isolatedPaneKey={activityTerminalPortal?.paneKey ?? null}
+      isVisible={isVisible || terminalPortal !== null}
+      isolatedPaneKey={terminalPortal?.paneKey ?? null}
       onPtyExit={(ptyId) => {
         if (consumeSuppressedPtyExit(ptyId)) {
           return
@@ -110,12 +107,8 @@ const TerminalOverlaySlot = memo(function TerminalOverlaySlot({
     />
   )
 
-  if (activityTerminalPortal) {
-    return createPortal(
-      terminalPane,
-      activityTerminalPortal.target,
-      `activity-terminal-${terminalTabId}`
-    )
+  if (terminalPortal) {
+    return createPortal(terminalPane, terminalPortal.target, `terminal-portal-${terminalTabId}`)
   }
 
   return (
@@ -134,12 +127,12 @@ const TerminalPaneOverlayLayer = memo(function TerminalPaneOverlayLayer({
   worktreeId,
   worktreePath,
   isWorktreeActive,
-  activityTerminalPortals = EMPTY_ACTIVITY_PORTALS
+  terminalPortals = EMPTY_TERMINAL_PORTALS
 }: {
   worktreeId: string
   worktreePath: string
   isWorktreeActive: boolean
-  activityTerminalPortals?: ActivityTerminalPortalTarget[]
+  terminalPortals?: TerminalPortalTarget[]
 }): React.JSX.Element | null {
   const { terminalTabs, unifiedTabs, groups, activeGroupId } = useAppStore(
     useShallow((state) => ({
@@ -209,7 +202,7 @@ const TerminalPaneOverlayLayer = memo(function TerminalPaneOverlayLayer({
         const assignment = assignments.get(terminalTab.id)
         const isVisible = Boolean(isWorktreeActive && assignment && assignment.isActiveInGroup)
         const isActive = Boolean(isVisible && assignment && assignment.groupId === activeGroupId)
-        const activityTerminalPortal = findActivityTerminalPortal(activityTerminalPortals, {
+        const terminalPortal = findTerminalPortal(terminalPortals, {
           worktreeId,
           tabId: terminalTab.id
         })
@@ -223,7 +216,7 @@ const TerminalPaneOverlayLayer = memo(function TerminalPaneOverlayLayer({
             groupId={assignment?.groupId}
             isVisible={isVisible}
             isActive={isActive}
-            activityTerminalPortal={activityTerminalPortal}
+            terminalPortal={terminalPortal}
             onFocusOwningGroup={focusOwningGroup}
             consumeSuppressedPtyExit={consumeSuppressedPtyExit}
             closeTab={closeTab}

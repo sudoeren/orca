@@ -35,6 +35,10 @@ describe('getDefaultSettings', () => {
   it('keeps compact worktree cards experimental and disabled by default', () => {
     expect(getDefaultSettings('/tmp').experimentalCompactWorktreeCards).toBe(false)
   })
+
+  it('keeps agent terminal popover experimental and disabled by default', () => {
+    expect(getDefaultSettings('/tmp').experimentalAgentTerminalPopover).toBe(false)
+  })
 })
 
 describe('getDefaultPrimarySelectionMiddleClickPaste', () => {

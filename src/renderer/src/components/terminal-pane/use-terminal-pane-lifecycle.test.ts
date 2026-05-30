@@ -90,6 +90,17 @@ describe('shouldDetachPaneTransportOnUnmount', () => {
     ).toBe(true)
   })
 
+  it('detaches pending-spawn transports when the tab still exists', () => {
+    expect(
+      shouldDetachPaneTransportOnUnmount({
+        tabStillExists: true,
+        tabId: 'tab-1',
+        ptyId: null,
+        worktreeTabs: []
+      })
+    ).toBe(true)
+  })
+
   it('detaches when a mirrored replacement tab owns the same PTY', () => {
     expect(
       shouldDetachPaneTransportOnUnmount({

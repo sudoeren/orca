@@ -123,6 +123,60 @@ describe('DashboardAgentRow', () => {
     expect(classTokens(markup)).toContain('worktree-agent-row-hover')
   })
 
+  it('lets inline callers replace the status tooltip with a popover trigger', () => {
+    const markup = renderToStaticMarkup(
+      <TooltipProvider>
+        <DashboardAgentRow
+          agent={makeAgent()}
+          onDismiss={vi.fn()}
+          onActivate={vi.fn()}
+          now={NOW}
+          hideIdentityIcon
+          hideExpand
+          renderStateDotPopover={({ children, agentName, statusLabel }) => (
+            <button
+              type="button"
+              aria-label={`Open terminal for ${agentName}, status ${statusLabel}`}
+            >
+              {children}
+            </button>
+          )}
+        />
+      </TooltipProvider>
+    )
+
+    expect(markup).toContain('Open terminal for Fix hover scope, status Working')
+    expect(markup).not.toContain('data-slot="tooltip-trigger"')
+  })
+
+  it('lets inline callers use the full row as the terminal popover anchor', () => {
+    const markup = renderToStaticMarkup(
+      <TooltipProvider>
+        <DashboardAgentRow
+          agent={makeAgent()}
+          onDismiss={vi.fn()}
+          onActivate={vi.fn()}
+          now={NOW}
+          hideIdentityIcon
+          hideExpand
+          renderRowPopover={({ children, agentName, statusLabel }) => (
+            <div
+              data-testid="row-popover-anchor"
+              aria-label={`Open terminal for ${agentName}, status ${statusLabel}`}
+            >
+              {children}
+            </div>
+          )}
+        />
+      </TooltipProvider>
+    )
+
+    expect(markup).toContain('data-testid="row-popover-anchor"')
+    expect(markup).toContain('Open terminal for Fix hover scope, status Working')
+    expect(markup).toContain('group/agent-row')
+    expect(markup).not.toContain('data-slot="tooltip-trigger"')
+  })
+
   it('scopes the timestamp and dismiss hover swap to the row-owned group', () => {
     const markup = renderRow(makeAgent())
     const classes = hoverSwapClasses(markup)
