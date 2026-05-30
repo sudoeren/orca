@@ -52,10 +52,6 @@ export function PrivacyDiagnosticsSection(): React.JSX.Element {
     }
   }, [])
 
-  useEffect(() => {
-    activeBundleSubmissionIdRef.current = bundle?.bundleSubmissionId ?? null
-  }, [bundle])
-
   const handleOpenFolder = useCallback(async (): Promise<void> => {
     try {
       await window.api.diagnostics.openTraceFolder()
@@ -91,6 +87,9 @@ export function PrivacyDiagnosticsSection(): React.JSX.Element {
         await window.api.diagnostics.discardBundlePreview(nextBundle.bundleSubmissionId)
         return
       }
+      // Why: unmount cleanup may run before a passive ref mirror would fire;
+      // keep the retained preview id in sync at the creation/clear sites.
+      activeBundleSubmissionIdRef.current = nextBundle.bundleSubmissionId
       setBundle(nextBundle)
       setPreviewOpened(false)
       setTicketId(null)
@@ -345,17 +344,15 @@ function Section({
   children: React.ReactNode
 }): React.JSX.Element {
   return (
-    <div className="flex flex-col gap-3 py-2 sm:flex-row sm:items-start sm:justify-between">
-      <div className="flex flex-1 items-start gap-3">
-        <div className="mt-1 text-muted-foreground">{icon}</div>
-        <div className="space-y-1">
+    <div className="flex items-center justify-between gap-4 py-2">
+      <div className="flex min-w-0 flex-1 items-start gap-2.5">
+        <div className="mt-0.5 text-muted-foreground">{icon}</div>
+        <div className="min-w-0 space-y-0.5">
           <Label className="text-sm">{title}</Label>
           <p className="text-xs text-muted-foreground">{description}</p>
         </div>
       </div>
-      <div className="flex shrink-0 flex-wrap items-center gap-2 self-start sm:justify-end sm:self-center">
-        {children}
-      </div>
+      <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">{children}</div>
     </div>
   )
 }

@@ -21,7 +21,7 @@ const EMPTY_SUMMARY: WorktreeAgentActivitySummary = {
   hasRetainedDone: false
 }
 
-type AgentActivityInput = Pick<
+export type AgentActivityInput = Pick<
   AppState,
   | 'tabsByWorktree'
   | 'agentStatusEpoch'
@@ -33,7 +33,6 @@ type AgentActivityInput = Pick<
 type AgentActivityCache = {
   tabsByWorktree: AppState['tabsByWorktree']
   agentStatusEpoch: number
-  agentStatusByPaneKey: AppState['agentStatusByPaneKey']
   migrationUnsupportedByPtyId: AppState['migrationUnsupportedByPtyId']
   retainedAgentsByPaneKey: AppState['retainedAgentsByPaneKey']
   summaries: Map<string, WorktreeAgentActivitySummary>
@@ -55,7 +54,6 @@ function getWorktreeAgentActivitySummaries(
     agentActivityCache &&
     agentActivityCache.tabsByWorktree === state.tabsByWorktree &&
     agentActivityCache.agentStatusEpoch === state.agentStatusEpoch &&
-    agentActivityCache.agentStatusByPaneKey === state.agentStatusByPaneKey &&
     agentActivityCache.migrationUnsupportedByPtyId === state.migrationUnsupportedByPtyId &&
     agentActivityCache.retainedAgentsByPaneKey === state.retainedAgentsByPaneKey
   ) {
@@ -99,14 +97,13 @@ function getWorktreeAgentActivitySummaries(
     }
   }
 
-  for (const retained of Object.values(state.retainedAgentsByPaneKey)) {
+  for (const retained of Object.values(state.retainedAgentsByPaneKey ?? {})) {
     summaryForWorktree(retained.worktreeId).hasRetainedDone = true
   }
 
   agentActivityCache = {
     tabsByWorktree: state.tabsByWorktree,
     agentStatusEpoch: state.agentStatusEpoch,
-    agentStatusByPaneKey: state.agentStatusByPaneKey,
     migrationUnsupportedByPtyId: state.migrationUnsupportedByPtyId,
     retainedAgentsByPaneKey: state.retainedAgentsByPaneKey,
     summaries

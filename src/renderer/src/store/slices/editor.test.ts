@@ -93,13 +93,13 @@ describe('createEditorSlice right sidebar state', () => {
     expect(store.getState().rightSidebarOpen).toBe(false)
   })
 
-  it('setRightSidebarTab writes the active worktree entry', () => {
+  it('setRightSidebarTab updates the global tab without writing a worktree entry', () => {
     const store = createEditorStore()
 
     store.getState().setRightSidebarTab('search')
 
     expect(store.getState().rightSidebarTab).toBe('search')
-    expect(store.getState().rightSidebarTabByWorktree).toEqual({ 'wt-1': 'search' })
+    expect(store.getState().rightSidebarTabByWorktree).toEqual({})
   })
 
   it('setRightSidebarTab with no active worktree does not mutate the worktree map', () => {
@@ -113,22 +113,20 @@ describe('createEditorSlice right sidebar state', () => {
     expect(store.getState().rightSidebarTabByWorktree).toBe(remembered)
   })
 
-  it('revealInExplorer records explorer for the target worktree', () => {
+  it('revealInExplorer selects explorer globally without writing a worktree entry', () => {
     const store = createEditorStore()
+    const remembered = { 'wt-1': 'search' as const, 'wt-2': 'checks' as const }
     store.setState({
       activeWorktreeId: 'wt-1',
       rightSidebarTab: 'search',
-      rightSidebarTabByWorktree: { 'wt-1': 'search', 'wt-2': 'checks' }
+      rightSidebarTabByWorktree: remembered
     })
 
     store.getState().revealInExplorer('wt-2', '/repo/file.ts')
 
     expect(store.getState().rightSidebarOpen).toBe(true)
     expect(store.getState().rightSidebarTab).toBe('explorer')
-    expect(store.getState().rightSidebarTabByWorktree).toEqual({
-      'wt-1': 'search',
-      'wt-2': 'explorer'
-    })
+    expect(store.getState().rightSidebarTabByWorktree).toBe(remembered)
     expect(store.getState().pendingExplorerReveal).toMatchObject({
       worktreeId: 'wt-2',
       filePath: '/repo/file.ts'
@@ -1334,6 +1332,8 @@ describe('createEditorSlice remote branch actions', () => {
   const gitUpstreamStatusMock = vi.fn()
   const gitPushMock = vi.fn()
   const gitPullMock = vi.fn()
+  const gitFastForwardMock = vi.fn()
+  const gitRebaseFromBaseMock = vi.fn()
   const gitFetchMock = vi.fn()
 
   beforeEach(() => {
@@ -1342,6 +1342,8 @@ describe('createEditorSlice remote branch actions', () => {
     gitUpstreamStatusMock.mockReset()
     gitPushMock.mockReset()
     gitPullMock.mockReset()
+    gitFastForwardMock.mockReset()
+    gitRebaseFromBaseMock.mockReset()
     gitFetchMock.mockReset()
 
     gitStatusMock.mockResolvedValue({ entries: [], conflictOperation: 'unknown' })
@@ -1361,6 +1363,8 @@ describe('createEditorSlice remote branch actions', () => {
         upstreamStatus: gitUpstreamStatusMock,
         push: gitPushMock,
         pull: gitPullMock,
+        fastForward: gitFastForwardMock,
+        rebaseFromBase: gitRebaseFromBaseMock,
         fetch: gitFetchMock
       }
     }
@@ -1444,6 +1448,135 @@ describe('createEditorSlice remote branch actions', () => {
     expect(gitPullMock).toHaveBeenCalledWith({
       worktreePath: '/repo',
       connectionId: undefined
+    })
+    expect(toastErrorMock).not.toHaveBeenCalled()
+  })
+
+  it('runs rebase from base and refreshes upstream on success', async () => {
+    const store = createEditorStore()
+    const pushTarget = { remoteName: 'fork', branchName: 'feature' }
+
+    await store.getState().rebaseFromBase('wt-1', '/repo', 'origin/main', undefined, pushTarget)
+
+    expect(gitRebaseFromBaseMock).toHaveBeenCalledWith({
+      worktreePath: '/repo',
+      baseRef: 'origin/main',
+      connectionId: undefined
+    })
+    expect(gitUpstreamStatusMock).toHaveBeenCalledWith({
+      worktreePath: '/repo',
+      connectionId: undefined,
+      pushTarget
+    })
+    expect(toastErrorMock).not.toHaveBeenCalled()
+  })
+
+  it('runs fast-forward and refreshes upstream on success', async () => {
+    const store = createEditorStore()
+    const pushTarget = { remoteName: 'fork', branchName: 'feature' }
+
+    await store.getState().fastForwardBranch('wt-1', '/repo', undefined, pushTarget)
+
+    expect(gitFastForwardMock).toHaveBeenCalledWith({
+      worktreePath: '/repo',
+      connectionId: undefined,
+      pushTarget
+    })
+    expect(gitUpstreamStatusMock).toHaveBeenCalledWith({
+      worktreePath: '/repo',
+      connectionId: undefined,
+      pushTarget
+    })
+    expect(toastErrorMock).not.toHaveBeenCalled()
+    expect(store.getState().isRemoteOperationActive).toBe(false)
+  })
+
+  it('surfaces a fast-forward toast and clears the busy flag when fast-forward fails', async () => {
+    const store = createEditorStore()
+    gitFastForwardMock.mockRejectedValueOnce(new Error('Not possible to fast-forward, aborting.'))
+
+    await expect(store.getState().fastForwardBranch('wt-1', '/repo')).rejects.toThrow(
+      'Not possible to fast-forward'
+    )
+
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      'Fast-forward failed. Not possible to fast-forward, aborting.'
+    )
+    expect(gitUpstreamStatusMock).not.toHaveBeenCalled()
+    expect(store.getState().isRemoteOperationActive).toBe(false)
+  })
+
+  it('keeps fast-forward wording when normalized pull errors report local changes', async () => {
+    const store = createEditorStore()
+    gitFastForwardMock.mockRejectedValueOnce(
+      new Error(
+        'Pull would overwrite local changes. Commit, stash, or discard them before pulling.'
+      )
+    )
+
+    await expect(store.getState().fastForwardBranch('wt-1', '/repo')).rejects.toThrow()
+
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      'Fast-forward blocked — commit or stash your local changes first.'
+    )
+  })
+
+  it('keeps fast-forward wording when normalized pull errors report untracked files', async () => {
+    const store = createEditorStore()
+    gitFastForwardMock.mockRejectedValueOnce(
+      new Error('Pull would overwrite untracked files. Move, remove, or add them before pulling.')
+    )
+
+    await expect(store.getState().fastForwardBranch('wt-1', '/repo')).rejects.toThrow()
+
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      'Fast-forward blocked — move, remove, or add untracked files first.'
+    )
+  })
+
+  it('keeps rebase wording when normalized pull errors report local changes', async () => {
+    const store = createEditorStore()
+    gitRebaseFromBaseMock.mockRejectedValueOnce(
+      new Error(
+        'Pull would overwrite local changes. Commit, stash, or discard them before pulling.'
+      )
+    )
+
+    await expect(store.getState().rebaseFromBase('wt-1', '/repo', 'origin/main')).rejects.toThrow()
+
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      'Rebase blocked — commit or stash your local changes first.'
+    )
+  })
+
+  it('keeps rebase wording when normalized pull errors report untracked files', async () => {
+    const store = createEditorStore()
+    gitRebaseFromBaseMock.mockRejectedValueOnce(
+      new Error('Pull would overwrite untracked files. Move, remove, or add them before pulling.')
+    )
+
+    await expect(store.getState().rebaseFromBase('wt-1', '/repo', 'origin/main')).rejects.toThrow()
+
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      'Rebase blocked — move, remove, or add untracked files first.'
+    )
+  })
+
+  it('fetches the explicit push target and refreshes that target status', async () => {
+    const store = createEditorStore()
+    const pushTarget = { remoteName: 'fork', branchName: 'feature' }
+
+    await store.getState().fetchBranch('wt-1', '/repo', undefined, pushTarget)
+
+    expect(gitFetchMock).toHaveBeenCalledWith({
+      worktreePath: '/repo',
+      connectionId: undefined,
+      pushTarget
+    })
+    expect(gitUpstreamStatusMock).toHaveBeenCalledWith({
+      worktreePath: '/repo',
+      connectionId: undefined,
+      pushTarget
     })
     expect(toastErrorMock).not.toHaveBeenCalled()
   })
@@ -1973,6 +2106,7 @@ describe('createEditorSlice activateMarkdownLink', () => {
   })
 
   afterEach(() => {
+    vi.unstubAllGlobals()
     vi.useRealTimers()
   })
 
@@ -2163,6 +2297,52 @@ describe('createEditorSlice activateMarkdownLink', () => {
       filePath: '/repo/docs/guide.md',
       fileId: '/repo/docs/guide.md',
       line: 10,
+      column: 1,
+      matchLength: 0
+    })
+  })
+
+  it('cancels superseded line-anchor reveal frames', async () => {
+    const store = createEditorStore()
+    pathExistsMock.mockResolvedValue(true)
+    let nextFrameId = 1
+    const pendingFrames = new Map<number, FrameRequestCallback>()
+    const canceledFrameIds = new Set<number>()
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      const frameId = nextFrameId++
+      pendingFrames.set(frameId, callback)
+      return frameId
+    })
+    vi.stubGlobal('cancelAnimationFrame', (frameId: number) => {
+      canceledFrameIds.add(frameId)
+      pendingFrames.delete(frameId)
+    })
+
+    await store.getState().activateMarkdownLink('./first.md#L3', {
+      sourceFilePath: '/repo/docs/note.md',
+      worktreeId: 'wt-1',
+      worktreeRoot: '/repo'
+    })
+    await store.getState().activateMarkdownLink('./second.md#L9', {
+      sourceFilePath: '/repo/docs/note.md',
+      worktreeId: 'wt-1',
+      worktreeRoot: '/repo'
+    })
+
+    expect(canceledFrameIds).toContain(1)
+    while (pendingFrames.size > 0) {
+      const nextPendingFrame = pendingFrames.entries().next()
+      if (nextPendingFrame.done) {
+        break
+      }
+      const [frameId, callback] = nextPendingFrame.value
+      pendingFrames.delete(frameId)
+      callback(0)
+    }
+    expect(store.getState().pendingEditorReveal).toEqual({
+      filePath: '/repo/docs/second.md',
+      fileId: '/repo/docs/second.md',
+      line: 9,
       column: 1,
       matchLength: 0
     })

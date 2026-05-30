@@ -2,13 +2,15 @@ import { useAppStore } from '@/store'
 import { pasteDraftWhenAgentReady } from '@/lib/agent-paste-draft'
 import {
   inspectRuntimeTerminalProcess,
-  sendRuntimePtyInput
+  sendRuntimePtyInputVerified
 } from '@/runtime/runtime-terminal-inspection'
 import type { AgentStartupPlan } from '@/lib/tui-agent-startup'
 import { isShellProcess } from '@/lib/tui-agent-startup'
 import type { OrcaHooks, TaskViewPresetId } from '../../../shared/types'
 import { resolveHookCommandSourcePolicy } from '../../../shared/hook-command-source-policy'
 import { isExpectedAgentProcess } from '../../../shared/agent-process-recognition'
+import { slugifyForWorkspaceName } from '../../../shared/workspace-name'
+export { getLinkedWorkItemSuggestedName } from '../../../shared/workspace-name'
 
 /**
  * Why: the TaskPage's preset buttons and the openTaskPage prefetcher both need
@@ -37,7 +39,6 @@ export function getTaskPresetQuery(presetId: TaskViewPresetId | null): string {
 }
 
 export const IS_MAC = navigator.userAgent.includes('Mac')
-export const ADD_ATTACHMENT_SHORTCUT = IS_MAC ? '⌘U' : 'Ctrl+U'
 export const CLIENT_PLATFORM: NodeJS.Platform = navigator.userAgent.includes('Windows')
   ? 'win32'
   : IS_MAC
@@ -159,43 +160,6 @@ export function getSetupConfig(
   return null
 }
 
-// Why: branch names and on-disk worktree directories must be short, lowercase,
-// and ASCII-safe. Free-form text (prompts, GitHub titles) often contains
-// emoji, CJK, or hundreds of characters, which would otherwise make
-// sanitizeWorktreeName either produce a ludicrously long name or throw
-// "Invalid worktree name" when every character is stripped.
-function slugifyForWorkspaceName(input: string): string {
-  return (
-    input
-      .trim()
-      .toLowerCase()
-      .replace(/[\\/]+/g, '-')
-      .replace(/\s+/g, '-')
-      .replace(/[^a-z0-9._-]+/g, '-')
-      .replace(/-+/g, '-')
-      // Why: git check-ref-format rejects any ref containing `..`, so a prompt
-      // like "../../foo" must not turn into a branch seed with internal `..`
-      // sequences (the main-process sanitizer collapses these too, but we
-      // mirror the rule here so the renderer preview matches the real name).
-      .replace(/\.{2,}/g, '.')
-      .replace(/^[.-]+|[.-]+$/g, '')
-      .slice(0, 48)
-      .replace(/[-._]+$/g, '')
-  )
-}
-
-export function getLinkedWorkItemSuggestedName(item: { title: string }): string {
-  const withoutLeadingNumber = item.title
-    .trim()
-    .replace(/^(?:issue|pr|pull request)\s*#?\d+\s*[:-]\s*/i, '')
-    .replace(/^#\d+\s*[:-]\s*/, '')
-    .replace(/\(#\d+\)/gi, '')
-    .replace(/\b#\d+\b/g, '')
-    .trim()
-  const seed = withoutLeadingNumber || item.title.trim()
-  return slugifyForWorkspaceName(seed)
-}
-
 export function getWorkspaceSeedName(args: {
   explicitName: string
   prompt: string
@@ -280,7 +244,7 @@ export async function ensureAgentStartupInTerminal(args: {
   // session and submitted. Wait until the agent owns the PTY before writing.
   if (startup.followupPrompt) {
     await waitForAgentForeground(ptyId, startup.expectedProcess)
-    sendRuntimePtyInput(useAppStore.getState().settings, ptyId, `${startup.followupPrompt}\r`)
+    await sendFollowupPrompt(ptyId, startup.followupPrompt)
   }
 
   // Why: draftPrompt uses bracketed-paste so the URL lands atomically in the
@@ -292,6 +256,14 @@ export async function ensureAgentStartupInTerminal(args: {
       content: draftPrompt,
       agent: startup.agent
     })
+  }
+}
+
+async function sendFollowupPrompt(ptyId: string, prompt: string): Promise<boolean> {
+  try {
+    return await sendRuntimePtyInputVerified(useAppStore.getState().settings, ptyId, `${prompt}\r`)
+  } catch {
+    return false
   }
 }
 

@@ -3,6 +3,9 @@
 // or the script body that lands on the remote box. Local install behavior
 // is exercised through `installer-utils.test.ts` and the per-CLI status
 // audit; this file covers ONLY the SFTP-backed path added in commit #8.
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
 import { vi, describe, expect, it } from 'vitest'
 
 vi.mock('electron', () => ({
@@ -13,6 +16,7 @@ vi.mock('electron', () => ({
 
 import type { SFTPWrapper } from 'ssh2'
 import { ClaudeHookService } from './hook-service'
+import { OPENCLAUDE_HOOK_SETTINGS } from './hook-settings'
 
 type FakeFs = {
   files: Map<string, string>
@@ -98,8 +102,77 @@ function createFakeSftp(): { sftp: SFTPWrapper; fs: FakeFs } {
   return { sftp, fs }
 }
 
+describe('ClaudeHookService.install', () => {
+  it('installs managed hooks into Claude settings and preserves user Bedrock settings', () => {
+    const tmpHome = mkdtempSync(join(tmpdir(), 'orca-claude-hooks-'))
+    vi.stubEnv('HOME', tmpHome)
+    try {
+      const legacyPath = join(tmpHome, '.claude', 'settings.json')
+      mkdirSync(join(tmpHome, '.claude'), { recursive: true })
+      writeFileSync(
+        legacyPath,
+        JSON.stringify({
+          apiKeyHelper: '/opt/company/claude-key-helper',
+          awsAuthRefresh: '/opt/company/aws-refresh',
+          awsCredentialExport: '/opt/company/aws-export',
+          env: {
+            CLAUDE_CODE_USE_BEDROCK: '1',
+            AWS_REGION: 'us-west-2'
+          },
+          hooks: {
+            Stop: [
+              {
+                hooks: [{ type: 'command', command: '/usr/local/bin/user-hook' }]
+              },
+              {
+                hooks: [
+                  {
+                    type: 'command',
+                    command: '/Users/old/.orca/agent-hooks/claude-hook.sh'
+                  }
+                ]
+              }
+            ]
+          }
+        })
+      )
+
+      const status = new ClaudeHookService().install()
+      expect(status.state).toBe('installed')
+
+      const legacy = JSON.parse(readFileSync(legacyPath, 'utf-8'))
+      expect(legacy).toMatchObject({
+        apiKeyHelper: '/opt/company/claude-key-helper',
+        awsAuthRefresh: '/opt/company/aws-refresh',
+        awsCredentialExport: '/opt/company/aws-export',
+        env: {
+          CLAUDE_CODE_USE_BEDROCK: '1',
+          AWS_REGION: 'us-west-2'
+        }
+      })
+      const legacyCommands = legacy.hooks.Stop.flatMap(
+        (definition: { hooks: { command: string }[] }) =>
+          definition.hooks.map((hook) => hook.command)
+      )
+      expect(legacyCommands).toContain('/usr/local/bin/user-hook')
+      expect(legacyCommands.some((command: string) => command.includes('claude-hook.sh'))).toBe(
+        true
+      )
+      expect(
+        legacyCommands.some((command: string) =>
+          command.includes('/Users/old/.orca/agent-hooks/claude-hook.sh')
+        )
+      ).toBe(false)
+      expect(legacy.hooks.StopFailure[0].hooks[0].command).toContain('claude-hook.sh')
+    } finally {
+      vi.unstubAllEnvs()
+      rmSync(tmpHome, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('ClaudeHookService.installRemote', () => {
-  it('writes settings.json + managed script under the remote $HOME', async () => {
+  it('writes Claude settings + managed script under the remote $HOME', async () => {
     const svc = new ClaudeHookService()
     const { sftp, fs } = createFakeSftp()
     const status = await svc.installRemote(sftp, '/home/dev')
@@ -116,6 +189,7 @@ describe('ClaudeHookService.installRemote', () => {
     for (const event of [
       'UserPromptSubmit',
       'Stop',
+      'StopFailure',
       'PreToolUse',
       'PostToolUse',
       'PostToolUseFailure',
@@ -131,16 +205,17 @@ describe('ClaudeHookService.installRemote', () => {
     expect(fs.modes.get('/home/dev/.orca/agent-hooks/claude-hook.sh')).toBe(0o755)
   })
 
-  it('reports parse error when remote settings.json is malformed', async () => {
+  it('reports parse error when remote settings.json cannot be parsed', async () => {
     const svc = new ClaudeHookService()
     const { sftp, fs } = createFakeSftp()
     fs.files.set('/home/dev/.claude/settings.json', 'not json')
     const status = await svc.installRemote(sftp, '/home/dev')
     expect(status.state).toBe('error')
-    expect(status.detail).toContain('Could not parse')
+    expect(status.managedHooksPresent).toBe(false)
+    expect(status.detail).toContain('Could not parse remote Claude settings.json')
   })
 
-  it('preserves user-authored hook entries on a fresh install', async () => {
+  it('preserves user-authored hook entries while sweeping old managed entries', async () => {
     const svc = new ClaudeHookService()
     const { sftp, fs } = createFakeSftp()
     fs.files.set(
@@ -150,6 +225,15 @@ describe('ClaudeHookService.installRemote', () => {
           Stop: [
             {
               hooks: [{ type: 'command', command: '/usr/local/bin/my-user-hook' }]
+            },
+            {
+              hooks: [
+                {
+                  type: 'command',
+                  command:
+                    'if [ -x /home/dev/.orca/agent-hooks/claude-hook.sh ]; then /bin/sh /home/dev/.orca/agent-hooks/claude-hook.sh; fi'
+                }
+              ]
             }
           ]
         }
@@ -157,10 +241,66 @@ describe('ClaudeHookService.installRemote', () => {
     )
     await svc.installRemote(sftp, '/home/dev')
     const parsed = JSON.parse(fs.files.get('/home/dev/.claude/settings.json')!)
-    // Original user-authored entry survives alongside the new managed entry.
+    // Original user-authored entry survives, while stale Orca entries are
+    // replaced with the current managed hook command.
     const stopDefs = parsed.hooks.Stop as { hooks: { command: string }[] }[]
     const userCmds = stopDefs.flatMap((d) => d.hooks.map((h) => h.command))
     expect(userCmds).toContain('/usr/local/bin/my-user-hook')
-    expect(userCmds.some((c) => c.includes('claude-hook.sh'))).toBe(true)
+    expect(userCmds.filter((c) => c.includes('claude-hook.sh'))).toHaveLength(1)
+  })
+})
+
+describe('OpenClaudeHookService-compatible install', () => {
+  const makeOpenClaudeService = (): ClaudeHookService =>
+    new ClaudeHookService({
+      agent: 'openclaude',
+      displayName: 'OpenClaude',
+      settings: OPENCLAUDE_HOOK_SETTINGS
+    })
+
+  it('installs managed hooks into OpenClaude settings without touching Claude settings', () => {
+    const tmpHome = mkdtempSync(join(tmpdir(), 'orca-openclaude-hooks-'))
+    vi.stubEnv('HOME', tmpHome)
+    try {
+      const openClaudeSettings = join(tmpHome, '.openclaude', 'settings.json')
+      mkdirSync(join(tmpHome, '.openclaude'), { recursive: true })
+      writeFileSync(openClaudeSettings, JSON.stringify({ hooks: {} }))
+
+      const status = makeOpenClaudeService().install()
+
+      expect(status).toMatchObject({
+        agent: 'openclaude',
+        state: 'installed',
+        configPath: openClaudeSettings
+      })
+      const parsed = JSON.parse(readFileSync(openClaudeSettings, 'utf-8'))
+      for (const event of ['UserPromptSubmit', 'Stop', 'StopFailure']) {
+        const command = parsed.hooks[event][0].hooks[0].command as string
+        expect(command).toContain('openclaude-hook.sh')
+      }
+      expect(
+        readFileSync(join(tmpHome, '.orca', 'agent-hooks', 'openclaude-hook.sh'), 'utf-8')
+      ).toContain('/hook/claude')
+      expect(existsSync(join(tmpHome, '.claude', 'settings.json'))).toBe(false)
+    } finally {
+      vi.unstubAllEnvs()
+      rmSync(tmpHome, { recursive: true, force: true })
+    }
+  })
+
+  it('writes remote OpenClaude settings under .openclaude', async () => {
+    const { sftp, fs } = createFakeSftp()
+
+    const status = await makeOpenClaudeService().installRemote(sftp, '/home/dev')
+
+    expect(status).toMatchObject({
+      agent: 'openclaude',
+      state: 'installed',
+      configPath: '/home/dev/.openclaude/settings.json'
+    })
+    const parsed = JSON.parse(fs.files.get('/home/dev/.openclaude/settings.json')!)
+    const command = parsed.hooks.StopFailure[0].hooks[0].command as string
+    expect(command).toContain('/home/dev/.orca/agent-hooks/openclaude-hook.sh')
+    expect(fs.files.get('/home/dev/.orca/agent-hooks/openclaude-hook.sh')).toContain('/hook/claude')
   })
 })

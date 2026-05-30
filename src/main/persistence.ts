@@ -33,10 +33,12 @@ import {
 import type {
   PersistedState,
   Repo,
+  ProjectGroup,
   SparsePreset,
   WorktreeMeta,
   WorktreeLineage,
   GlobalSettings,
+  OrcaWorkspaceLayout,
   NotificationSettings,
   OnboardingChecklistState,
   OnboardingOutcome,
@@ -59,6 +61,7 @@ import {
   getDefaultUIState,
   getDefaultRepoHookSettings,
   getDefaultWorkspaceSession,
+  normalizeAgentActivityDisplayMode,
   normalizeWorktreeCardProperties,
   ONBOARDING_FINAL_STEP
 } from '../shared/constants'
@@ -78,9 +81,16 @@ import { agentHookServer } from './agent-hooks/server'
 import { pruneLocalTerminalScrollbackBuffers } from '../shared/workspace-session-terminal-buffers'
 import { pruneWorkspaceSessionBrowserHistory } from '../shared/workspace-session-browser-history'
 import { getRepoIdFromWorktreeId, getWorktreePathBasenameFromId } from '../shared/worktree-id'
+import { normalizeRuntimePathForComparison } from '../shared/cross-platform-path'
 import { normalizeTerminalQuickCommands } from '../shared/terminal-quick-commands'
 import { normalizeTaskProviderSettings } from '../shared/task-providers'
 import { normalizeOpenInApplications } from '../shared/open-in-applications'
+import { normalizeTerminalShortcutPolicy } from '../shared/keybindings'
+import {
+  normalizeFeatureInteractions,
+  type FeatureInteractionId
+} from '../shared/feature-interactions'
+import { normalizeFeatureTipIds } from '../shared/feature-tips'
 import {
   DEFAULT_WORKSPACE_STATUS_ID,
   clampWorkspaceBoardColumnWidth,
@@ -89,6 +99,25 @@ import {
   normalizePersistedWorkspaceStatuses,
   normalizeWorkspaceStatuses
 } from '../shared/workspace-statuses'
+import { isLegacyRepoForExternalWorktreeVisibility } from '../shared/worktree-ownership'
+import { sanitizeRepoIcon } from '../shared/repo-icon'
+import { normalizeRepoBadgeColor } from '../shared/repo-badge-color'
+import {
+  clearMissingProjectGroupMemberships,
+  createProjectGroup,
+  getNextProjectGroupOrder,
+  getProjectGroupSubtreeIds,
+  normalizeProjectGroupName,
+  normalizeProjectGroups
+} from '../shared/project-groups'
+import {
+  mergeLegacyCommitMessageAiIntoSourceControlAi,
+  normalizeRepoSourceControlAiOverrides,
+  normalizeSourceControlAiSettings,
+  projectSourceControlAiToLegacyCommitMessageAi,
+  sourceControlAiSettingsFromLegacy
+} from '../shared/source-control-ai'
+import { normalizeDisabledTuiAgents } from '../shared/tui-agent-selection'
 
 function encrypt(plaintext: string): string {
   if (!plaintext || !safeStorage.isEncryptionAvailable()) {
@@ -164,6 +193,40 @@ function backupPath(dataFile: string, index: number): string {
   return `${dataFile}.bak.${index}`
 }
 
+function buildWorkspaceDirHistoryForUpdate(
+  current: GlobalSettings,
+  updates: Partial<GlobalSettings>
+): OrcaWorkspaceLayout[] | null {
+  if (!('workspaceDir' in updates) && !('nestWorkspaces' in updates)) {
+    return null
+  }
+  const nextPath = updates.workspaceDir ?? current.workspaceDir
+  const nextNestWorkspaces = updates.nestWorkspaces ?? current.nestWorkspaces
+  if (
+    normalizeRuntimePathForComparison(nextPath) ===
+      normalizeRuntimePathForComparison(current.workspaceDir) &&
+    nextNestWorkspaces === current.nestWorkspaces
+  ) {
+    return null
+  }
+
+  const previousLayout = {
+    path: current.workspaceDir,
+    nestWorkspaces: current.nestWorkspaces
+  }
+  const existing = current.workspaceDirHistory ?? []
+  const next = [...existing]
+  const previousKey = getWorkspaceLayoutHistoryKey(previousLayout)
+  if (!next.some((layout) => getWorkspaceLayoutHistoryKey(layout) === previousKey)) {
+    next.push(previousLayout)
+  }
+  return next
+}
+
+function getWorkspaceLayoutHistoryKey(layout: OrcaWorkspaceLayout): string {
+  return `${normalizeRuntimePathForComparison(layout.path)}:${layout.nestWorkspaces}`
+}
+
 function normalizeGroupBy(groupBy: unknown): PersistedState['ui']['groupBy'] {
   if (
     groupBy === 'none' ||
@@ -179,6 +242,31 @@ function normalizeGroupBy(groupBy: unknown): PersistedState['ui']['groupBy'] {
   return getDefaultUIState().groupBy
 }
 
+function mergeFeatureInteractions(
+  current: PersistedState['ui']['featureInteractions'],
+  incoming: PersistedState['ui']['featureInteractions']
+): PersistedState['ui']['featureInteractions'] {
+  const currentNormalized = normalizeFeatureInteractions(current)
+  const incomingNormalized = normalizeFeatureInteractions(incoming)
+  const merged = { ...currentNormalized }
+  for (const [id, incomingRecord] of Object.entries(incomingNormalized)) {
+    const currentRecord = currentNormalized[id as keyof typeof currentNormalized]
+    merged[id as keyof typeof merged] = currentRecord
+      ? {
+          firstInteractedAt: Math.min(
+            currentRecord.firstInteractedAt,
+            incomingRecord.firstInteractedAt
+          ),
+          interactionCount: Math.max(
+            currentRecord.interactionCount,
+            incomingRecord.interactionCount
+          )
+        }
+      : incomingRecord
+  }
+  return merged
+}
+
 function normalizeSortBy(sortBy: unknown): PersistedState['ui']['sortBy'] {
   if (
     sortBy === 'smart' ||
@@ -192,10 +280,44 @@ function normalizeSortBy(sortBy: unknown): PersistedState['ui']['sortBy'] {
   return getDefaultUIState().sortBy
 }
 
+function normalizeRightSidebarTab(tab: unknown): PersistedState['ui']['rightSidebarTab'] {
+  if (
+    tab === 'explorer' ||
+    tab === 'search' ||
+    tab === 'source-control' ||
+    tab === 'checks' ||
+    tab === 'ports'
+  ) {
+    return tab
+  }
+  return getDefaultUIState().rightSidebarTab
+}
+
 function normalizeNotificationSettings(value: unknown): NotificationSettings {
   const defaults = getDefaultNotificationSettings()
   const candidate =
     value && typeof value === 'object' ? (value as Partial<NotificationSettings>) : {}
+  const rawSoundId = (candidate as { customSoundId?: unknown }).customSoundId
+  const customSoundId =
+    rawSoundId === 'system' ||
+    rawSoundId === 'two-tone' ||
+    rawSoundId === 'bong' ||
+    rawSoundId === 'thump' ||
+    rawSoundId === 'blip' ||
+    rawSoundId === 'sonar' ||
+    rawSoundId === 'blop' ||
+    rawSoundId === 'ding' ||
+    rawSoundId === 'clack' ||
+    rawSoundId === 'beep' ||
+    rawSoundId === 'custom'
+      ? rawSoundId
+      : rawSoundId === 'orca' || rawSoundId === 'chime'
+        ? 'two-tone'
+        : rawSoundId === 'pop'
+          ? 'blop'
+          : typeof candidate.customSoundPath === 'string'
+            ? 'custom'
+            : defaults.customSoundId
   const rawVolume = candidate.customSoundVolume
   const customSoundVolume =
     typeof rawVolume === 'number' && Number.isFinite(rawVolume)
@@ -204,6 +326,7 @@ function normalizeNotificationSettings(value: unknown): NotificationSettings {
   return {
     ...defaults,
     ...candidate,
+    customSoundId,
     customSoundVolume
   }
 }
@@ -353,6 +476,29 @@ function readDeprecatedExperimentFlag(parsed: PersistedState | undefined): boole
 
 function readLegacySidekickFlag(parsed: PersistedState | undefined): boolean | undefined {
   return (parsed?.settings as { experimentalSidekick?: boolean } | undefined)?.experimentalSidekick
+}
+
+function sanitizeRepoUpdatesForPersistence<
+  T extends Partial<Pick<Repo, 'badgeColor' | 'repoIcon'>>
+>(updates: T): T {
+  const sanitized = { ...updates }
+  if ('badgeColor' in sanitized) {
+    const badgeColor = normalizeRepoBadgeColor(sanitized.badgeColor)
+    if (!badgeColor) {
+      delete sanitized.badgeColor
+    } else {
+      sanitized.badgeColor = badgeColor
+    }
+  }
+  if ('repoIcon' in sanitized) {
+    const repoIcon = sanitizeRepoIcon(sanitized.repoIcon)
+    if (repoIcon === undefined) {
+      delete sanitized.repoIcon
+    } else {
+      sanitized.repoIcon = repoIcon
+    }
+  }
+  return sanitized
 }
 
 function expandFloatingWorkspaceHomePath(input: string, home: string): string {
@@ -868,8 +1014,14 @@ function normalizeWorkspaceSessionPaneIdentities(
       normalizedLayout: normalized.snapshot,
       leafIdByInputLeafId: normalized.leafIdByInputLeafId
     })
-    migrationUnsupportedEntries.push(...migrationEntries.migrationUnsupportedEntries)
-    legacyPaneKeyAliasEntries.push(...migrationEntries.legacyPaneKeyAliasEntries)
+    // Why: old persisted split layouts can generate enough alias rows to
+    // exceed V8's argument limit if the arrays are spread into push().
+    for (const entry of migrationEntries.migrationUnsupportedEntries) {
+      migrationUnsupportedEntries.push(entry)
+    }
+    for (const entry of migrationEntries.legacyPaneKeyAliasEntries) {
+      legacyPaneKeyAliasEntries.push(entry)
+    }
     const leafIdByPtyId = new Map<string, string>()
     const duplicatePtyIds = new Set<string>()
     for (const [leafId, ptyId] of Object.entries(normalized.snapshot.ptyIdsByLeafId ?? {})) {
@@ -1162,6 +1314,13 @@ export class Store {
   private writeGeneration = 0
   private gitUsernameCache = new Map<string, string>()
   private loadNeedsSave = false
+  private settingsChangeListeners = new Set<
+    (
+      updates: Partial<GlobalSettings>,
+      settings: GlobalSettings,
+      originWebContentsId?: number
+    ) => void
+  >()
 
   constructor() {
     const loaded = this.load()
@@ -1312,6 +1471,19 @@ export class Store {
         // Merge with defaults in case new fields were added
         const homeDir = homedir()
         const defaults = getDefaultPersistedState(homeDir)
+        const rawSourceControlAiMissing = parsed.settings?.sourceControlAi === undefined
+        if (rawSourceControlAiMissing) {
+          this.loadNeedsSave = true
+        }
+        const legacyCommitMessageAi = parsed.settings?.commitMessageAi
+        const migratedSourceControlAi = rawSourceControlAiMissing
+          ? sourceControlAiSettingsFromLegacy(
+              legacyCommitMessageAi ?? defaults.settings.commitMessageAi
+            )
+          : mergeLegacyCommitMessageAiIntoSourceControlAi(
+              parsed.settings?.sourceControlAi,
+              legacyCommitMessageAi
+            )
         // Why: before the layout-aware 'auto' mode shipped (issue #903),
         // terminalMacOptionAsAlt defaulted to 'true' globally. That silently
         // broke Option-layer characters (@ on Turkish via Option+Q, @ on
@@ -1416,6 +1588,7 @@ export class Store {
         result = {
           ...defaults,
           ...parsed,
+          projectGroups: normalizeProjectGroups(parsed.projectGroups),
           worktreeLineageById: parsed.worktreeLineageById ?? {},
           settings: {
             ...defaults.settings,
@@ -1450,8 +1623,20 @@ export class Store {
             ),
             defaultTaskSource: taskProviderSettings.defaultTaskSource,
             visibleTaskProviders: taskProviderSettings.visibleTaskProviders,
+            terminalShortcutPolicy: normalizeTerminalShortcutPolicy(
+              parsed.settings?.terminalShortcutPolicy
+            ),
+            disabledTuiAgents: normalizeDisabledTuiAgents(parsed.settings?.disabledTuiAgents),
             openInApplications: normalizeOpenInApplications(parsed.settings?.openInApplications),
             notifications: normalizeNotificationSettings(parsed.settings?.notifications),
+            sourceControlAi: migratedSourceControlAi,
+            // Why: new builds read sourceControlAi, but rollback builds still
+            // write commitMessageAi; after merging those writes, refresh the
+            // legacy projection for continued rollback compatibility.
+            commitMessageAi: projectSourceControlAiToLegacyCommitMessageAi(
+              migratedSourceControlAi,
+              parsed.settings?.commitMessageAi ?? defaults.settings.commitMessageAi
+            ),
             voice: {
               ...getDefaultVoiceSettings(),
               ...parsed.settings?.voice
@@ -1467,6 +1652,15 @@ export class Store {
             const rawSort = parsed.ui?.sortBy
             const sort = normalizeSortBy(rawSort)
             const migrate = !parsed.ui?._sortBySmartMigrated && rawSort === 'recent'
+            const rightSidebarOpen =
+              typeof parsed.ui?.rightSidebarOpen === 'boolean'
+                ? parsed.ui.rightSidebarOpen
+                : typeof parsed.settings?.rightSidebarOpenByDefault === 'boolean'
+                  ? parsed.settings.rightSidebarOpenByDefault
+                  : defaults.ui.rightSidebarOpen
+            if (typeof parsed.ui?.rightSidebarOpen !== 'boolean') {
+              this.loadNeedsSave = true
+            }
             const workspaceStatusesDefaultOrderMigrated =
               parsed.ui?._workspaceStatusesDefaultOrderMigrated === true
             // Why: the default workflow changed to Done -> Review -> Progress -> Todo.
@@ -1522,6 +1716,8 @@ export class Store {
             // depend on the deprecated value continuing to round-trip.
             const rawCardProps = parsed.ui?.worktreeCardProperties
             const inlineAgentsMigrated = parsed.ui?._inlineAgentsDefaultedForAllUsers === true
+            const expandedCardPropsMigrated =
+              parsed.ui?._expandedWorktreeCardPropertiesDefaulted === true
             const hadExperimentOn = readDeprecatedExperimentFlag(parsed)
             const deliberateUncheck =
               hadExperimentOn &&
@@ -1539,21 +1735,42 @@ export class Store {
               const candidate = needsInlineAgentsMigration
                 ? [...rawCardProps, 'inline-agents' as const]
                 : rawCardProps
-              // Why: only Agent activity remains configurable; older hidden
-              // card fields must be restored because users can no longer
-              // toggle them back on from the sidebar menu.
-              const normalized = normalizeWorktreeCardProperties(candidate)
+              const expandedCandidate = (() => {
+                if (expandedCardPropsMigrated) {
+                  return candidate
+                }
+                const next = [...candidate]
+                // Why: Linear used to be controlled by the generic issue
+                // property and Ports were always visible. Add the split-out
+                // properties once so existing cards keep their prior surface.
+                if (candidate.includes('issue') && !candidate.includes('linear-issue')) {
+                  next.push('linear-issue' as const)
+                }
+                if (!candidate.includes('ports')) {
+                  next.push('ports' as const)
+                }
+                return next
+              })()
+              const normalized = normalizeWorktreeCardProperties(expandedCandidate)
               const changed =
                 normalized.length !== rawCardProps.length ||
                 normalized.some((property, index) => property !== rawCardProps[index])
               return changed ? normalized : undefined
             })()
-            if (migratedCardProps !== undefined || !inlineAgentsMigrated) {
+            if (
+              migratedCardProps !== undefined ||
+              !inlineAgentsMigrated ||
+              !expandedCardPropsMigrated
+            ) {
               this.loadNeedsSave = true
             }
             return {
               ...defaults.ui,
               ...parsed.ui,
+              // Why: migrate once from the retired Appearance setting only
+              // when no explicit persisted chrome preference exists yet.
+              rightSidebarOpen,
+              rightSidebarTab: normalizeRightSidebarTab(parsed.ui?.rightSidebarTab),
               sortBy: migrate ? ('smart' as const) : sort,
               workspaceStatuses,
               _workspaceStatusesDefaultOrderMigrated: true,
@@ -1567,7 +1784,8 @@ export class Store {
               // a rollback to a pre-default-on build that still reads it.
               // The new flag is the one that actually gates the migration.
               _inlineAgentsDefaultedForExperiment: true,
-              _inlineAgentsDefaultedForAllUsers: true
+              _inlineAgentsDefaultedForAllUsers: true,
+              _expandedWorktreeCardPropertiesDefaulted: true
             }
           })(),
           // Why: the workspace session is the most volatile persisted surface
@@ -1666,6 +1884,7 @@ export class Store {
 
     result = {
       ...result,
+      repos: clearMissingProjectGroupMemberships(result.repos, result.projectGroups ?? []),
       workspaceSession: pruneWorkspaceSessionBrowserHistory(
         pruneLocalTerminalScrollbackBuffers(result.workspaceSession, result.repos)
       )
@@ -1896,6 +2115,95 @@ export class Store {
     return repo ? this.hydrateRepo(repo) : undefined
   }
 
+  getProjectGroups(): ProjectGroup[] {
+    return [...(this.state.projectGroups ?? [])].sort(
+      (left, right) => left.tabOrder - right.tabOrder || left.name.localeCompare(right.name)
+    )
+  }
+
+  createProjectGroup(input: {
+    name: string
+    parentPath?: string | null
+    parentGroupId?: string | null
+    createdFrom: ProjectGroup['createdFrom']
+  }): ProjectGroup {
+    const maxOrder = Math.max(
+      -1,
+      ...(this.state.projectGroups ?? []).map((group) => group.tabOrder)
+    )
+    const group = createProjectGroup({
+      ...input,
+      tabOrder: maxOrder + 1
+    })
+    this.state.projectGroups = [...(this.state.projectGroups ?? []), group]
+    this.scheduleSave()
+    return group
+  }
+
+  updateProjectGroup(
+    groupId: string,
+    updates: Partial<Pick<ProjectGroup, 'name' | 'isCollapsed' | 'tabOrder' | 'color'>>
+  ): ProjectGroup | null {
+    const group = (this.state.projectGroups ?? []).find((entry) => entry.id === groupId)
+    if (!group) {
+      return null
+    }
+    if (updates.name !== undefined) {
+      group.name = normalizeProjectGroupName(updates.name, group.name)
+    }
+    if (updates.isCollapsed !== undefined) {
+      group.isCollapsed = updates.isCollapsed
+    }
+    if (updates.tabOrder !== undefined && Number.isFinite(updates.tabOrder)) {
+      group.tabOrder = updates.tabOrder
+    }
+    if (updates.color !== undefined) {
+      group.color = typeof updates.color === 'string' ? updates.color : null
+    }
+    group.updatedAt = Date.now()
+    this.scheduleSave()
+    return group
+  }
+
+  deleteProjectGroup(groupId: string): boolean {
+    const before = this.state.projectGroups?.length ?? 0
+    const deletedGroupIds = getProjectGroupSubtreeIds(this.state.projectGroups ?? [], groupId)
+    this.state.projectGroups = (this.state.projectGroups ?? []).filter(
+      (group) => !deletedGroupIds.has(group.id)
+    )
+    if ((this.state.projectGroups?.length ?? 0) === before) {
+      return false
+    }
+    // Why: groups are sidebar organization only. Deleting one must not delete
+    // repos or worktrees, so contained repos from the full subtree are ungrouped.
+    this.state.repos = this.state.repos.map((repo) =>
+      repo.projectGroupId && deletedGroupIds.has(repo.projectGroupId)
+        ? { ...repo, projectGroupId: null }
+        : repo
+    )
+    this.scheduleSave()
+    return true
+  }
+
+  moveProjectToGroup(repoId: string, groupId: string | null, order?: number): Repo | null {
+    const repo = this.state.repos.find((entry) => entry.id === repoId)
+    if (!repo) {
+      return null
+    }
+    const normalizedGroupId =
+      groupId && (this.state.projectGroups ?? []).some((group) => group.id === groupId)
+        ? groupId
+        : null
+    const siblingRepos = this.state.repos.filter((entry) => entry.id !== repoId)
+    repo.projectGroupId = normalizedGroupId
+    repo.projectGroupOrder =
+      typeof order === 'number' && Number.isFinite(order)
+        ? order
+        : getNextProjectGroupOrder(siblingRepos, normalizedGroupId)
+    this.scheduleSave()
+    return this.hydrateRepo(repo)
+  }
+
   addRepo(repo: Repo): void {
     this.state.repos.push(repo)
     this.scheduleSave()
@@ -1933,7 +2241,7 @@ export class Store {
     return true
   }
 
-  removeRepo(id: string): void {
+  removeProject(id: string): void {
     this.state.repos = this.state.repos.filter((r) => r.id !== id)
     // Why: presets are repo-scoped, so removing the repo means the presets
     // can never be referenced again — drop them with the parent.
@@ -1960,10 +2268,17 @@ export class Store {
         Repo,
         | 'displayName'
         | 'badgeColor'
+        | 'repoIcon'
         | 'hookSettings'
         | 'worktreeBaseRef'
         | 'kind'
+        | 'symlinkPaths'
         | 'issueSourcePreference'
+        | 'externalWorktreeVisibility'
+        | 'externalWorktreeVisibilityPromptDismissedAt'
+        | 'projectGroupId'
+        | 'projectGroupOrder'
+        | 'sourceControlAi'
       >
     >
   ): Repo | null {
@@ -1971,23 +2286,67 @@ export class Store {
     if (!repo) {
       return null
     }
-    // Why: `issueSourcePreference === undefined` in the patch means "reset to
-    // auto" (and the persisted record should drop the key, not preserve a
-    // stale explicit value via Object.assign's skip-on-undefined behavior).
-    // Without this delete branch, toggling explicit → auto would silently
-    // leave the old preference in place on disk.
-    if ('issueSourcePreference' in updates && updates.issueSourcePreference === undefined) {
-      delete repo.issueSourcePreference
-      const { issueSourcePreference: _drop, ...rest } = updates
-      Object.assign(repo, rest)
-    } else {
-      Object.assign(repo, updates)
+    const sanitizedUpdates = sanitizeRepoUpdatesForPersistence(updates)
+    if ('projectGroupId' in sanitizedUpdates) {
+      const nextGroupId = sanitizedUpdates.projectGroupId
+      if (
+        typeof nextGroupId !== 'string' ||
+        nextGroupId.trim().length === 0 ||
+        !this.state.projectGroups.some((group) => group.id === nextGroupId)
+      ) {
+        sanitizedUpdates.projectGroupId = null
+      }
     }
+    if (
+      'projectGroupOrder' in sanitizedUpdates &&
+      (typeof sanitizedUpdates.projectGroupOrder !== 'number' ||
+        !Number.isFinite(sanitizedUpdates.projectGroupOrder))
+    ) {
+      delete sanitizedUpdates.projectGroupOrder
+    }
+    const externalWorktreeVisibilityLegacy =
+      'externalWorktreeVisibility' in sanitizedUpdates &&
+      repo.externalWorktreeVisibilityLegacy === undefined
+        ? isLegacyRepoForExternalWorktreeVisibility(repo)
+        : undefined
+    // Why: selected repo fields use `undefined` as an explicit clear signal,
+    // so delete them before assigning the rest of the patch.
+    if (
+      'issueSourcePreference' in sanitizedUpdates &&
+      sanitizedUpdates.issueSourcePreference === undefined
+    ) {
+      delete repo.issueSourcePreference
+      delete sanitizedUpdates.issueSourcePreference
+    }
+    if (
+      'externalWorktreeVisibility' in sanitizedUpdates &&
+      repo.externalWorktreeVisibilityLegacy === undefined
+    ) {
+      // Why: old persisted repos have no explicit marker. Stamp it the first
+      // time visibility changes so later hide/show choices keep legacy safety.
+      repo.externalWorktreeVisibilityLegacy = externalWorktreeVisibilityLegacy
+    }
+    if ('sourceControlAi' in sanitizedUpdates && sanitizedUpdates.sourceControlAi === undefined) {
+      delete repo.sourceControlAi
+      delete sanitizedUpdates.sourceControlAi
+    } else if ('sourceControlAi' in sanitizedUpdates) {
+      const normalizedSourceControlAi = normalizeRepoSourceControlAiOverrides(
+        sanitizedUpdates.sourceControlAi
+      )
+      if (normalizedSourceControlAi === undefined) {
+        delete sanitizedUpdates.sourceControlAi
+      } else {
+        sanitizedUpdates.sourceControlAi = normalizedSourceControlAi
+      }
+    }
+    Object.assign(repo, sanitizedUpdates)
     this.scheduleSave()
     return this.hydrateRepo(repo)
   }
 
   private hydrateRepo(repo: Repo): Repo {
+    const { repoIcon: rawRepoIcon, ...repoWithoutIcon } = repo
+    const repoIcon = sanitizeRepoIcon(rawRepoIcon)
     const gitUsername = isFolderRepo(repo)
       ? ''
       : (this.gitUsernameCache.get(repo.path) ??
@@ -1998,7 +2357,8 @@ export class Store {
         })())
 
     return {
-      ...repo,
+      ...repoWithoutIcon,
+      ...(repoIcon !== undefined ? { repoIcon } : {}),
       kind: isFolderRepo(repo) ? 'folder' : 'git',
       gitUsername,
       hookSettings: {
@@ -2080,6 +2440,7 @@ export class Store {
       updatedAt: now
     }
     this.state.automations = [...(this.state.automations ?? []), automation]
+    this.recordFeatureInteraction('automation-created')
     this.flush()
     return automation
   }
@@ -2178,6 +2539,9 @@ export class Store {
       createdAt: now
     }
     this.state.automationRuns = [...(this.state.automationRuns ?? []), run]
+    if (trigger === 'manual') {
+      this.recordFeatureInteraction('automation-run')
+    }
     this.flush()
     return run
   }
@@ -2320,8 +2684,36 @@ export class Store {
     return this.state.settings
   }
 
-  updateSettings(updates: Partial<GlobalSettings>): GlobalSettings {
+  onSettingsChanged(
+    listener: (
+      updates: Partial<GlobalSettings>,
+      settings: GlobalSettings,
+      originWebContentsId?: number
+    ) => void
+  ): () => void {
+    this.settingsChangeListeners.add(listener)
+    return () => {
+      this.settingsChangeListeners.delete(listener)
+    }
+  }
+
+  private notifySettingsChanged(
+    updates: Partial<GlobalSettings>,
+    originWebContentsId?: number
+  ): void {
+    for (const listener of this.settingsChangeListeners) {
+      listener(updates, this.state.settings, originWebContentsId)
+    }
+  }
+
+  updateSettings(
+    updates: Partial<GlobalSettings>,
+    options: { notifyListeners?: boolean; originWebContentsId?: number } = {}
+  ): GlobalSettings {
     const sanitizedUpdates = { ...updates }
+    if ('disabledTuiAgents' in updates) {
+      sanitizedUpdates.disabledTuiAgents = normalizeDisabledTuiAgents(updates.disabledTuiAgents)
+    }
     if ('terminalQuickCommands' in updates) {
       sanitizedUpdates.terminalQuickCommands = normalizeTerminalQuickCommands(
         updates.terminalQuickCommands
@@ -2344,6 +2736,18 @@ export class Store {
     if ('openInApplications' in updates) {
       sanitizedUpdates.openInApplications = normalizeOpenInApplications(updates.openInApplications)
     }
+    if ('terminalShortcutPolicy' in updates) {
+      sanitizedUpdates.terminalShortcutPolicy = normalizeTerminalShortcutPolicy(
+        updates.terminalShortcutPolicy
+      )
+    }
+    const historyWithPreviousLayout = buildWorkspaceDirHistoryForUpdate(
+      this.state.settings,
+      sanitizedUpdates
+    )
+    if (historyWithPreviousLayout) {
+      sanitizedUpdates.workspaceDirHistory = historyWithPreviousLayout
+    }
     // Why: `telemetry` is deep-merged for the same reason `notifications` is —
     // partial updates from the Privacy pane / consent flow (e.g., flipping
     // only `optedIn`) must not clobber sibling fields like `installId` or
@@ -2354,6 +2758,23 @@ export class Store {
       sanitizedUpdates.telemetry !== undefined
         ? { ...this.state.settings.telemetry, ...sanitizedUpdates.telemetry }
         : this.state.settings.telemetry
+    if ('sourceControlAi' in sanitizedUpdates) {
+      const normalizedSourceControlAi = normalizeSourceControlAiSettings(
+        sanitizedUpdates.sourceControlAi,
+        this.state.settings.commitMessageAi
+      )
+      sanitizedUpdates.sourceControlAi = normalizedSourceControlAi
+      sanitizedUpdates.commitMessageAi = projectSourceControlAiToLegacyCommitMessageAi(
+        normalizedSourceControlAi,
+        this.state.settings.commitMessageAi
+      )
+    } else if ('commitMessageAi' in sanitizedUpdates) {
+      sanitizedUpdates.sourceControlAi = mergeLegacyCommitMessageAiIntoSourceControlAi(
+        this.state.settings.sourceControlAi,
+        sanitizedUpdates.commitMessageAi
+      )
+    }
+    const previousSettings = this.state.settings
     this.state.settings = {
       ...this.state.settings,
       ...sanitizedUpdates,
@@ -2364,6 +2785,15 @@ export class Store {
       ...(mergedTelemetry !== undefined ? { telemetry: mergedTelemetry } : {})
     }
     this.scheduleSave()
+    const changedUpdates = {} as Partial<GlobalSettings> & Record<string, unknown>
+    for (const key of Object.keys(sanitizedUpdates) as (keyof GlobalSettings)[]) {
+      if (!Object.is(previousSettings[key], this.state.settings[key])) {
+        changedUpdates[String(key)] = this.state.settings[key]
+      }
+    }
+    if (options.notifyListeners === true && Object.keys(changedUpdates).length > 0) {
+      this.notifySettingsChanged(changedUpdates, options.originWebContentsId)
+    }
     return this.state.settings
   }
 
@@ -2375,15 +2805,21 @@ export class Store {
       ...this.state.ui,
       groupBy: normalizeGroupBy(this.state.ui?.groupBy),
       sortBy: normalizeSortBy(this.state.ui?.sortBy),
+      rightSidebarTab: normalizeRightSidebarTab(this.state.ui?.rightSidebarTab),
       worktreeCardProperties: normalizeWorktreeCardProperties(
         this.state.ui?.worktreeCardProperties
+      ),
+      agentActivityDisplayMode: normalizeAgentActivityDisplayMode(
+        this.state.ui?.agentActivityDisplayMode
       ),
       workspaceStatuses: normalizeWorkspaceStatuses(this.state.ui?.workspaceStatuses),
       workspaceBoardOpacity: clampWorkspaceBoardOpacity(this.state.ui?.workspaceBoardOpacity),
       workspaceBoardCompact: normalizeWorkspaceBoardCompact(this.state.ui?.workspaceBoardCompact),
       workspaceBoardColumnWidth: clampWorkspaceBoardColumnWidth(
         this.state.ui?.workspaceBoardColumnWidth
-      )
+      ),
+      featureTipsSeenIds: normalizeFeatureTipIds(this.state.ui?.featureTipsSeenIds),
+      featureInteractions: normalizeFeatureInteractions(this.state.ui?.featureInteractions)
     }
   }
 
@@ -2397,10 +2833,18 @@ export class Store {
       sortBy: updates.sortBy
         ? normalizeSortBy(updates.sortBy)
         : normalizeSortBy(this.state.ui?.sortBy),
+      rightSidebarTab:
+        updates.rightSidebarTab !== undefined
+          ? normalizeRightSidebarTab(updates.rightSidebarTab)
+          : normalizeRightSidebarTab(this.state.ui?.rightSidebarTab),
       worktreeCardProperties:
         updates.worktreeCardProperties !== undefined
           ? normalizeWorktreeCardProperties(updates.worktreeCardProperties)
           : normalizeWorktreeCardProperties(this.state.ui?.worktreeCardProperties),
+      agentActivityDisplayMode:
+        updates.agentActivityDisplayMode !== undefined
+          ? normalizeAgentActivityDisplayMode(updates.agentActivityDisplayMode)
+          : normalizeAgentActivityDisplayMode(this.state.ui?.agentActivityDisplayMode),
       workspaceStatuses:
         updates.workspaceStatuses !== undefined
           ? normalizeWorkspaceStatuses(updates.workspaceStatuses)
@@ -2413,9 +2857,38 @@ export class Store {
       ),
       workspaceBoardColumnWidth: clampWorkspaceBoardColumnWidth(
         updates.workspaceBoardColumnWidth ?? this.state.ui?.workspaceBoardColumnWidth
-      )
+      ),
+      featureTipsSeenIds:
+        updates.featureTipsSeenIds !== undefined
+          ? normalizeFeatureTipIds(updates.featureTipsSeenIds)
+          : normalizeFeatureTipIds(this.state.ui?.featureTipsSeenIds),
+      // Why: runtime RPCs and the renderer can both record education state.
+      // Merge instead of replacing so a stale renderer snapshot cannot erase
+      // runtime-only feature interactions.
+      featureInteractions:
+        updates.featureInteractions !== undefined
+          ? mergeFeatureInteractions(
+              this.state.ui?.featureInteractions,
+              updates.featureInteractions
+            )
+          : normalizeFeatureInteractions(this.state.ui?.featureInteractions)
     }
     this.scheduleSave()
+  }
+
+  recordFeatureInteraction(id: FeatureInteractionId): PersistedState['ui'] {
+    const featureInteractions = normalizeFeatureInteractions(this.state.ui?.featureInteractions)
+    const existing = featureInteractions[id]
+    this.updateUI({
+      featureInteractions: {
+        ...featureInteractions,
+        [id]: {
+          firstInteractedAt: existing?.firstInteractedAt ?? Date.now(),
+          interactionCount: (existing?.interactionCount ?? 0) + 1
+        }
+      }
+    })
+    return this.getUI()
   }
 
   // ── Onboarding ────────────────────────────────────────────────────
@@ -2465,6 +2938,12 @@ export class Store {
 
   getWorkspaceSession(): PersistedState['workspaceSession'] {
     return this.state.workspaceSession ?? getDefaultWorkspaceSession()
+  }
+
+  /** Resolve the worktree a terminal tab belongs to, from the session's
+   *  tab→worktree map. More reliable than agent-echoed hook fields. */
+  getWorktreeIdForTab(tabId: string): string | undefined {
+    return findWorktreeIdForTab(this.getWorkspaceSession(), tabId)
   }
 
   setWorkspaceSession(session: PersistedState['workspaceSession']): void {

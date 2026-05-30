@@ -28,6 +28,12 @@ import {
 } from './activity-bar-buttons'
 import { getActiveChecksStatus } from './active-checks-status'
 import { getVisibleRightSidebarActivityItems } from './right-sidebar-activity-visibility'
+import { useShortcutLabel } from '@/hooks/useShortcutLabel'
+import {
+  RIGHT_SIDEBAR_HEADER_NO_DRAG_CLASS_NAME,
+  RIGHT_SIDEBAR_TOP_ACTIVITY_STRIP_CLASS_NAME,
+  RIGHT_SIDEBAR_WINDOWS_TOP_ACTIVITY_STRIP_CLASS_NAME
+} from './right-sidebar-titlebar-drag-regions'
 
 const MIN_WIDTH = 220
 // Why: long file names (e.g. construction drawing sheets, multi-part document
@@ -40,48 +46,14 @@ const ABSOLUTE_FALLBACK_MAX_WIDTH = 2000
 
 const ACTIVITY_BAR_SIDE_WIDTH = 40
 
-const isMac = typeof navigator !== 'undefined' && navigator.userAgent.includes('Mac')
-const isWindows =
-  !isMac && typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
-const mod = isMac ? '\u2318' : 'Ctrl+'
-
-const ACTIVITY_ITEMS: ActivityBarItem[] = [
-  {
-    id: 'explorer',
-    icon: Files,
-    title: 'Explorer',
-    shortcut: `${isMac ? '\u21E7' : 'Shift+'}${mod}E`
-  },
-  {
-    id: 'search',
-    icon: Search,
-    title: 'Search',
-    shortcut: `${isMac ? '\u21E7' : 'Shift+'}${mod}F`
-  },
-  {
-    id: 'source-control',
-    icon: GitBranch,
-    title: 'Source Control',
-    shortcut: `${isMac ? '\u21E7' : 'Shift+'}${mod}G`,
-    gitOnly: true
-  },
-  {
-    id: 'checks',
-    icon: ListChecks,
-    title: 'Checks',
-    shortcut: `${isMac ? '\u21E7' : 'Shift+'}${mod}K`,
-    gitOnly: true
-  },
-  {
-    id: 'ports',
-    icon: Plug,
-    title: 'Ports',
-    shortcut: '',
-    sshOnly: true
-  }
-]
-
+const isWindows = typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
 function RightSidebarInner(): React.JSX.Element {
+  const rightSidebarShortcut = useShortcutLabel('sidebar.right.toggle')
+  const explorerShortcut = useShortcutLabel('sidebar.explorer.toggle')
+  const searchShortcut = useShortcutLabel('sidebar.search.toggle')
+  const sourceControlShortcut = useShortcutLabel('sidebar.sourceControl.toggle')
+  const checksShortcut = useShortcutLabel('sidebar.checks.toggle')
+  const portsShortcut = useShortcutLabel('sidebar.ports.toggle')
   const activeWorktree = useActiveWorktree()
   const rightSidebarOpen = useAppStore((s) => s.rightSidebarOpen)
   const rightSidebarWidth = useAppStore((s) => s.rightSidebarWidth)
@@ -99,9 +71,48 @@ function RightSidebarInner(): React.JSX.Element {
   const isFolder = activeRepo ? isFolderRepo(activeRepo) : false
   const isSshRepo = Boolean(activeRepo?.connectionId)
 
+  const activityItems = useMemo<ActivityBarItem[]>(
+    () => [
+      {
+        id: 'explorer',
+        icon: Files,
+        title: 'Explorer',
+        shortcut: explorerShortcut === 'Unassigned' ? '' : explorerShortcut
+      },
+      {
+        id: 'search',
+        icon: Search,
+        title: 'Search',
+        shortcut: searchShortcut === 'Unassigned' ? '' : searchShortcut
+      },
+      {
+        id: 'source-control',
+        icon: GitBranch,
+        title: 'Source Control',
+        shortcut: sourceControlShortcut === 'Unassigned' ? '' : sourceControlShortcut,
+        gitOnly: true
+      },
+      {
+        id: 'checks',
+        icon: ListChecks,
+        title: 'Checks',
+        shortcut: checksShortcut === 'Unassigned' ? '' : checksShortcut,
+        gitOnly: true
+      },
+      {
+        id: 'ports',
+        icon: Plug,
+        title: 'Ports',
+        shortcut: portsShortcut === 'Unassigned' ? '' : portsShortcut,
+        sshOnly: true
+      }
+    ],
+    [checksShortcut, explorerShortcut, portsShortcut, searchShortcut, sourceControlShortcut]
+  )
+
   const visibleItems = useMemo(
-    () => getVisibleRightSidebarActivityItems(ACTIVITY_ITEMS, { isFolder, isSshRepo }),
-    [isFolder, isSshRepo]
+    () => getVisibleRightSidebarActivityItems(activityItems, { isFolder, isSshRepo }),
+    [activityItems, isFolder, isSshRepo]
   )
 
   // If the active tab is hidden (e.g. switched from a git repo to a folder),
@@ -180,7 +191,7 @@ function RightSidebarInner(): React.JSX.Element {
         </button>
       </TooltipTrigger>
       <TooltipContent side="bottom" sideOffset={6}>
-        {`Toggle right sidebar (${isMac ? '⌘L' : 'Ctrl+L'})`}
+        {`Toggle right sidebar (${rightSidebarShortcut})`}
       </TooltipContent>
     </Tooltip>
   ) : null
@@ -214,41 +225,58 @@ function RightSidebarInner(): React.JSX.Element {
                   <ContextMenuTrigger asChild>
                     <div
                       ref={topActivityStripRef}
-                      className="right-sidebar-activity-strip flex min-w-0 flex-1 items-center overflow-hidden pl-2 right-sidebar-header-no-drag"
+                      className={RIGHT_SIDEBAR_TOP_ACTIVITY_STRIP_CLASS_NAME}
                     >
-                      {/* Why: the top strip shares a narrow titlebar with the close
-                          button and Windows controls. Overflow goes behind More
-                          instead of creating a horizontally scrollable toolbar. */}
-                      <div className="flex min-w-0 shrink">
-                        {topActivityLayout.visibleItems.map((item) => (
-                          <ActivityBarButton
-                            key={item.id}
-                            item={item}
-                            active={effectiveTab === item.id}
-                            onClick={() => setRightSidebarTab(item.id)}
-                            layout="top"
-                            statusIndicator={item.id === 'checks' ? checksStatus : null}
+                      <div
+                        className={cn(
+                          'flex min-w-0 shrink',
+                          RIGHT_SIDEBAR_HEADER_NO_DRAG_CLASS_NAME
+                        )}
+                      >
+                        {/* Why: the top strip shares a narrow titlebar with the close
+                            button and Windows controls. Overflow goes behind More
+                            instead of creating a horizontally scrollable toolbar. */}
+                        <div className="flex min-w-0 shrink">
+                          {topActivityLayout.visibleItems.map((item) => (
+                            <ActivityBarButton
+                              key={item.id}
+                              item={item}
+                              active={effectiveTab === item.id}
+                              onClick={() => setRightSidebarTab(item.id)}
+                              layout="top"
+                              statusIndicator={item.id === 'checks' ? checksStatus : null}
+                            />
+                          ))}
+                        </div>
+                        {topActivityLayout.overflowItems.length > 0 && (
+                          <TopActivityOverflowMenu
+                            items={topActivityLayout.overflowItems}
+                            activeTab={effectiveTab}
+                            onSelect={setRightSidebarTab}
+                            checksStatus={checksStatus}
                           />
-                        ))}
+                        )}
                       </div>
-                      {topActivityLayout.overflowItems.length > 0 && (
-                        <TopActivityOverflowMenu
-                          items={topActivityLayout.overflowItems}
-                          activeTab={effectiveTab}
-                          onSelect={setRightSidebarTab}
-                          checksStatus={checksStatus}
-                        />
-                      )}
                     </div>
                   </ContextMenuTrigger>
-                  <div className="flex shrink-0 items-center pr-1 right-sidebar-header-no-drag">
+                  <div
+                    className={cn(
+                      'flex shrink-0 items-center pr-1',
+                      RIGHT_SIDEBAR_HEADER_NO_DRAG_CLASS_NAME
+                    )}
+                  >
                     {closeButton}
                   </div>
                 </TooltipProvider>
               )}
               {isWindows && (
                 <TooltipProvider delayDuration={400}>
-                  <div className="ml-auto flex shrink-0 items-center pr-1 right-sidebar-header-no-drag">
+                  <div
+                    className={cn(
+                      'ml-auto flex shrink-0 items-center pr-1',
+                      RIGHT_SIDEBAR_HEADER_NO_DRAG_CLASS_NAME
+                    )}
+                  >
                     {closeButton}
                   </div>
                 </TooltipProvider>
@@ -259,7 +287,7 @@ function RightSidebarInner(): React.JSX.Element {
                 <ContextMenuTrigger asChild>
                   <div
                     ref={topActivityStripRef}
-                    className="right-sidebar-activity-strip flex h-10 min-h-10 items-center border-b border-border px-2 right-sidebar-header-no-drag"
+                    className={RIGHT_SIDEBAR_WINDOWS_TOP_ACTIVITY_STRIP_CLASS_NAME}
                   >
                     {/* Why: Windows has fixed native-style controls in the titlebar
                         area; keep sidebar navigation in the sidebar body so the

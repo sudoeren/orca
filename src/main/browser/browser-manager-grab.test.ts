@@ -4,6 +4,7 @@ main-side payload validation. Splitting across files would scatter the shared
 mock setup and make it harder to verify the grab contract holistically. */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { GRAB_BUDGET } from '../../shared/browser-grab-types'
+import type { BrowserGrabPayload } from '../../shared/browser-grab-types'
 
 const {
   webContentsFromIdMock,
@@ -62,8 +63,61 @@ function makeGuest(id: number) {
   } as unknown as Electron.WebContents
 }
 
+function makeValidGrabPayload(): BrowserGrabPayload {
+  return {
+    page: {
+      sanitizedUrl: 'https://example.com/',
+      title: 'Example',
+      viewportWidth: 1280,
+      viewportHeight: 720,
+      scrollX: 0,
+      scrollY: 0,
+      devicePixelRatio: 2,
+      capturedAt: '2026-04-10T00:00:00.000Z'
+    },
+    target: {
+      tagName: 'button',
+      selector: 'button',
+      textSnippet: 'Click me',
+      htmlSnippet: '<button>Click me</button>',
+      attributes: {},
+      accessibility: {
+        role: 'button',
+        accessibleName: 'Click me',
+        ariaLabel: null,
+        ariaLabelledBy: null
+      },
+      rectViewport: { x: 0, y: 0, width: 100, height: 40 },
+      rectPage: { x: 0, y: 0, width: 100, height: 40 },
+      computedStyles: {
+        display: 'block',
+        position: 'static',
+        width: '100px',
+        height: '40px',
+        margin: '0',
+        padding: '0',
+        color: '#000',
+        backgroundColor: '#fff',
+        border: 'none',
+        borderRadius: '0',
+        fontFamily: 'sans-serif',
+        fontSize: '14px',
+        fontWeight: '400',
+        lineHeight: '20px',
+        textAlign: 'left',
+        zIndex: 'auto'
+      }
+    },
+    nearbyText: [],
+    ancestorPath: ['div', 'body'],
+    screenshot: null
+  }
+}
+
 describe('browserManager grab operations', () => {
   const rendererWebContentsId = 5001
+  const primaryModifier =
+    process.platform === 'darwin' ? { meta: true, control: false } : { meta: false, control: true }
   let guest: Electron.WebContents
 
   beforeEach(() => {
@@ -72,6 +126,7 @@ describe('browserManager grab operations', () => {
     guestExecuteJavaScriptMock.mockResolvedValue(true)
     guestExecuteJavaScriptInIsolatedWorldMock.mockResolvedValue(true)
     browserManager.unregisterAll()
+    browserManager.setSettingsResolver(() => ({}))
 
     guest = makeGuest(101)
     webContentsFromIdMock.mockImplementation((id: number) => {
@@ -158,7 +213,13 @@ describe('browserManager grab operations', () => {
       const preventDefault = vi.fn()
       handler?.(
         { preventDefault } as never,
-        { type: 'keyDown', meta: true, control: true, shift: false, alt: false, key: 'c' } as never
+        {
+          type: 'keyDown',
+          ...primaryModifier,
+          shift: false,
+          alt: false,
+          key: 'c'
+        } as never
       )
 
       await Promise.resolve()
@@ -178,7 +239,13 @@ describe('browserManager grab operations', () => {
       const preventDefault = vi.fn()
       handler?.(
         { preventDefault } as never,
-        { type: 'keyDown', meta: true, control: true, shift: false, alt: false, key: 'c' } as never
+        {
+          type: 'keyDown',
+          ...primaryModifier,
+          shift: false,
+          alt: false,
+          key: 'c'
+        } as never
       )
 
       await Promise.resolve()
@@ -231,8 +298,8 @@ describe('browserManager grab operations', () => {
         { preventDefault } as never,
         {
           type: 'keyDown',
-          meta: true,
-          control: true,
+          meta: process.platform === 'darwin',
+          control: process.platform !== 'darwin',
           shift: true,
           alt: false,
           code: 'KeyB',
@@ -324,6 +391,40 @@ describe('browserManager grab operations', () => {
 
       const result = await browserManager.awaitGrabSelection('tab-1', 'op-1', guest)
       expect(result.kind).toBe('cancelled')
+    })
+
+    it('resolves with cancelled when guest returns teardown cancellation marker', async () => {
+      guestExecuteJavaScriptMock.mockResolvedValueOnce({ __orcaCancelled: true })
+
+      const result = await browserManager.awaitGrabSelection('tab-1', 'op-1', guest)
+      expect(result).toEqual({ opId: 'op-1', kind: 'cancelled', reason: 'user' })
+    })
+
+    it('resolves with cancelled when guest returns a serialized cancelled error', async () => {
+      guestExecuteJavaScriptMock.mockResolvedValueOnce({ message: 'cancelled' })
+
+      const result = await browserManager.awaitGrabSelection('tab-1', 'op-1', guest)
+      expect(result).toEqual({ opId: 'op-1', kind: 'cancelled', reason: 'user' })
+    })
+
+    it('resolves with cancelled when executeJavaScript rejects a serialized cancelled error', async () => {
+      guestExecuteJavaScriptMock.mockRejectedValueOnce({ message: 'cancelled' })
+
+      const result = await browserManager.awaitGrabSelection('tab-1', 'op-1', guest)
+      expect(result).toEqual({ opId: 'op-1', kind: 'cancelled', reason: 'user' })
+    })
+
+    it('does not treat a valid payload message field as cancellation', async () => {
+      guestExecuteJavaScriptMock.mockResolvedValueOnce({
+        ...makeValidGrabPayload(),
+        message: 'cancelled'
+      })
+
+      const result = await browserManager.awaitGrabSelection('tab-1', 'op-1', guest)
+      expect(result.kind).toBe('selected')
+      if (result.kind === 'selected') {
+        expect(result.payload.target.tagName).toBe('button')
+      }
     })
 
     it('resolves with error when executeJavaScript throws', async () => {

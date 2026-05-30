@@ -6,6 +6,7 @@ const NOTIFICATION_BODY_PREVIEW_MAX_LENGTH = 180
 
 const AGENT_TYPE_LABELS: Readonly<Record<string, string>> = {
   claude: 'Claude',
+  openclaude: 'OpenClaude',
   codex: 'Codex',
   gemini: 'Gemini',
   antigravity: 'Antigravity',
@@ -13,6 +14,7 @@ const AGENT_TYPE_LABELS: Readonly<Record<string, string>> = {
   cursor: 'Cursor',
   aider: 'Aider',
   pi: 'Pi',
+  omp: 'OMP',
   droid: 'Droid',
   grok: 'Grok',
   hermes: 'Hermes'

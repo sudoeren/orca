@@ -10,7 +10,7 @@ import {
   CommandItem,
   CommandList
 } from '@/components/ui/command'
-import RepoDotLabel from '@/components/repo/RepoDotLabel'
+import RepoBadgeLabel from '@/components/repo/RepoBadgeLabel'
 import { searchRepos } from '@/lib/repo-search'
 import type { Repo } from '../../../../shared/types'
 
@@ -79,7 +79,7 @@ const SidebarRepositoryFilterSection = React.memo(function SidebarRepositoryFilt
     [filterRepoIds, setFilterRepoIds]
   )
 
-  const handleRemoveRepo = useCallback(
+  const handleRemoveProject = useCallback(
     (repoId: string) => {
       setFilterRepoIds(filterRepoIds.filter((id) => id !== repoId))
     },
@@ -97,7 +97,7 @@ const SidebarRepositoryFilterSection = React.memo(function SidebarRepositoryFilt
         if (lastRepo) {
           event.preventDefault()
           event.stopPropagation()
-          handleRemoveRepo(lastRepo.id)
+          handleRemoveProject(lastRepo.id)
         }
         return
       }
@@ -119,7 +119,7 @@ const SidebarRepositoryFilterSection = React.memo(function SidebarRepositoryFilt
     },
     [
       availableRepos,
-      handleRemoveRepo,
+      handleRemoveProject,
       handleSelectRepo,
       highlightedRepoId,
       matchingAvailableRepos,
@@ -145,7 +145,7 @@ const SidebarRepositoryFilterSection = React.memo(function SidebarRepositoryFilt
         onValueChange={setHighlightedRepoId}
         className="bg-transparent"
       >
-        <SelectedProjectPills selectedRepos={selectedRepos} onRemoveRepo={handleRemoveRepo} />
+        <SelectedProjectPills selectedRepos={selectedRepos} onRemoveProject={handleRemoveProject} />
         <CommandInput
           autoFocus
           placeholder={selectedRepos.length > 0 ? 'Add project...' : 'Filter projects...'}
@@ -169,7 +169,7 @@ const SidebarRepositoryFilterSection = React.memo(function SidebarRepositoryFilt
               className="mx-1 my-0.5 items-center gap-2 rounded-[7px] px-2 py-1 text-[12px] leading-5 font-medium data-[selected=true]:bg-black/8 dark:data-[selected=true]:bg-white/14"
             >
               <span className="inline-flex min-w-0 flex-1 items-center gap-1.5">
-                <RepoDotLabel
+                <RepoBadgeLabel
                   name={repo.displayName}
                   color={repo.badgeColor}
                   className="max-w-full"
@@ -191,10 +191,10 @@ const SidebarRepositoryFilterSection = React.memo(function SidebarRepositoryFilt
 
 function SelectedProjectPills({
   selectedRepos,
-  onRemoveRepo
+  onRemoveProject
 }: {
   selectedRepos: Repo[]
-  onRemoveRepo: (repoId: string) => void
+  onRemoveProject: (repoId: string) => void
 }) {
   if (selectedRepos.length === 0) {
     return null
@@ -208,11 +208,11 @@ function SelectedProjectPills({
           variant="outline"
           className="h-5 max-w-full gap-1 border-border/70 bg-background px-1.5 py-0 text-[11px] font-medium"
         >
-          <RepoDotLabel
+          <RepoBadgeLabel
             name={repo.displayName}
             color={repo.badgeColor}
             className="max-w-[8rem]"
-            dotClassName="size-1.5"
+            badgeClassName="size-1.5"
           />
           <Button
             type="button"
@@ -221,7 +221,7 @@ function SelectedProjectPills({
             aria-label={`Remove ${repo.displayName} filter`}
             className="-mr-1 size-4 rounded-full text-muted-foreground hover:bg-muted hover:text-foreground"
             onMouseDown={(event) => event.preventDefault()}
-            onClick={() => onRemoveRepo(repo.id)}
+            onClick={() => onRemoveProject(repo.id)}
           >
             <X className="size-2.5" strokeWidth={2.5} />
           </Button>

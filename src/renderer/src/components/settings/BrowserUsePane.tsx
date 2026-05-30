@@ -1,12 +1,23 @@
-import { useEffect, useState } from 'react'
+/* eslint-disable max-lines -- Why: Browser Use setup keeps enablement, CLI registration, skill install, cookie import, examples, and interaction tracking in one pane so the three-step setup state stays coherent. */
+import { useCallback, useEffect, useState } from 'react'
 import { Import, Loader2, MousePointerClick } from 'lucide-react'
 import { toast } from 'sonner'
 import type { CliInstallStatus } from '../../../../shared/cli-install-types'
-import { ORCA_CLI_SKILL_INSTALL_COMMAND } from '@/lib/agent-feature-install-commands'
 import {
-  BROWSER_USE_ENABLED_STORAGE_KEY,
-  BROWSER_USE_SKILL_INSTALLED_STORAGE_KEY
-} from '@/lib/browser-use-setup-state'
+  ORCA_CLI_SKILL_INSTALL_COMMAND,
+  ORCA_CLI_SKILL_NAME
+} from '@/lib/agent-feature-install-commands'
+import {
+  AGENT_SKILL_CLI_PREREQUISITE_NOTICE,
+  ensureOrcaCliAvailableForAgentSkillTerminal,
+  isOrcaCliAvailableOnPath
+} from '@/lib/agent-skill-cli-prerequisite'
+import { BROWSER_USE_ENABLED_STORAGE_KEY } from '@/lib/browser-use-setup-state'
+import {
+  GLOBAL_AGENT_SKILL_SOURCE_KINDS,
+  useInstalledAgentSkill
+} from '@/hooks/useInstalledAgentSkills'
+import { useMountedRef } from '@/hooks/useMountedRef'
 import { Button } from '../ui/button'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../ui/tooltip'
 import {
@@ -48,6 +59,16 @@ export function BrowserUseSetup({
   const [cliStatus, setCliStatus] = useState<CliInstallStatus | null>(null)
   const [cliLoading, setCliLoading] = useState(true)
   const [cliBusy, setCliBusy] = useState(false)
+  const mountedRef = useMountedRef()
+
+  const handleCliStatusChange = useCallback(
+    (nextStatus: CliInstallStatus): void => {
+      if (mountedRef.current) {
+        setCliStatus(nextStatus)
+      }
+    },
+    [mountedRef]
+  )
 
   // Why: the toggle gates only whether we show the setup instructions. We
   // persist it in localStorage instead of global settings because it has no
@@ -60,18 +81,25 @@ export function BrowserUseSetup({
   const toggleBrowserUse = (value: boolean): void => {
     setBrowserUseEnabled(value)
     localStorage.setItem(BROWSER_USE_ENABLED_STORAGE_KEY, value ? '1' : '0')
-  }
-
-  const refreshCli = async (): Promise<void> => {
-    setCliLoading(true)
-    try {
-      setCliStatus(await window.api.cli.getInstallStatus())
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Failed to load CLI status.')
-    } finally {
-      setCliLoading(false)
+    if (value) {
+      useAppStore.getState().recordFeatureInteraction('agent-browser-setup')
     }
   }
+
+  const refreshCli = useCallback(async (): Promise<void> => {
+    setCliLoading(true)
+    try {
+      handleCliStatusChange(await window.api.cli.getInstallStatus())
+    } catch (error) {
+      if (mountedRef.current) {
+        toast.error(error instanceof Error ? error.message : 'Failed to load CLI status.')
+      }
+    } finally {
+      if (mountedRef.current) {
+        setCliLoading(false)
+      }
+    }
+  }, [handleCliStatusChange, mountedRef])
 
   useEffect(() => {
     // Why: skip IPC work when the feature is toggled off — the component
@@ -81,7 +109,7 @@ export function BrowserUseSetup({
     }
     void refreshCli()
     void fetchBrowserSessionProfiles()
-  }, [browserUseEnabled, fetchBrowserSessionProfiles])
+  }, [browserUseEnabled, fetchBrowserSessionProfiles, refreshCli])
 
   const defaultProfile = browserSessionProfiles.find((p) => p.id === 'default')
   // Why: this step explicitly imports into the default profile, so completion
@@ -90,41 +118,33 @@ export function BrowserUseSetup({
   // when the default profile — the one agents use — is still empty.
   const cookiesImported = !!defaultProfile?.source
 
-  const cliEnabled = cliStatus?.state === 'installed'
+  const cliEnabled = isOrcaCliAvailableOnPath(cliStatus)
+  const cliPathNeedsAttention = cliStatus?.state === 'installed' && !cliStatus.pathConfigured
   const cliSupported = cliStatus?.supported ?? false
 
-  // Why: the skill install step is a copy-and-run command that happens in the
-  // user's terminal. We cannot detect completion from the app, so we let the
-  // user mark it done explicitly after copying — this avoids falsely implying
-  // progress and keeps the guided flow honest.
-  const [skillInstalled, setSkillInstalled] = useState<boolean>(() => {
-    return localStorage.getItem(BROWSER_USE_SKILL_INSTALLED_STORAGE_KEY) === '1'
+  const {
+    installed: skillDetected,
+    loading: skillLoading,
+    error: skillError,
+    refresh: refreshSkill
+  } = useInstalledAgentSkill(ORCA_CLI_SKILL_NAME, {
+    enabled: browserUseEnabled,
+    sourceKinds: GLOBAL_AGENT_SKILL_SOURCE_KINDS
   })
-
-  const markSkillInstalled = (value: boolean): void => {
-    setSkillInstalled(value)
-    localStorage.setItem(BROWSER_USE_SKILL_INSTALLED_STORAGE_KEY, value ? '1' : '0')
-  }
 
   const handleEnableCli = async (): Promise<void> => {
     setCliBusy(true)
     try {
-      const next = await window.api.cli.install()
-      setCliStatus(next)
-      toast.success('Registered `orca` in PATH.')
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Failed to register `orca` in PATH.')
+      const next = await ensureOrcaCliAvailableForAgentSkillTerminal({
+        onStatusChange: handleCliStatusChange
+      })
+      if (mountedRef.current && isOrcaCliAvailableOnPath(next)) {
+        toast.success('Registered the Orca CLI in PATH.')
+      }
     } finally {
-      setCliBusy(false)
-    }
-  }
-
-  const handleCopySkillCommand = async (): Promise<void> => {
-    try {
-      await window.api.ui.writeClipboardText(ORCA_CLI_SKILL_INSTALL_COMMAND)
-      toast.success('Copied install command. Run it on this computer.')
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Failed to copy command.')
+      if (mountedRef.current) {
+        setCliBusy(false)
+      }
     }
   }
 
@@ -162,8 +182,7 @@ export function BrowserUseSetup({
   const showStep1 = matchesSettingsSearch(searchQuery, [BROWSER_USE_PANE_SEARCH_ENTRIES[0]])
   const showStep2 = matchesSettingsSearch(searchQuery, [BROWSER_USE_PANE_SEARCH_ENTRIES[1]])
   const showStep3 = matchesSettingsSearch(searchQuery, [BROWSER_USE_PANE_SEARCH_ENTRIES[2]])
-
-  const completedCount = [cliEnabled, skillInstalled, cookiesImported].filter(Boolean).length
+  const completedCount = [cliEnabled, skillDetected, cookiesImported].filter(Boolean).length
 
   const sourceLabel = defaultProfile?.source
     ? `${BROWSER_FAMILY_LABELS[defaultProfile.source.browserFamily] ?? defaultProfile.source.browserFamily}${defaultProfile.source.profileName ? ` (${defaultProfile.source.profileName})` : ''}`
@@ -189,7 +208,7 @@ export function BrowserUseSetup({
 
   if (!browserUseEnabled) {
     return (
-      <div className="flex items-center justify-between gap-4 px-1 py-2">
+      <div className="flex items-center justify-between gap-4 py-2">
         <div className="space-y-0.5">
           <p className="text-sm font-medium">Agent Browser Use</p>
           <p className="text-xs text-muted-foreground">
@@ -252,7 +271,7 @@ export function BrowserUseSetup({
       {showStep1 ? (
         <SearchableSetting
           title="Enable Orca CLI"
-          description="Register the orca shell command so agents can drive the browser."
+          description="Register the Orca CLI so agents can drive the browser."
           keywords={BROWSER_USE_PANE_SEARCH_ENTRIES[0].keywords}
           className="rounded-xl border border-border/60 bg-card/50 p-4"
         >
@@ -264,14 +283,17 @@ export function BrowserUseSetup({
             <div className="min-w-0 flex-1 space-y-1">
               <p className="text-sm font-medium">Enable Orca CLI</p>
               <p className="text-xs text-muted-foreground">
-                Registers the <code className="rounded bg-muted px-1 py-0.5 text-[11px]">orca</code>{' '}
-                command so agents can orchestrate the browser from their shell.
+                Registers the Orca CLI command so agents can orchestrate the browser from their
+                shell.
               </p>
               {cliStatus?.commandPath && cliEnabled ? (
                 <p className="text-[11px] text-muted-foreground">
                   Installed at{' '}
                   <code className="rounded bg-muted px-1 py-0.5">{cliStatus.commandPath}</code>
                 </p>
+              ) : null}
+              {cliPathNeedsAttention && cliStatus?.detail ? (
+                <p className="text-[11px] text-amber-600 dark:text-amber-400">{cliStatus.detail}</p>
               ) : null}
             </div>
             <TooltipProvider delayDuration={250}>
@@ -284,7 +306,13 @@ export function BrowserUseSetup({
                       disabled={cliLoading || cliBusy || !cliSupported || cliEnabled}
                       onClick={() => void handleEnableCli()}
                     >
-                      {cliBusy ? 'Registering…' : cliEnabled ? 'Enabled' : 'Enable'}
+                      {cliBusy
+                        ? 'Registering...'
+                        : cliEnabled
+                          ? 'Enabled'
+                          : cliPathNeedsAttention
+                            ? 'Fix PATH'
+                            : 'Enable'}
                     </Button>
                   </span>
                 </TooltipTrigger>
@@ -302,7 +330,7 @@ export function BrowserUseSetup({
       {showStep2 ? (
         <SearchableSetting
           title="Install Browser Use Skill"
-          description="Install the orca-cli agent skill so agents know how to use the browser."
+          description="Install the Browser Use skill so agents can operate Orca's browser."
           keywords={BROWSER_USE_PANE_SEARCH_ENTRIES[1].keywords}
           className={`rounded-xl border border-border/60 bg-card/50 p-4 ${
             cliEnabled ? '' : 'opacity-60'
@@ -310,10 +338,18 @@ export function BrowserUseSetup({
         >
           <BrowserUseSkillStep
             command={ORCA_CLI_SKILL_INSTALL_COMMAND}
-            skillInstalled={skillInstalled}
+            skillDetected={skillDetected}
+            skillLoading={skillLoading}
+            skillError={skillError}
             disabled={!cliEnabled}
-            onCopy={() => void handleCopySkillCommand()}
-            onToggleInstalled={() => markSkillInstalled(!skillInstalled)}
+            preInstallNotice={AGENT_SKILL_CLI_PREREQUISITE_NOTICE}
+            onBeforeOpenTerminal={async () => {
+              useAppStore.getState().recordFeatureInteraction('agent-browser-setup')
+              await ensureOrcaCliAvailableForAgentSkillTerminal({
+                onStatusChange: handleCliStatusChange
+              })
+            }}
+            onRecheck={refreshSkill}
           />
         </SearchableSetting>
       ) : null}
@@ -324,7 +360,7 @@ export function BrowserUseSetup({
           description="Import cookies from Chrome, Edge, or other browsers so agents can reuse your logins."
           keywords={BROWSER_USE_PANE_SEARCH_ENTRIES[2].keywords}
           className={`rounded-xl border border-border/60 bg-card/50 p-4 ${
-            cliEnabled && skillInstalled ? '' : 'opacity-60'
+            cliEnabled && skillDetected ? '' : 'opacity-60'
           }`}
         >
           <div className="flex items-start gap-3">

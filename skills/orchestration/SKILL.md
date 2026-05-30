@@ -1,20 +1,12 @@
 ---
 name: orchestration
 description: >-
-  Use `orca orchestration` when coordinating multiple AI agents through Orca:
-  pass context, instructions, questions, findings, reviews, handoffs, or
-  structured results between agents; delegate subtasks; dispatch work; track task
-  DAGs; wait for worker_done/escalation; or run coordinator loops and decision
-  gates. This is the right skill for semantic agent-to-agent communication.
-  Boundary with `orca-cli`: do not use orchestration for ordinary terminal
-  control, shell commands, browser automation, worktree management, or
-  reading/waiting on terminals; use `orca-cli` for those. Triggers include "tell
-  the other agent", "ask <agent>", "hand off to", "pass this to <agent>",
-  "delegate to <agent>", "have <agent> do X", "let <agent> know", "share with the
-  other AI", "coordinate agents", "what did <agent> find", "check orchestration
-  inbox", "reply to <agent>", "dispatch task", "orchestrate agents",
-  "multi-agent", "task DAG", "worker_done", "escalation", "decision gate", and
-  "coordinator loop".
+  Use for Orca agent-to-agent coordination: send/ask/reply between agent
+  terminals, dispatch tasks to worker agents, wait for worker_done or
+  escalation messages, manage task DAGs with dependencies, run decision
+  gates, operate coordinator loops, or decompose a spec into parallel subtasks.
+  Use `orca-cli` instead for terminal control, shell commands, browser
+  automation, worktree management, and reading or waiting on terminals.
 ---
 
 # Orca Inter-Agent Orchestration
@@ -29,10 +21,14 @@ Use this skill when the task involves coordinating multiple coding agents throug
 - You need to act as a coordinator managing a multi-agent workflow
 - You need to create decision gates for human-in-the-loop checkpoints
 
+## When Not To Use
+
+Use `orca-cli` instead for ordinary terminal control, shell commands, browser automation, worktree management, or reading/waiting on terminals.
+
 ## Preconditions
 
 - Orca must be running (`orca status --json` should return `runtime: true`).
-- The `orca` CLI must be on PATH (installed via Settings > Browser > Enable Orca CLI).
+- The `orca` CLI must be on PATH (`orca-ide` on Linux; installed via Settings > Browser > Enable Orca CLI).
 - The orchestration experimental feature must be enabled in Settings > Experimental.
 - All `orca orchestration` commands are RPC calls to the running Orca runtime — they require an active Orca session.
 
@@ -96,7 +92,7 @@ orca orchestration dispatch --task <task_id> --to <handle> [--from <handle>] [--
 orca orchestration dispatch-show --task <task_id> [--json]
 ```
 
-Why: `--inject` sends a preamble that teaches the agent how to use `orca orchestration send --type worker_done` to report completion. All agents have `orca` on PATH and can execute shell commands. The preamble maximizes structured feedback but the system works without it (coordinator falls back to idle detection + output reading).
+Why: `--inject` sends a preamble that teaches the agent how to use `orca orchestration send --type worker_done` to report completion. All agents have `orca` (or `orca-ide` on Linux) on PATH and can execute shell commands. The preamble maximizes structured feedback but the system works without it (coordinator falls back to idle detection + output reading).
 
 Why: `--inject` requires a recognized agent CLI (e.g. Claude Code) running in the target terminal. If the terminal is a bare shell, omit `--inject` and send the prompt manually with `terminal send`.
 

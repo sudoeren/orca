@@ -1,11 +1,13 @@
 /* eslint-disable max-lines -- Why: this module keeps Claude credential source
 ordering, OAuth usage fetch semantics, and PTY fallback behavior together so
 subscription usage state cannot drift across code paths. */
+import { existsSync, lstatSync, readFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { net, session } from 'electron'
 import type { ProviderRateLimits, RateLimitWindow } from '../../shared/rate-limit-types'
+import { parseWslUncPath } from '../../shared/wsl-paths'
 import { fetchViaPty } from './claude-pty'
 import type { ClaudeRuntimeAuthPreparation } from '../claude-accounts/runtime-auth-service'
 import {
@@ -18,6 +20,7 @@ import {
   resolveOwnedClaudeManagedAuthPath
 } from '../claude-accounts/managed-auth-path'
 import { createOAuthUsageError, OAuthUsageError } from './claude-oauth-usage-error'
+import { withMacTailscaleDnsHint } from '../network/macos-tailscale-dns-diagnostic'
 
 const OAUTH_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 const OAUTH_BETA_HEADER = 'oauth-2025-04-20'
@@ -306,6 +309,17 @@ async function fetchViaOAuth(token: string): Promise<ProviderRateLimits> {
 export async function fetchClaudeRateLimits(options?: {
   authPreparation?: ClaudeRuntimeAuthPreparation
 }): Promise<ProviderRateLimits> {
+  if (options?.authPreparation?.runtime === 'wsl' && !options.authPreparation.wslLinuxConfigDir) {
+    return {
+      provider: 'claude',
+      session: null,
+      weekly: null,
+      updatedAt: Date.now(),
+      error: `WSL Claude config unavailable for ${options.authPreparation.wslDistro ?? 'default distro'}`,
+      status: 'error'
+    }
+  }
+
   // Path A: try OAuth API if we have a genuine OAuth token
   const oauthCredentials = await readOAuthCredentials(options?.authPreparation?.configDir)
   if (oauthCredentials.token) {
@@ -318,7 +332,7 @@ export async function fetchClaudeRateLimits(options?: {
           session: null,
           weekly: null,
           updatedAt: Date.now(),
-          error: err.message,
+          error: withMacTailscaleDnsHint(err.message),
           status: 'error'
         }
       }
@@ -340,7 +354,7 @@ export async function fetchClaudeRateLimits(options?: {
         session: null,
         weekly: null,
         updatedAt: Date.now(),
-        error: message,
+        error: withMacTailscaleDnsHint(message),
         status: 'error'
       }
     }
@@ -367,6 +381,9 @@ export async function fetchClaudeRateLimits(options?: {
 export type InactiveClaudeAccountInfo = {
   id: string
   managedAuthPath: string
+  managedAuthRuntime?: 'host' | 'wsl'
+  wslDistro?: string | null
+  wslLinuxAuthPath?: string | null
 }
 
 // Why: reads an inactive account's OAuth token directly from its managed
@@ -374,6 +391,14 @@ export type InactiveClaudeAccountInfo = {
 // Using ClaudeRuntimeAuthService would overwrite the active account's auth.
 async function readManagedOAuthToken(account: InactiveClaudeAccountInfo): Promise<string | null> {
   try {
+    if (account.managedAuthRuntime === 'wsl') {
+      const managedAuthPath = resolveOwnedWslClaudeManagedAuthPath(account)
+      if (!managedAuthPath) {
+        return null
+      }
+      const raw = readClaudeManagedAuthFile(managedAuthPath, '.credentials.json')
+      return raw ? parseOAuthCredentialsJson(raw).token : null
+    }
     const managedAuthPath = resolveOwnedClaudeManagedAuthPath(account.id, account.managedAuthPath, {
       adoptLegacyMarker: true
     })
@@ -389,6 +414,36 @@ async function readManagedOAuthToken(account: InactiveClaudeAccountInfo): Promis
     }
     const raw = readClaudeManagedAuthFile(managedAuthPath, '.credentials.json')
     return raw ? parseOAuthCredentialsJson(raw).token : null
+  } catch {
+    return null
+  }
+}
+
+function resolveOwnedWslClaudeManagedAuthPath(account: InactiveClaudeAccountInfo): string | null {
+  if (process.platform !== 'win32') {
+    return null
+  }
+  const wslInfo = parseWslUncPath(account.managedAuthPath)
+  if (!wslInfo || (account.wslDistro && wslInfo.distro !== account.wslDistro)) {
+    return null
+  }
+  const linuxPath = account.wslLinuxAuthPath ?? wslInfo.linuxPath
+  if (
+    !linuxPath.includes('/.local/share/orca/claude-accounts/') ||
+    !linuxPath.endsWith(`/${account.id}/auth`)
+  ) {
+    return null
+  }
+  try {
+    const markerPath = path.join(account.managedAuthPath, '.orca-managed-claude-auth')
+    if (
+      !existsSync(markerPath) ||
+      lstatSync(markerPath).isSymbolicLink() ||
+      readFileSync(markerPath, 'utf-8').trim() !== account.id
+    ) {
+      return null
+    }
+    return account.managedAuthPath
   } catch {
     return null
   }

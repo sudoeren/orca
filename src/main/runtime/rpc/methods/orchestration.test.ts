@@ -949,6 +949,38 @@ describe('orchestration RPC methods', () => {
       expect(outbound).toBeTruthy()
     })
 
+    it('returns promptly when the RPC signal aborts while waiting', async () => {
+      setup()
+      vi.useFakeTimers()
+      const controller = new AbortController()
+      const method = findMethod('orchestration.ask')
+      const parsed = method.params!.parse({
+        from: 'term_worker',
+        to: 'term_coord',
+        question: 'still there?',
+        timeoutMs: 60_000
+      })
+
+      try {
+        const promise = method.handler(parsed, {
+          runtime,
+          signal: controller.signal
+        }) as Promise<{ timedOut: boolean }>
+
+        controller.abort()
+        const outcomePromise = Promise.race([
+          promise.then((result) => (result.timedOut ? 'aborted' : 'answered')),
+          new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), 0))
+        ])
+        await vi.advanceTimersByTimeAsync(0)
+        const outcome = await outcomePromise
+
+        expect(outcome).toBe('aborted')
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
     it('rejects group addresses with a dedicated error (no message persisted)', async () => {
       setup()
       await expect(
@@ -1022,10 +1054,14 @@ describe('orchestration RPC methods', () => {
   })
 
   describe('orchestration.reset', () => {
-    it('resets all state', async () => {
-      setup()
+    function seedResetState(): void {
       db.insertMessage({ from: 'a', to: 'b', subject: 'test' })
       db.createTask({ spec: 'work' })
+    }
+
+    it('resets all state', async () => {
+      setup()
+      seedResetState()
 
       const result = (await call('orchestration.reset', { all: true })) as { reset: string }
       expect(result.reset).toBe('all')
@@ -1035,8 +1071,7 @@ describe('orchestration RPC methods', () => {
 
     it('resets tasks only', async () => {
       setup()
-      db.insertMessage({ from: 'a', to: 'b', subject: 'test' })
-      db.createTask({ spec: 'work' })
+      seedResetState()
 
       await call('orchestration.reset', { tasks: true })
       expect(db.getInbox()).toHaveLength(1)
@@ -1045,10 +1080,50 @@ describe('orchestration RPC methods', () => {
 
     it('resets messages only', async () => {
       setup()
-      db.insertMessage({ from: 'a', to: 'b', subject: 'test' })
-      db.createTask({ spec: 'work' })
+      seedResetState()
 
       await call('orchestration.reset', { messages: true })
+      expect(db.getInbox()).toHaveLength(0)
+      expect(db.listTasks()).toHaveLength(1)
+    })
+
+    it.each([
+      ['empty params', {}],
+      ['false-only params', { all: false }],
+      ['multi-scope task and messages params', { tasks: true, messages: true }],
+      ['multi-scope all and tasks params', { all: true, tasks: true }],
+      ['non-boolean params', { all: 'true' }]
+    ])('rejects %s without mutating state', async (_name, params) => {
+      setup()
+      seedResetState()
+
+      await expect(call('orchestration.reset', params)).rejects.toThrow()
+      expect(db.getInbox()).toHaveLength(1)
+      expect(db.listTasks()).toHaveLength(1)
+    })
+
+    it('ignores false scopes when exactly one scope is true', async () => {
+      setup()
+      seedResetState()
+
+      const result = (await call('orchestration.reset', { all: false, tasks: true })) as {
+        reset: string
+      }
+
+      expect(result.reset).toBe('tasks')
+      expect(db.getInbox()).toHaveLength(1)
+      expect(db.listTasks()).toHaveLength(0)
+    })
+
+    it('ignores non-boolean scopes when exactly one real boolean scope is true', async () => {
+      setup()
+      seedResetState()
+
+      const result = (await call('orchestration.reset', { all: 'true', messages: true })) as {
+        reset: string
+      }
+
+      expect(result.reset).toBe('messages')
       expect(db.getInbox()).toHaveLength(0)
       expect(db.listTasks()).toHaveLength(1)
     })

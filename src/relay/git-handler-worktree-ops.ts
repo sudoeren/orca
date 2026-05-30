@@ -11,12 +11,37 @@ import { parseWorktreeList } from './git-handler-utils'
 
 // ─── Worktree management ─────────────────────────────────────────────
 
+async function persistRelayWorktreeCreationBase(
+  git: GitExec,
+  targetDir: string,
+  branchName: string,
+  effectiveBase: string
+): Promise<void> {
+  const configKey = `branch.${branchName}.base`
+  try {
+    await git(['config', '--local', '--replace-all', configKey, effectiveBase], targetDir)
+  } catch (error) {
+    console.warn(`relay addWorktree: failed to set ${configKey} for ${targetDir}`, error)
+    try {
+      // Why: SSH worktree creation shares branch config by name; clear stale
+      // metadata if replacing an old same-name base fails.
+      await git(['config', '--local', '--unset-all', configKey], targetDir)
+    } catch (unsetError) {
+      console.warn(
+        `relay addWorktree: failed to unset stale ${configKey} for ${targetDir}`,
+        unsetError
+      )
+    }
+  }
+}
+
 export async function addWorktreeOp(git: GitExec, params: Record<string, unknown>): Promise<void> {
   const repoPath = params.repoPath as string
   const branchName = params.branchName as string
   const targetDir = params.targetDir as string
   const base = params.base as string | undefined
   const checkoutExistingBranch = params.checkoutExistingBranch === true
+  const noCheckout = params.noCheckout === true
 
   // Why: a branchName starting with '-' would be interpreted as a git flag,
   // potentially changing the command's semantics (e.g. "--detach").
@@ -47,6 +72,9 @@ export async function addWorktreeOp(git: GitExec, params: Record<string, unknown
   const args = checkoutExistingBranch
     ? ['worktree', 'add', targetDir, branchName]
     : ['worktree', 'add', '--no-track', '-b', branchName, targetDir]
+  if (!checkoutExistingBranch && noCheckout) {
+    args.splice(3, 0, '--no-checkout')
+  }
   if (effectiveBase) {
     args.push(effectiveBase)
   }
@@ -55,6 +83,10 @@ export async function addWorktreeOp(git: GitExec, params: Record<string, unknown
 
   if (checkoutExistingBranch) {
     return
+  }
+
+  if (effectiveBase) {
+    await persistRelayWorktreeCreationBase(git, targetDir, branchName, effectiveBase)
   }
 
   // Why: best-effort write so a deliberate user value (any scope) is
@@ -93,6 +125,7 @@ export async function removeWorktreeOp(
   const worktreePath = params.worktreePath as string
   const force = params.force as boolean | undefined
   const deleteBranch = params.deleteBranch !== false
+  const forceBranchDelete = params.forceBranchDelete === true
 
   let repoPath = worktreePath
   try {
@@ -138,10 +171,15 @@ export async function removeWorktreeOp(
   }
 
   try {
-    await git(['branch', '-D', branchName], repoPath)
+    // Why: use `-d` (not `-D`) to mirror the local removeWorktree fix — Git
+    // refuses to delete a branch with commits not merged into its upstream or
+    // HEAD, so unpublished work on a remote worktree is preserved rather than
+    // force-deleted. forceBranchDelete is reserved for failed create rollback.
+    await git(['branch', forceBranchDelete ? '-D' : '-d', branchName], repoPath)
   } catch (error) {
+    // Expected when the branch still has unmerged/unpublished commits: keep it.
     console.warn(
-      `relay removeWorktree: failed to delete local branch "${branchName}" after removing worktree`,
+      `relay removeWorktree: preserved local branch "${branchName}" after removing worktree (not fully merged)`,
       error
     )
   }
@@ -174,6 +212,16 @@ function areRelayWorktreePathsEqual(leftPath: string, rightPath: string): boolea
   const left = path.normalize(path.resolve(leftPath))
   const right = path.normalize(path.resolve(rightPath))
   return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right
+}
+
+export async function worktreeIsCleanOp(
+  git: GitExec,
+  params: Record<string, unknown>
+): Promise<{ clean: boolean; stdout?: string }> {
+  const worktreePath = params.worktreePath as string
+  const { stdout } = await git(['status', '--porcelain', '--untracked-files=all'], worktreePath)
+  const clean = !stdout.trim()
+  return { clean, stdout: clean ? undefined : stdout }
 }
 
 // ─── Commit ──────────────────────────────────────────────────────────

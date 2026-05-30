@@ -120,6 +120,7 @@ export default function WorkspaceKanbanDrawer({
       if (!current || getWorkspaceStatus(current, workspaceStatuses) === status) {
         return
       }
+      useAppStore.getState().recordFeatureInteraction('workspace-board-actions')
       void updateWorktreeMeta(worktreeId, { workspaceStatus: status })
     },
     [updateWorktreeMeta, workspaceStatuses, worktreeById]
@@ -211,6 +212,7 @@ export default function WorkspaceKanbanDrawer({
       if (writeManualOrder && order.changed) {
         setSortBy('manual')
       }
+      useAppStore.getState().recordFeatureInteraction('workspace-board-actions')
       void updateWorktreesMeta(updates)
     },
     [
@@ -244,6 +246,7 @@ export default function WorkspaceKanbanDrawer({
         updates.set(worktreeId, { isPinned: true })
       }
       if (updates.size > 0) {
+        useAppStore.getState().recordFeatureInteraction('workspace-board-actions')
         void updateWorktreesMeta(updates)
       }
     },
@@ -327,6 +330,16 @@ export default function WorkspaceKanbanDrawer({
   const handleWorktreeActivate = useCallback(() => {
     onOpenChange(false)
   }, [onOpenChange])
+  const handleSheetOpenChange = useCallback(
+    (nextOpen: boolean) => {
+      // Why: Radix treats any outside pointer release as a dismiss request.
+      // The board has custom right-side/sidebar rules, so only those paths close it.
+      if (nextOpen) {
+        onOpenChange(true)
+      }
+    },
+    [onOpenChange]
+  )
 
   const handleRenameStatus = useCallback(
     (statusId: string, label: string) => {
@@ -339,6 +352,7 @@ export default function WorkspaceKanbanDrawer({
           status.id === statusId ? { ...status, label: trimmed } : status
         )
       )
+      useAppStore.getState().recordFeatureInteraction('workspace-board-actions')
     },
     [setWorkspaceStatuses, workspaceStatuses]
   )
@@ -348,6 +362,7 @@ export default function WorkspaceKanbanDrawer({
       setWorkspaceStatuses(
         workspaceStatuses.map((status) => (status.id === statusId ? { ...status, color } : status))
       )
+      useAppStore.getState().recordFeatureInteraction('workspace-board-actions')
     },
     [setWorkspaceStatuses, workspaceStatuses]
   )
@@ -357,6 +372,7 @@ export default function WorkspaceKanbanDrawer({
       setWorkspaceStatuses(
         workspaceStatuses.map((status) => (status.id === statusId ? { ...status, icon } : status))
       )
+      useAppStore.getState().recordFeatureInteraction('workspace-board-actions')
     },
     [setWorkspaceStatuses, workspaceStatuses]
   )
@@ -372,6 +388,7 @@ export default function WorkspaceKanbanDrawer({
       const [moved] = next.splice(index, 1)
       next.splice(nextIndex, 0, moved)
       setWorkspaceStatuses(next)
+      useAppStore.getState().recordFeatureInteraction('workspace-board-actions')
     },
     [setWorkspaceStatuses, workspaceStatuses]
   )
@@ -382,6 +399,7 @@ export default function WorkspaceKanbanDrawer({
       ...workspaceStatuses,
       { id: makeWorkspaceStatusId(label, workspaceStatuses), label }
     ])
+    useAppStore.getState().recordFeatureInteraction('workspace-board-actions')
   }, [setWorkspaceStatuses, workspaceStatuses])
 
   const handleRemoveStatus = useCallback(
@@ -396,6 +414,7 @@ export default function WorkspaceKanbanDrawer({
       const next = workspaceStatuses.filter((status) => status.id !== statusId)
       const fallbackStatus = next[Math.min(index, next.length - 1)]?.id ?? next[0]!.id
       setWorkspaceStatuses(next)
+      useAppStore.getState().recordFeatureInteraction('workspace-board-actions')
       for (const worktree of allWorktrees) {
         if (getWorkspaceStatus(worktree, workspaceStatuses) === statusId) {
           void updateWorktreeMeta(worktree.id, { workspaceStatus: fallbackStatus })
@@ -449,7 +468,7 @@ export default function WorkspaceKanbanDrawer({
     : '0px'
 
   return (
-    <Sheet open={open} onOpenChange={onOpenChange} modal={false}>
+    <Sheet open={open} onOpenChange={handleSheetOpenChange} modal={false}>
       <SheetContent
         side="left"
         showCloseButton={false}
@@ -471,6 +490,29 @@ export default function WorkspaceKanbanDrawer({
           // its tooltip without hover and makes the drawer feel noisy.
           event.preventDefault()
         }}
+        onPointerDownOutside={(event) => {
+          const originalEvent = event.detail.originalEvent
+          const target = originalEvent.target
+          if (preserveOpenForMenu) {
+            event.preventDefault()
+            return
+          }
+          if (isWorkspaceBoardKeepOpenTarget(target)) {
+            event.preventDefault()
+            return
+          }
+          const liveDrawerLeft =
+            boardRef.current
+              ?.closest<HTMLElement>('[data-slot="sheet-content"]')
+              ?.getBoundingClientRect().left ?? drawerLeft
+          const pointerX =
+            'clientX' in originalEvent && typeof originalEvent.clientX === 'number'
+              ? originalEvent.clientX
+              : null
+          if (pointerX !== null && pointerX < liveDrawerLeft) {
+            event.preventDefault()
+          }
+        }}
         onInteractOutside={(event) => {
           const originalEvent = event.detail.originalEvent
           const target = originalEvent.target
@@ -488,7 +530,11 @@ export default function WorkspaceKanbanDrawer({
             boardRef.current
               ?.closest<HTMLElement>('[data-slot="sheet-content"]')
               ?.getBoundingClientRect().left ?? drawerLeft
-          if (originalEvent instanceof PointerEvent && originalEvent.clientX < liveDrawerLeft) {
+          const pointerX =
+            'clientX' in originalEvent && typeof originalEvent.clientX === 'number'
+              ? originalEvent.clientX
+              : null
+          if (pointerX !== null && pointerX < liveDrawerLeft) {
             // Why: keep the workspace sidebar interactive while the companion board stays open.
             event.preventDefault()
           }
@@ -498,7 +544,10 @@ export default function WorkspaceKanbanDrawer({
           selectedCount={selectedWorktrees.length}
           compact={workspaceBoardCompact}
           workspaceStatuses={workspaceStatuses}
-          onCompactChange={setWorkspaceBoardCompact}
+          onCompactChange={(compact) => {
+            useAppStore.getState().recordFeatureInteraction('workspace-board-actions')
+            setWorkspaceBoardCompact(compact)
+          }}
           onRenameStatus={handleRenameStatus}
           onChangeStatusColor={handleChangeStatusColor}
           onChangeStatusIcon={handleChangeStatusIcon}

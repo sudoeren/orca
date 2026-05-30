@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   Accessibility,
   Bluetooth,
@@ -20,35 +20,7 @@ import type {
   DeveloperPermissionStatus
 } from '../../../../shared/developer-permissions-types'
 import { Button } from '../ui/button'
-import type { SettingsSearchEntry } from './settings-search'
-
-export const DEVELOPER_PERMISSIONS_PANE_SEARCH_ENTRIES: SettingsSearchEntry[] = [
-  {
-    title: 'Developer Permissions',
-    description: 'macOS permissions for terminal-launched developer tools.',
-    keywords: ['permissions', 'privacy', 'tcc', 'macos', 'developer tools']
-  },
-  {
-    title: 'Microphone and Camera',
-    description: 'Allow voice, transcription, webcam, and media capture tools.',
-    keywords: ['microphone', 'camera', 'voice', 'audio', 'video', 'sox', 'ffmpeg', 'whisper']
-  },
-  {
-    title: 'Screen Recording and Accessibility',
-    description: 'Allow screenshots, screen inspection, keystrokes, and window automation.',
-    keywords: ['screen recording', 'accessibility', 'screenshot', 'automation', 'window']
-  },
-  {
-    title: 'Full Disk Access',
-    description: 'Open the macOS privacy pane for broad terminal file access.',
-    keywords: ['full disk access', 'documents', 'downloads', 'desktop', 'icloud']
-  },
-  {
-    title: 'Local Network, USB, and Bluetooth',
-    description: 'Allow device and local-network tools used from terminal sessions.',
-    keywords: ['local network', 'usb', 'bluetooth', 'bonjour', 'mdns', 'device']
-  }
-]
+export { DEVELOPER_PERMISSIONS_PANE_SEARCH_ENTRIES } from './developer-permissions-search'
 
 type PermissionDefinition = {
   id: DeveloperPermissionId
@@ -158,20 +130,39 @@ export function DeveloperPermissionsPane(): React.JSX.Element {
   const [states, setStates] = useState<DeveloperPermissionState[]>([])
   const [loading, setLoading] = useState(true)
   const [pendingId, setPendingId] = useState<DeveloperPermissionId | null>(null)
+  const mountedRef = useRef(true)
+  const refreshSequenceRef = useRef(0)
 
   const stateById = useMemo(
     () => new Map(states.map((state) => [state.id, state.status] as const)),
     [states]
   )
 
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      refreshSequenceRef.current += 1
+    }
+  }, [])
+
   const refresh = useCallback(async (): Promise<void> => {
+    const refreshId = refreshSequenceRef.current + 1
+    refreshSequenceRef.current = refreshId
     setLoading(true)
     try {
-      setStates(await window.api.developerPermissions.getStatus())
+      const nextStates = await window.api.developerPermissions.getStatus()
+      if (mountedRef.current && refreshId === refreshSequenceRef.current) {
+        setStates(nextStates)
+      }
     } catch {
-      toast.error('Could not load developer permissions')
+      if (mountedRef.current && refreshId === refreshSequenceRef.current) {
+        toast.error('Could not load developer permissions')
+      }
     } finally {
-      setLoading(false)
+      if (mountedRef.current && refreshId === refreshSequenceRef.current) {
+        setLoading(false)
+      }
     }
   }, [])
 
@@ -195,7 +186,13 @@ export function DeveloperPermissionsPane(): React.JSX.Element {
     setPendingId(id)
     try {
       const result = await window.api.developerPermissions.request({ id })
+      if (!mountedRef.current) {
+        return
+      }
       await refresh()
+      if (!mountedRef.current) {
+        return
+      }
       if (result.status === 'granted') {
         toast.success('Permission granted')
       } else if (result.openedSystemSettings) {
@@ -204,9 +201,13 @@ export function DeveloperPermissionsPane(): React.JSX.Element {
         toast.message('Permission request sent')
       }
     } catch {
-      toast.error('Could not request permission')
+      if (mountedRef.current) {
+        toast.error('Could not request permission')
+      }
     } finally {
-      setPendingId(null)
+      if (mountedRef.current) {
+        setPendingId(null)
+      }
     }
   }
 

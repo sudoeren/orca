@@ -17,6 +17,7 @@ import { toast } from 'sonner'
 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { LinearIssueTextEditor } from '@/components/LinearIssueTextEditor'
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from '@/components/ui/sheet'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
@@ -24,6 +25,7 @@ import { VisuallyHidden } from 'radix-ui'
 import CommentMarkdown from '@/components/sidebar/CommentMarkdown'
 import { cn } from '@/lib/utils'
 import { useAppStore } from '@/store'
+import { getScreenSubmitShortcutLabel, isScreenSubmitShortcut } from '@/lib/screen-submit-shortcut'
 import { createBrowserUuid } from '@/lib/browser-uuid'
 import {
   useTeamStates,
@@ -42,8 +44,6 @@ import {
   linearIssueComments,
   linearUpdateIssue
 } from '@/runtime/runtime-linear-client'
-
-const IS_MAC = navigator.userAgent.includes('Mac')
 
 function LinearIcon({ className }: { className?: string }): React.JSX.Element {
   return (
@@ -949,9 +949,17 @@ export function LinearIssueCommentFooter({
   variant?: 'compact' | 'linear-page'
 }): React.JSX.Element {
   const settings = useAppStore((s) => s.settings)
+  const submitShortcutLabel = getScreenSubmitShortcutLabel()
   const [body, setBody] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const mountedRef = useRef(true)
+
+  const handleFooterRef = useCallback((node: HTMLDivElement | null): void => {
+    // Why: comment submission can resolve after the footer unmounts; the root
+    // ref keeps that completion from writing stale local state without an Effect.
+    mountedRef.current = node !== null
+  }, [])
 
   const autoGrow = useCallback(() => {
     const el = textareaRef.current
@@ -971,6 +979,9 @@ export function LinearIssueCommentFooter({
     try {
       const result = await linearAddIssueComment(settings, issueId, trimmed, workspaceId)
       const typed = result as { ok: boolean; id?: string; error?: string }
+      if (!mountedRef.current) {
+        return
+      }
       if (typed.ok) {
         setBody('')
         onCommentAdded({
@@ -982,16 +993,19 @@ export function LinearIssueCommentFooter({
         toast.error(typed.error ?? 'Failed to add comment')
       }
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to add comment')
+      if (mountedRef.current) {
+        toast.error(err instanceof Error ? err.message : 'Failed to add comment')
+      }
     } finally {
-      setSubmitting(false)
+      if (mountedRef.current) {
+        setSubmitting(false)
+      }
     }
   }, [body, issueId, onCommentAdded, settings, workspaceId])
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      const mod = IS_MAC ? e.metaKey : e.ctrlKey
-      if (e.key === 'Enter' && mod) {
+      if (isScreenSubmitShortcut(e)) {
         e.preventDefault()
         handleSubmit()
       }
@@ -1001,7 +1015,10 @@ export function LinearIssueCommentFooter({
 
   if (variant === 'linear-page') {
     return (
-      <div className="rounded-xl border border-border/70 bg-background shadow-xs">
+      <div
+        ref={handleFooterRef}
+        className="rounded-xl border border-border/70 bg-background shadow-xs"
+      >
         <textarea
           ref={textareaRef}
           value={body}
@@ -1016,7 +1033,7 @@ export function LinearIssueCommentFooter({
         />
         <div className="flex items-center justify-between px-4 pb-3">
           <span className="text-[11px] text-muted-foreground">
-            {IS_MAC ? '⌘' : 'Ctrl'} Enter to comment
+            {submitShortcutLabel !== 'Unassigned' ? `${submitShortcutLabel} to comment` : ''}
           </span>
           <Button
             size="icon-sm"
@@ -1036,7 +1053,10 @@ export function LinearIssueCommentFooter({
   }
 
   return (
-    <div className="flex items-end gap-2 border-t border-border/60 bg-background/40 px-4 py-3">
+    <div
+      ref={handleFooterRef}
+      className="flex items-end gap-2 border-t border-border/60 bg-background/40 px-4 py-3"
+    >
       <textarea
         ref={textareaRef}
         value={body}
@@ -1096,6 +1116,14 @@ export default function LinearItemDrawer({
     setFullIssue((prev) => (prev ? { ...prev, ...patch } : prev))
     setEditState((prev) => (prev ? { ...prev, ...patch } : prev))
   }, [])
+
+  const handleIssueTextChange = useCallback(
+    (patch: Partial<Pick<LinearIssue, 'title' | 'description'>>) => {
+      hasEditedRef.current = true
+      setFullIssue((prev) => (prev ? { ...prev, ...patch } : prev))
+    },
+    []
+  )
 
   // Why: the list view may not include the full description. Re-fetch
   // the issue by ID and its comments to populate the drawer.
@@ -1171,7 +1199,9 @@ export default function LinearItemDrawer({
     }
     let cancelled = false
     let count = 0
+    let frameId: number | null = null
     const tick = (): void => {
+      frameId = null
       if (cancelled) {
         return
       }
@@ -1179,12 +1209,15 @@ export default function LinearItemDrawer({
         document.body.style.pointerEvents = ''
       }
       if (count++ < 5) {
-        requestAnimationFrame(tick)
+        frameId = requestAnimationFrame(tick)
       }
     }
     tick()
     return () => {
       cancelled = true
+      if (frameId !== null) {
+        cancelAnimationFrame(frameId)
+      }
     }
   }, [issue?.id])
 
@@ -1228,9 +1261,14 @@ export default function LinearItemDrawer({
                   <span className="font-mono text-[12px] text-muted-foreground">
                     {displayed.identifier}
                   </span>
-                  <h2 className="mt-1 text-[15px] font-semibold leading-tight text-foreground">
-                    {displayed.title}
-                  </h2>
+                  <div className="mt-1">
+                    <LinearIssueTextEditor
+                      issue={displayed}
+                      onIssueChange={handleIssueTextChange}
+                      density="drawer"
+                      fields="title"
+                    />
+                  </div>
                   <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
                     {displayed.workspaceName && <span>{displayed.workspaceName}</span>}
                     {displayed.team?.name && <span>{displayed.team.name}</span>}
@@ -1286,14 +1324,12 @@ export default function LinearItemDrawer({
             {/* Body + comments */}
             <div className="min-h-0 flex-1 overflow-y-auto scrollbar-sleek">
               <div className="px-4 py-4">
-                {displayed.description?.trim() ? (
-                  <CommentMarkdown
-                    content={displayed.description}
-                    className="text-[14px] leading-relaxed"
-                  />
-                ) : (
-                  <span className="italic text-muted-foreground">No description provided.</span>
-                )}
+                <LinearIssueTextEditor
+                  issue={displayed}
+                  onIssueChange={handleIssueTextChange}
+                  density="drawer"
+                  fields="description"
+                />
               </div>
 
               <div className="border-t border-border/40 px-4 py-4">

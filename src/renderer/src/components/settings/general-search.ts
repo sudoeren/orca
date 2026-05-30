@@ -61,15 +61,34 @@ export const GENERAL_EDITOR_SEARCH_ENTRIES: SettingsSearchEntry[] = [
   }
 ]
 
+export const GENERAL_NAVIGATION_SEARCH_ENTRIES: SettingsSearchEntry[] = [
+  {
+    title: 'Tab Order',
+    description: 'Recent or tab strip.',
+    keywords: [
+      'recent tab order',
+      'tab',
+      'ctrl',
+      'control',
+      'recent',
+      'mru',
+      'sequential',
+      'switch'
+    ]
+  }
+]
+
 export const GENERAL_CLI_SEARCH_ENTRIES: SettingsSearchEntry[] = [
   {
-    title: 'Shell command',
-    description: 'Register or remove the orca shell command.',
-    keywords: ['cli', 'path', 'terminal', 'command']
+    title: 'Orca CLI',
+    description: 'Register or remove the Orca CLI command.',
+    keywords: ['cli', 'path', 'terminal', 'command', 'shell command'],
+    cmdJKeywords: ['cli', 'path', 'command', 'shell command'],
+    targetSectionId: 'cli'
   },
   {
     title: 'Agent skill',
-    description: 'Install the Orca skill so agents know to use the orca CLI.',
+    description: 'Install the Orca skill so agents know to use the Orca CLI.',
     keywords: ['skill', 'agents', 'npx']
   }
 ]
@@ -98,9 +117,12 @@ export const GENERAL_AGENT_SEARCH_ENTRIES: SettingsSearchEntry[] = [
       'agent',
       'default',
       'claude',
+      'openclaude',
+      'open claude',
       'codex',
       'opencode',
       'pi',
+      'omp',
       'gemini',
       'aider',
       'copilot',
@@ -119,6 +141,7 @@ export const GENERAL_SUPPORT_SEARCH_ENTRIES: SettingsSearchEntry[] = [
 
 export const GENERAL_PANE_SEARCH_ENTRIES: SettingsSearchEntry[] = [
   ...GENERAL_WORKSPACE_SEARCH_ENTRIES,
+  ...GENERAL_NAVIGATION_SEARCH_ENTRIES,
   ...GENERAL_EDITOR_SEARCH_ENTRIES,
   ...GENERAL_CLI_SEARCH_ENTRIES,
   ...GENERAL_CACHE_TIMER_SEARCH_ENTRIES,

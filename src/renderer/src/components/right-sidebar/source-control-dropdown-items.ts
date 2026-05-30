@@ -2,21 +2,28 @@
 // Why: split from source-control-primary-action because the primary and dropdown are independent derivations with different priority ladders; together they exceed the max-lines budget and tangle unrelated concerns.
 
 import type { PrimaryActionInputs } from './source-control-primary-action'
+import type { GitConflictOperation } from '../../../../shared/types'
 import { shouldForcePushWithLeaseForUpstream } from '../../../../shared/git-upstream-status'
 
 export type DropdownActionInputs = PrimaryActionInputs & {
+  conflictOperation?: GitConflictOperation
   isPullRequestOperationActive?: boolean
+  rebaseBaseRef?: string | null
 }
 
 export type DropdownActionKind =
   | 'commit'
   | 'commit_push'
   | 'commit_sync'
+  | 'abort_merge'
+  | 'abort_rebase'
   | 'create_pr'
   | 'push_create_pr'
   | 'push'
   | 'pull'
+  | 'fast_forward'
   | 'sync'
+  | 'rebase_base'
   | 'fetch'
   | 'publish'
 
@@ -26,6 +33,7 @@ export type DropdownItem = {
   title: string
   disabled: boolean
   hint?: string
+  variant?: 'default' | 'destructive'
 }
 
 export type DropdownSeparator = { kind: 'separator' }
@@ -38,6 +46,10 @@ function describePushCount(ahead: number): string {
 
 function describePullCount(behind: number): string {
   return `Pull ${behind} commit${behind === 1 ? '' : 's'}`
+}
+
+function describeFastForwardCount(behind: number): string {
+  return `Fast-forward ${behind} commit${behind === 1 ? '' : 's'}`
 }
 
 function describeSyncCounts(ahead: number, behind: number): string {
@@ -63,6 +75,10 @@ function formatForcePushTitle(branchCommitsAhead: number | undefined, upstreamNa
   return `Remote only has older copies of local commits. Force push ${countText} with lease to update ${upstreamName ?? 'the remote branch'}.`
 }
 
+function formatRebaseBaseRef(baseRef: string): string {
+  return baseRef.replace(/^refs\/remotes\//, '').replace(/^remotes\//, '')
+}
+
 /**
  * Resolve the chevron dropdown items. Every item is always rendered so the
  * menu shape stays stable across states; inapplicable rows are disabled
@@ -80,11 +96,14 @@ export function resolveDropdownItems(inputs: DropdownActionInputs): DropdownEntr
     prState,
     isPRStateLoading,
     hostedReviewCreation,
+    conflictOperation = 'unknown',
     branchCommitsAhead,
+    rebaseBaseRef,
     isPullRequestOperationActive = false
   } = inputs
 
   const hasStaged = stagedCount > 0
+  const hasDirtyLocalChanges = hasStaged || inputs.hasUnstagedChanges
   // Why: mirror the primary-action guard. When upstreamStatus is undefined,
   // fetchUpstreamStatus hasn't resolved for this worktree yet. Collapsing that
   // to hasUpstream=false would re-enable Publish Branch on an already-tracked
@@ -223,7 +242,7 @@ export function resolveDropdownItems(inputs: DropdownActionInputs): DropdownEntr
               : behind > 0 && ahead > 0
                 ? 'Sync first to pull remote changes before pushing'
                 : ahead === 0
-                  ? 'Nothing to push'
+                  ? `Nothing to push${upstreamStatus?.upstreamName ? ` to ${upstreamStatus.upstreamName}` : ''}`
                   : describePushCount(ahead),
     disabled:
       globalBusy ||
@@ -253,6 +272,33 @@ export function resolveDropdownItems(inputs: DropdownActionInputs): DropdownEntr
       globalBusy || upstreamLoading || !hasUpstream || behind === 0 || shouldForcePushWithLease
   }
 
+  const fastForwardItem: DropdownItem = {
+    kind: 'fast_forward',
+    label: formatCountLabel('Fast-forward', behind),
+    title: upstreamLoading
+      ? 'Checking branch status…'
+      : publishBlockedByPRLoading
+        ? 'Checking PR status…'
+        : publishBlockedByMergedPR
+          ? 'PR is already merged'
+          : !hasUpstream
+            ? 'Publish the branch first to fast-forward'
+            : shouldForcePushWithLease
+              ? 'Nothing new to fast-forward — remote only has older copies of local commits'
+              : behind === 0
+                ? 'Nothing to fast-forward'
+                : ahead > 0
+                  ? 'Local commits prevent a fast-forward pull'
+                  : describeFastForwardCount(behind),
+    disabled:
+      globalBusy ||
+      upstreamLoading ||
+      !hasUpstream ||
+      behind === 0 ||
+      ahead > 0 ||
+      shouldForcePushWithLease
+  }
+
   const syncItem: DropdownItem = {
     kind: 'sync',
     label: formatSyncLabel('Sync', ahead, behind),
@@ -275,6 +321,31 @@ export function resolveDropdownItems(inputs: DropdownActionInputs): DropdownEntr
       !hasUpstream ||
       shouldForcePushWithLease ||
       (ahead === 0 && behind === 0)
+  }
+
+  const rebaseBaseLabel = rebaseBaseRef ? formatRebaseBaseRef(rebaseBaseRef) : null
+  const hasRemoteBaseRef = rebaseBaseLabel?.includes('/') === true
+  const rebaseItem: DropdownItem = {
+    kind: 'rebase_base',
+    label: rebaseBaseLabel ? `Rebase from ${rebaseBaseLabel}` : 'Rebase from Base',
+    title: (() => {
+      if (!rebaseBaseLabel || !hasRemoteBaseRef) {
+        return 'Choose a remote base branch to rebase from'
+      }
+      if (hasUnresolvedConflicts) {
+        return 'Resolve conflicts before rebasing'
+      }
+      if (hasDirtyLocalChanges) {
+        return 'Commit or stash local changes before rebasing'
+      }
+      return `Rebase current branch with latest commits from ${rebaseBaseLabel}`
+    })(),
+    disabled:
+      globalBusy ||
+      !rebaseBaseRef ||
+      !hasRemoteBaseRef ||
+      hasUnresolvedConflicts ||
+      hasDirtyLocalChanges
   }
 
   const fetchItem: DropdownItem = {
@@ -376,10 +447,26 @@ export function resolveDropdownItems(inputs: DropdownActionInputs): DropdownEntr
     createPRItem,
     pushCreatePRItem,
     pullItem,
+    fastForwardItem,
     syncItem,
+    rebaseItem,
     fetchItem,
     publishItem
   ]
+  if (conflictOperation === 'merge' || conflictOperation === 'rebase') {
+    const isRebase = conflictOperation === 'rebase'
+    const label = isRebase ? 'Abort rebase' : 'Abort merge'
+    entries.push(
+      { kind: 'separator' },
+      {
+        kind: isRebase ? 'abort_rebase' : 'abort_merge',
+        label,
+        title: globalBusy ? 'Operation in progress…' : `Abort the ${conflictOperation} in progress`,
+        disabled: globalBusy,
+        variant: 'destructive'
+      }
+    )
+  }
   if (!isPullRequestOperationActive) {
     return entries
   }

@@ -19,6 +19,7 @@ import {
 import { useAppStore } from '../../store'
 import { Button } from '../ui/button'
 import { Input } from '../ui/input'
+import { useMountedRef } from '@/hooks/useMountedRef'
 import {
   Dialog,
   DialogContent,
@@ -27,7 +28,7 @@ import {
   DialogHeader,
   DialogTitle
 } from '../ui/dialog'
-import type { SettingsSearchEntry } from './settings-search'
+export { INTEGRATIONS_PANE_SEARCH_ENTRIES } from './integrations-search'
 
 function LinearIcon({ className }: { className?: string }): React.JSX.Element {
   return (
@@ -36,39 +37,6 @@ function LinearIcon({ className }: { className?: string }): React.JSX.Element {
     </svg>
   )
 }
-
-export const INTEGRATIONS_PANE_SEARCH_ENTRIES: SettingsSearchEntry[] = [
-  {
-    title: 'GitHub Integration',
-    description: 'GitHub authentication via the gh CLI.',
-    keywords: ['github', 'gh', 'integration']
-  },
-  {
-    title: 'GitLab Integration',
-    description: 'GitLab authentication via the glab CLI.',
-    keywords: ['gitlab', 'glab', 'integration', 'mr', 'merge request']
-  },
-  {
-    title: 'Bitbucket Integration',
-    description: 'Bitbucket Cloud authentication via API token environment variables.',
-    keywords: ['bitbucket', 'integration', 'pull request', 'api token']
-  },
-  {
-    title: 'Azure DevOps Integration',
-    description: 'Azure DevOps Repos authentication via token environment variables.',
-    keywords: ['azure devops', 'azure repos', 'ado', 'integration', 'pull request', 'api token']
-  },
-  {
-    title: 'Gitea Integration',
-    description: 'Gitea authentication via API token environment variables.',
-    keywords: ['gitea', 'self-hosted', 'integration', 'pull request', 'api token']
-  },
-  {
-    title: 'Linear Integration',
-    description: 'Connect Linear to browse and link issues.',
-    keywords: ['linear', 'integration', 'api key', 'connect', 'disconnect']
-  }
-]
 
 type GhStatus = 'checking' | 'connected' | 'not-installed' | 'not-authenticated'
 // Why: parallel to GhStatus — GitLab uses glab and the same three failure
@@ -129,6 +97,7 @@ export function IntegrationsPane(): React.JSX.Element {
   const refreshPreflightStatus = useAppStore((s) => s.refreshPreflightStatus)
   const testLinearConnection = useAppStore((s) => s.testLinearConnection)
   const linearWorkspaces = linearStatus.workspaces ?? []
+  const mountedRef = useMountedRef()
 
   const [ghStatus, setGhStatus] = useState<GhStatus>('checking')
   const [glabStatus, setGlabStatus] = useState<GlabStatus>('checking')
@@ -202,6 +171,9 @@ export function IntegrationsPane(): React.JSX.Element {
     setLinearConnectError(null)
     try {
       const result = await connectLinear(linearApiKeyDraft.trim())
+      if (!mountedRef.current) {
+        return
+      }
       if (result.ok) {
         setLinearApiKeyDraft('')
         setLinearConnectState('idle')
@@ -212,13 +184,18 @@ export function IntegrationsPane(): React.JSX.Element {
         setLinearConnectError(result.error)
       }
     } catch (error) {
-      setLinearConnectState('error')
-      setLinearConnectError(error instanceof Error ? error.message : 'Connection failed')
+      if (mountedRef.current) {
+        setLinearConnectState('error')
+        setLinearConnectError(error instanceof Error ? error.message : 'Connection failed')
+      }
     }
   }
 
   const handleLinearDisconnect = async (workspaceId?: string): Promise<void> => {
     await (workspaceId ? disconnectLinearWorkspace(workspaceId) : disconnectLinear())
+    if (!mountedRef.current) {
+      return
+    }
     setLinearConnectState('idle')
     setLinearConnectError(null)
     setLinearTestResultByWorkspace({})
@@ -236,6 +213,9 @@ export function IntegrationsPane(): React.JSX.Element {
       return next
     })
     const result = await testLinearConnection(workspaceId)
+    if (!mountedRef.current) {
+      return
+    }
     if (result.ok) {
       setLinearTestResultByWorkspace((prev) => ({
         ...prev,

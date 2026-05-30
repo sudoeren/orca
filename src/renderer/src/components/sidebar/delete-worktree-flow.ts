@@ -166,26 +166,25 @@ export function runWorktreeDeleteWithToast(
  * running the delete immediately with toast feedback, or opening the
  * confirmation modal.
  *
- * Why folder mode is handled at the call site: folder-repo removal branches
- * to a different modal (`confirm-remove-folder`) and the folder-vs-git
- * determination requires the full Worktree record's repoId. Keeping that
- * decision adjacent to the caller (rather than branching inside this helper)
- * avoids bleeding folder-mode concerns into what is otherwise a simple
- * skip-confirm-vs-modal decision, and lets the context menu short-circuit
- * before ever entering this funnel.
- *
- * The main-worktree / missing-record guard here is defense-in-depth — the
- * caller is responsible for disabling UI when this is known ahead of time,
- * but we still refuse to act if the record disappeared between render and
- * click (e.g. a concurrent delete or state reset).
+ * The missing-record guard here is defense-in-depth — the caller is
+ * responsible for disabling UI when this is known ahead of time, but we still
+ * refuse to act if the record disappeared between render and click (e.g. a
+ * concurrent delete or state reset).
  */
 export function runWorktreeDelete(worktreeId: string): void {
   const state = useAppStore.getState()
   const target = getWorktreeMapFromState(state).get(worktreeId) ?? null
-  // Guard: main worktrees cannot be deleted, and a missing record means the
-  // worktree was removed out from under us — either way, no-op silently
-  // rather than opening a modal with stale/invalid context.
-  if (!target || target.isMainWorktree) {
+  if (!target) {
+    return
+  }
+  if (target.isMainWorktree) {
+    const repo = state.repos.find((entry) => entry.id === target.repoId)
+    // Why: git refuses to delete the primary checkout, but users can still
+    // remove the owning project from Orca without deleting disk contents.
+    state.openModal('confirm-remove-folder', {
+      repoId: target.repoId,
+      displayName: repo?.displayName ?? target.displayName
+    })
     return
   }
   state.clearWorktreeDeleteState(worktreeId)

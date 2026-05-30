@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import {
   hasSleepableWorkspaceActivity,
+  isContextWorktreeDeletable,
   shouldUseNativeContextMenu,
   shouldIgnoreNestedWorktreeContextMenuScope,
-  shouldSuppressContextMenuFollowUpClick
+  shouldRemoveProjectFromContextMenu,
+  shouldSuppressContextMenuFollowUpClick,
+  shouldContinueDeleteSiblingPositionRestore
 } from './WorktreeContextMenu'
 
 describe('shouldUseNativeContextMenu', () => {
@@ -92,6 +95,17 @@ describe('shouldSuppressContextMenuFollowUpClick', () => {
   })
 })
 
+describe('shouldContinueDeleteSiblingPositionRestore', () => {
+  it('stops once the delete row position has settled even when the row remains mounted', () => {
+    expect(
+      shouldContinueDeleteSiblingPositionRestore({
+        attempts: 6,
+        stableFrames: 6
+      })
+    ).toBe(false)
+  })
+})
+
 describe('hasSleepableWorkspaceActivity', () => {
   it('treats preserved empty PTY arrays as slept, not live', () => {
     expect(
@@ -111,5 +125,25 @@ describe('hasSleepableWorkspaceActivity', () => {
     expect(hasSleepableWorkspaceActivity('wt-1', {}, {}, { 'wt-1': [{ id: 'browser-1' }] })).toBe(
       true
     )
+  })
+})
+
+describe('project removal from workspace context menus', () => {
+  it('routes primary workspace rows to project removal in non-repo grouped views', () => {
+    const gitRepo = { id: 'repo-1' }
+    const folderRepo = { id: 'folder-1' }
+
+    expect(shouldRemoveProjectFromContextMenu(gitRepo, { isMainWorktree: true })).toBe(true)
+    expect(shouldRemoveProjectFromContextMenu(folderRepo, { isMainWorktree: true })).toBe(true)
+    expect(shouldRemoveProjectFromContextMenu(gitRepo, { isMainWorktree: false })).toBe(false)
+    expect(shouldRemoveProjectFromContextMenu(null, { isMainWorktree: true })).toBe(false)
+  })
+
+  it('treats additional folder workspace rows as deletable workspace rows', () => {
+    const folderRepo = { kind: 'folder' as const }
+
+    expect(isContextWorktreeDeletable({ isMainWorktree: false }, folderRepo)).toBe(true)
+    expect(isContextWorktreeDeletable({ isMainWorktree: true }, folderRepo)).toBe(false)
+    expect(isContextWorktreeDeletable({ isMainWorktree: false }, null)).toBe(false)
   })
 })

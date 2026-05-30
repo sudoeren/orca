@@ -2111,6 +2111,78 @@ describe('createGitHubSlice.refreshGitHubForWorktreeIfStale', () => {
     expect(mockApi.gh.enqueuePRRefresh).not.toHaveBeenCalled()
   })
 
+  it('does not fetch linked issue details when the issue card section is hidden', async () => {
+    const store = createTestStore()
+    const repoPath = '/repo'
+    const branch = 'feature/test'
+    const worktreeId = 'wt-1'
+
+    store.setState({
+      repos: [{ id: 'repo-1', path: repoPath, name: 'repo', kind: 'git' }],
+      groupBy: 'repo',
+      worktreeCardProperties: ['comment'],
+      rightSidebarOpen: false,
+      worktreesByRepo: {
+        'repo-1': [
+          {
+            id: worktreeId,
+            repoId: 'repo-1',
+            path: '/repo/worktrees/test',
+            branch,
+            displayName: 'test',
+            isMainWorktree: false,
+            isBare: false,
+            isArchived: false,
+            linkedIssue: 123
+          }
+        ]
+      }
+    } as unknown as Partial<AppState>)
+
+    store.getState().refreshGitHubForWorktreeIfStale(worktreeId)
+    await Promise.resolve()
+
+    expect(mockApi.gh.issue).not.toHaveBeenCalled()
+  })
+
+  it('fetches linked issue details when the issue card section is visible', async () => {
+    const store = createTestStore()
+    const repoPath = '/repo'
+    const branch = 'feature/test'
+    const worktreeId = 'wt-1'
+
+    store.setState({
+      repos: [{ id: 'repo-1', path: repoPath, name: 'repo', kind: 'git' }],
+      groupBy: 'repo',
+      worktreeCardProperties: ['issue'],
+      rightSidebarOpen: false,
+      worktreesByRepo: {
+        'repo-1': [
+          {
+            id: worktreeId,
+            repoId: 'repo-1',
+            path: '/repo/worktrees/test',
+            branch,
+            displayName: 'test',
+            isMainWorktree: false,
+            isBare: false,
+            isArchived: false,
+            linkedIssue: 123
+          }
+        ]
+      }
+    } as unknown as Partial<AppState>)
+
+    store.getState().refreshGitHubForWorktreeIfStale(worktreeId)
+    await Promise.resolve()
+
+    expect(mockApi.gh.issue).toHaveBeenCalledWith({
+      repoPath,
+      repoId: 'repo-1',
+      number: 123
+    })
+  })
+
   it('enqueues active PR refresh IPC for connected SSH-backed repos', () => {
     const store = createTestStore()
     const repoPath = '/repo'
@@ -2169,6 +2241,7 @@ describe('createGitHubSlice.refreshGitHubForWorktreeIfStale', () => {
       repos: [{ id: 'repo-1', path: repoPath, name: 'repo', kind: 'git' }],
       groupBy: 'repo',
       worktreeCardProperties: ['comment'],
+      activeWorktreeId: worktreeId,
       rightSidebarOpen: true,
       rightSidebarTab: 'source-control',
       worktreesByRepo: {
@@ -2324,6 +2397,7 @@ describe('createGitHubSlice.refreshAllGitHub', () => {
       repos: [{ id: 'repo-1', path: repoPath, name: 'repo', kind: 'git' }],
       groupBy: 'repo',
       worktreeCardProperties: ['comment'],
+      activeWorktreeId: 'wt-1',
       rightSidebarOpen: true,
       rightSidebarTab: 'source-control',
       worktreesByRepo: {
@@ -2368,6 +2442,7 @@ describe('createGitHubSlice.refreshAllGitHub', () => {
       repos: [{ id: 'repo-1', path: repoPath, name: 'repo', kind: 'git' }],
       groupBy: 'repo',
       worktreeCardProperties: ['comment'],
+      activeWorktreeId: 'wt-1',
       rightSidebarOpen: true,
       rightSidebarTab: 'source-control',
       worktreesByRepo: {
@@ -2396,6 +2471,78 @@ describe('createGitHubSlice.refreshAllGitHub', () => {
       method: 'github.prForBranch',
       params: { repo: 'repo-1', branch, linkedPRNumber: null },
       timeoutMs: 30_000
+    })
+  })
+
+  it('does not refresh stale linked issues when the issue card section is hidden', async () => {
+    const store = createTestStore()
+    const repoPath = '/repo'
+    const branch = 'feature/test'
+
+    store.setState({
+      repos: [{ id: 'repo-1', path: repoPath, name: 'repo', kind: 'git' }],
+      groupBy: 'repo',
+      worktreeCardProperties: ['comment'],
+      rightSidebarOpen: false,
+      worktreesByRepo: {
+        'repo-1': [
+          {
+            id: 'wt-1',
+            repoId: 'repo-1',
+            path: '/repo/worktrees/test',
+            branch,
+            displayName: 'test',
+            isMainWorktree: false,
+            isBare: false,
+            isArchived: false,
+            lastActivityAt: 1,
+            linkedIssue: 123
+          }
+        ]
+      }
+    } as unknown as Partial<AppState>)
+
+    store.getState().refreshAllGitHub()
+    await Promise.resolve()
+
+    expect(mockApi.gh.issue).not.toHaveBeenCalled()
+  })
+
+  it('refreshes stale linked issues when the issue card section is visible', async () => {
+    const store = createTestStore()
+    const repoPath = '/repo'
+    const branch = 'feature/test'
+
+    store.setState({
+      repos: [{ id: 'repo-1', path: repoPath, name: 'repo', kind: 'git' }],
+      groupBy: 'repo',
+      worktreeCardProperties: ['issue'],
+      rightSidebarOpen: false,
+      worktreesByRepo: {
+        'repo-1': [
+          {
+            id: 'wt-1',
+            repoId: 'repo-1',
+            path: '/repo/worktrees/test',
+            branch,
+            displayName: 'test',
+            isMainWorktree: false,
+            isBare: false,
+            isArchived: false,
+            lastActivityAt: 1,
+            linkedIssue: 123
+          }
+        ]
+      }
+    } as unknown as Partial<AppState>)
+
+    store.getState().refreshAllGitHub()
+    await Promise.resolve()
+
+    expect(mockApi.gh.issue).toHaveBeenCalledWith({
+      repoPath,
+      repoId: 'repo-1',
+      number: 123
     })
   })
 })
@@ -2536,6 +2683,91 @@ describe('createGitHubSlice.fetchWorkItems source/error envelope', () => {
     expect(mockApi.gh.listWorkItems).toHaveBeenCalledTimes(2)
     const after = store.getState().getWorkItemsSourcesAndError('repo-id', 24, '')
     expect(after.error).toBeNull()
+  })
+
+  it('threads noCache only when explicitly requested for work-item fetches', async () => {
+    const store = createTestStore()
+    mockApi.gh.listWorkItems
+      .mockResolvedValueOnce({
+        items: [],
+        sources: { issues: null, prs: null, upstreamCandidate: null }
+      })
+      .mockResolvedValueOnce({
+        items: [],
+        sources: { issues: null, prs: null, upstreamCandidate: null }
+      })
+      .mockResolvedValueOnce({
+        items: [],
+        sources: { issues: null, prs: null, upstreamCandidate: null }
+      })
+
+    await store.getState().fetchWorkItems('repo-normal', '/repo/normal', 24, '')
+    await store.getState().fetchWorkItems('repo-force', '/repo/force', 24, '', { force: true })
+    await store.getState().fetchWorkItems('repo-fresh', '/repo/fresh', 24, '', {
+      force: true,
+      noCache: true
+    })
+
+    expect(mockApi.gh.listWorkItems).toHaveBeenNthCalledWith(1, {
+      repoPath: '/repo/normal',
+      repoId: 'repo-normal',
+      limit: 24,
+      query: undefined
+    })
+    expect(mockApi.gh.listWorkItems).toHaveBeenNthCalledWith(2, {
+      repoPath: '/repo/force',
+      repoId: 'repo-force',
+      limit: 24,
+      query: undefined
+    })
+    expect(mockApi.gh.listWorkItems).toHaveBeenNthCalledWith(3, {
+      repoPath: '/repo/fresh',
+      repoId: 'repo-fresh',
+      limit: 24,
+      query: undefined,
+      noCache: true
+    })
+  })
+
+  it('does not dedupe a no-cache forced fetch onto a cacheable forced request', async () => {
+    const store = createTestStore()
+    type WorkItemsEnvelope = {
+      items: []
+      sources: { issues: null; prs: null; upstreamCandidate: null }
+    }
+    let resolveCacheable: (value: WorkItemsEnvelope) => void = () => {}
+    const cacheableRequest = new Promise<WorkItemsEnvelope>((resolve) => {
+      resolveCacheable = resolve
+    })
+    mockApi.gh.listWorkItems.mockReturnValueOnce(cacheableRequest).mockResolvedValueOnce({
+      items: [],
+      sources: { issues: null, prs: null, upstreamCandidate: null }
+    })
+
+    const landingProbe = store
+      .getState()
+      .fetchWorkItems('repo-id', '/repo', 24, '', { force: true })
+    await Promise.resolve()
+    const noCacheRefresh = store
+      .getState()
+      .fetchWorkItems('repo-id', '/repo', 24, '', { force: true, noCache: true })
+
+    expect(mockApi.gh.listWorkItems).toHaveBeenCalledTimes(1)
+    resolveCacheable({
+      items: [],
+      sources: { issues: null, prs: null, upstreamCandidate: null }
+    })
+    await landingProbe
+    await noCacheRefresh
+
+    expect(mockApi.gh.listWorkItems).toHaveBeenCalledTimes(2)
+    expect(mockApi.gh.listWorkItems).toHaveBeenNthCalledWith(2, {
+      repoPath: '/repo',
+      repoId: 'repo-id',
+      limit: 24,
+      query: undefined,
+      noCache: true
+    })
   })
 
   it('routes work item fetches through repo-scoped IPC even when a runtime is active', async () => {

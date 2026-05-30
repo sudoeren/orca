@@ -35,9 +35,11 @@ import {
 } from '../../../../shared/work-items'
 import { deriveCheckStatusFromChecks, syncPRChecksStatus } from './github-checks'
 import { callRuntimeRpc, getActiveRuntimeTarget } from '../../runtime/runtime-rpc-client'
+import { rightSidebarShowsPullRequestData } from '@/lib/right-sidebar-visibility'
 import { hostedReviewInfoFromGitHubPRInfo } from '../../../../shared/hosted-review-github'
 import { getHostedReviewCacheKey, linkedReviewHintKey } from './hosted-review-cache-identity'
 import { getGitHubPRCacheKey, getGitHubRepoCacheKey } from './github-cache-key'
+import { isMacAppDataPath } from '@/lib/passive-macos-app-data-access'
 
 // ─── ProjectV2 cache types ────────────────────────────────────────────
 // Why: declared separately from CacheEntry<T> (not a generified E parameter)
@@ -313,6 +315,7 @@ export type CacheEntry<T> = {
 
 type FetchOptions = {
   force?: boolean
+  noCache?: boolean
 }
 
 type RepoScopedFetchOptions = FetchOptions & {
@@ -352,6 +355,7 @@ const inflightCommentsRequests = new Map<string, Promise<PRComment[]>>()
 type InflightWorkItems = {
   promise: Promise<GitHubWorkItem[]>
   force: boolean
+  noCache: boolean
 }
 const inflightWorkItemsRequests = new Map<string, InflightWorkItems>()
 const prRequestGenerations = new Map<string, number>()
@@ -510,6 +514,9 @@ function buildPRRefreshCandidate(
 ): GitHubPRRefreshCandidate | null {
   const repo = state.repos.find((r) => r.id === worktree.repoId)
   if (!repo) {
+    return null
+  }
+  if (isMacAppDataPath(repoPath ?? repo.path)) {
     return null
   }
   const branch = worktree.branch.replace(/^refs\/heads\//, '')
@@ -930,6 +937,10 @@ function evictStaleEntries<T>(
   return pruned
 }
 
+function shouldRefreshIssueDecorations(state: AppState): boolean {
+  return (state.worktreeCardProperties ?? []).includes('issue')
+}
+
 let saveTimer: ReturnType<typeof setTimeout> | null = null
 
 function debouncedSaveCache(state: AppState): void {
@@ -1052,7 +1063,7 @@ export type GitHubSlice = {
    * Why: fan out a single work-item query across multiple repos. Partial
    * failures don't reject — a repo that both fails to fetch *and* has no
    * cached fallback contributes nothing and increments `failedCount`, which
-   * the caller surfaces as a "N of M repos failed to load" banner. A repo
+   * the caller surfaces as a "N of M projects failed to load" banner. A repo
    * served from stale cache on rejection is NOT counted as failed — matching
    * the single-repo behavior of quietly serving stale data.
    */
@@ -1639,12 +1650,9 @@ export const createGitHubSlice: StateCreator<AppState, [], [], GitHubSlice> = (s
     const existing = inflightWorkItemsRequests.get(key)
     if (existing) {
       // Why: a user-initiated refresh (force=true) must not silently dedupe to
-      // a non-forcing fetch already in flight — the result would be no fresher
-      // than what the user just asked to invalidate. Wait for the non-forcing
-      // request to settle (success or failure — we discard the result either
-      // way), then fall through to issue a new forced request. Non-forcing
-      // callers continue to dedupe onto any in-flight request as before.
-      if (options?.force && !existing.force) {
+      // a less-fresh fetch already in flight. noCache=true is stricter than a
+      // cacheable forced landing probe because it must bypass gh api's cache too.
+      if ((options?.force && !existing.force) || (options?.noCache && !existing.noCache)) {
         await existing.promise.catch(() => {})
       } else {
         return existing.promise
@@ -1658,7 +1666,8 @@ export const createGitHubSlice: StateCreator<AppState, [], [], GitHubSlice> = (s
           repoPath,
           repoId,
           limit,
-          query: query || undefined
+          query: query || undefined,
+          ...(options?.noCache ? { noCache: true } : {})
         })
         // Why: stamp repoId at the renderer fetch boundary so every downstream
         // consumer (cross-repo merge, row rendering, drawer) can rely on the
@@ -1711,7 +1720,8 @@ export const createGitHubSlice: StateCreator<AppState, [], [], GitHubSlice> = (s
 
     inflightWorkItemsRequests.set(key, {
       promise: request,
-      force: Boolean(options?.force)
+      force: Boolean(options?.force),
+      noCache: Boolean(options?.noCache)
     })
     return request
   },
@@ -1719,7 +1729,7 @@ export const createGitHubSlice: StateCreator<AppState, [], [], GitHubSlice> = (s
   fetchWorkItemsAcrossRepos: async (repos, perRepoLimit, displayLimit, query, options) => {
     const state = get()
     let failedCount = 0
-    const perRepoResults = await Promise.all(
+    const perProjectResults = await Promise.all(
       repos.map(async (r) => {
         try {
           return await state.fetchWorkItems(r.repoId, r.path, perRepoLimit, query, options)
@@ -1745,13 +1755,13 @@ export const createGitHubSlice: StateCreator<AppState, [], [], GitHubSlice> = (s
         }
       })
     )
-    const merged = sortWorkItemsByUpdatedAt(perRepoResults.flat()).slice(0, displayLimit)
+    const merged = sortWorkItemsByUpdatedAt(perProjectResults.flat()).slice(0, displayLimit)
     return { items: merged, failedCount }
   },
 
   fetchWorkItemsNextPage: async (repos, perRepoLimit, displayLimit, query, before) => {
     let failedCount = 0
-    const perRepoResults = await Promise.all(
+    const perProjectResults = await Promise.all(
       repos.map(async (r) => {
         await acquireWorkItemSlot()
         try {
@@ -1788,7 +1798,7 @@ export const createGitHubSlice: StateCreator<AppState, [], [], GitHubSlice> = (s
         }
       })
     )
-    const merged = sortWorkItemsByUpdatedAt(perRepoResults.flat()).slice(0, displayLimit)
+    const merged = sortWorkItemsByUpdatedAt(perProjectResults.flat()).slice(0, displayLimit)
     return { items: merged, failedCount }
   },
 
@@ -2497,10 +2507,9 @@ export const createGitHubSlice: StateCreator<AppState, [], [], GitHubSlice> = (s
     const now = Date.now()
     const stalePRCandidates: { candidate: GitHubPRRefreshCandidate; score: number }[] = []
     const cardProps = state.worktreeCardProperties ?? []
+    const shouldRefreshIssues = shouldRefreshIssueDecorations(state)
     const isPRStatusGrouping = state.groupBy === 'pr-status'
-    const rightSidebarShowsPR =
-      state.rightSidebarOpen &&
-      (state.rightSidebarTab === 'checks' || state.rightSidebarTab === 'source-control')
+    const rightSidebarShowsPR = rightSidebarShowsPullRequestData(state)
     const shouldRefreshPRs =
       isPRStatusGrouping ||
       rightSidebarShowsPR ||
@@ -2530,7 +2539,7 @@ export const createGitHubSlice: StateCreator<AppState, [], [], GitHubSlice> = (s
             }
           }
         }
-        if (wt.linkedIssue) {
+        if (shouldRefreshIssues && wt.linkedIssue) {
           const issueKey = repoScopedCacheKey(repo.path, repo.id, String(wt.linkedIssue))
           const issueEntry = state.issueCache[issueKey]
           if (!issueEntry || now - issueEntry.fetchedAt >= CACHE_TTL) {
@@ -2612,7 +2621,7 @@ export const createGitHubSlice: StateCreator<AppState, [], [], GitHubSlice> = (s
         }
       }
     }
-    if (worktree.linkedIssue) {
+    if (shouldRefreshIssueDecorations(state) && worktree.linkedIssue) {
       void get().fetchIssue(repo.path, worktree.linkedIssue, { repoId: repo.id })
     }
   },
@@ -2775,8 +2784,7 @@ export const createGitHubSlice: StateCreator<AppState, [], [], GitHubSlice> = (s
       state.groupBy === 'pr-status' ||
       cardProps.includes('pr') ||
       cardProps.includes('ci') ||
-      (state.rightSidebarOpen &&
-        (state.rightSidebarTab === 'checks' || state.rightSidebarTab === 'source-control'))
+      rightSidebarShowsPullRequestData(state)
 
     if (shouldRefreshPR && !worktree.isBare && branch) {
       const candidate = buildPRRefreshCandidate(state, worktree)
@@ -2795,7 +2803,7 @@ export const createGitHubSlice: StateCreator<AppState, [], [], GitHubSlice> = (s
       }
     }
 
-    if (worktree.linkedIssue) {
+    if (shouldRefreshIssueDecorations(state) && worktree.linkedIssue) {
       const issueKey = repoScopedCacheKey(repo.path, repo.id, String(worktree.linkedIssue))
       const issueEntry = state.issueCache[issueKey]
       if (!issueEntry || now - issueEntry.fetchedAt >= CACHE_TTL) {

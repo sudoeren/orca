@@ -4,7 +4,8 @@ import { existsSync, statSync } from 'fs'
 import { join, basename } from 'path'
 import { gitExecFileSync, gitExecFileAsync } from './runner'
 import type { BaseRefSearchResult } from '../../shared/types'
-import { buildHostedRemoteFileUrl } from './hosted-remote-url'
+import { buildHostedRemoteFileUrl, parseHostedRemote } from './hosted-remote-url'
+import { normalizeGitUsername } from './git-username'
 
 const GH_LOGIN_TIMEOUT_MS = 2500
 
@@ -88,12 +89,55 @@ export function getRepoName(path: string): string {
  */
 export function getRemoteUrl(path: string): string | null {
   try {
-    return gitExecFileSync(['remote', 'get-url', 'origin'], {
-      cwd: path
-    }).trim()
+    return getRemoteUrlByName(path, 'origin')
   } catch {
     return null
   }
+}
+
+function getRemoteUrlByName(path: string, remote: string): string {
+  return gitExecFileSync(['remote', 'get-url', remote], {
+    cwd: path
+  }).trim()
+}
+
+function listRemoteNamesSync(path: string): string[] {
+  try {
+    return gitExecFileSync(['remote'], { cwd: path })
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+  } catch {
+    return []
+  }
+}
+
+function getConfiguredBranchRemote(path: string, branch: string | null): string {
+  if (!branch) {
+    return ''
+  }
+  const remote = getGitConfigValue(path, `branch.${branch}.remote`)
+  return remote === '.' ? '' : remote
+}
+
+function getCurrentBranchName(path: string): string {
+  try {
+    return gitExecFileSync(['branch', '--show-current'], { cwd: path }).trim()
+  } catch {
+    return ''
+  }
+}
+
+function getRemoteNameFromRef(shortRef: string, remotes: readonly string[]): string {
+  const sortedRemotes = [...remotes].sort((a, b) => b.length - a.length)
+  return sortedRemotes.find((remote) => shortRef.startsWith(`${remote}/`)) ?? ''
+}
+
+function getDefaultBranchName(shortRef: string, remoteName: string): string {
+  if (!shortRef.includes('/')) {
+    return shortRef
+  }
+  return remoteName ? shortRef.slice(remoteName.length + 1) : shortRef.split('/').slice(1).join('/')
 }
 
 function getGitConfigValue(path: string, key: string): string {
@@ -104,16 +148,6 @@ function getGitConfigValue(path: string, key: string): string {
   } catch {
     return ''
   }
-}
-
-function normalizeUsername(value: string): string {
-  const trimmed = value.trim()
-  if (!trimmed) {
-    return ''
-  }
-
-  const localPart = trimmed.includes('@') ? trimmed.split('@')[0] : trimmed
-  return localPart.replace(/^\d+\+/, '')
 }
 
 let cachedGhLogin: string | undefined
@@ -142,7 +176,7 @@ function getGhLogin(): string {
       timeout: GH_LOGIN_TIMEOUT_MS
     }).trim()
     if (apiLogin) {
-      cachedGhLogin = normalizeUsername(apiLogin)
+      cachedGhLogin = normalizeGitUsername(apiLogin)
       return cachedGhLogin
     }
   } catch (err) {
@@ -169,12 +203,12 @@ function getGhLogin(): string {
       /Active account:\s+true[\s\S]*?account\s+([A-Za-z0-9-]+)/
     )
     if (activeAccountMatch?.[1]) {
-      cachedGhLogin = normalizeUsername(activeAccountMatch[1])
+      cachedGhLogin = normalizeGitUsername(activeAccountMatch[1])
       return cachedGhLogin
     }
 
     const accountMatch = output.match(/Logged in to github\.com account\s+([A-Za-z0-9-]+)/)
-    const login = normalizeUsername(accountMatch?.[1] ?? '')
+    const login = normalizeGitUsername(accountMatch?.[1] ?? '')
     if (login) {
       cachedGhLogin = login
     }
@@ -187,18 +221,60 @@ function getGhLogin(): string {
   }
 }
 
+function getGhLoginForGitHubRemote(path: string): string {
+  const remoteUrl = getGitHubRemoteUrlForGhLogin(path)
+  if (!remoteUrl) {
+    return ''
+  }
+  return getGhLogin()
+}
+
+function getGitHubRemoteUrlForGhLogin(path: string): string {
+  const remotes = listRemoteNamesSync(path)
+  const defaultBaseRef = getDefaultBaseRef(path)
+  const defaultBaseRemote = defaultBaseRef ? getRemoteNameFromRef(defaultBaseRef, remotes) : ''
+  const defaultBranch = defaultBaseRef
+    ? getDefaultBranchName(defaultBaseRef, defaultBaseRemote)
+    : null
+
+  const candidateRemotes = [
+    getConfiguredBranchRemote(path, getCurrentBranchName(path)),
+    getConfiguredBranchRemote(path, defaultBranch),
+    defaultBaseRemote,
+    'origin',
+    remotes.length === 1 ? remotes[0] : ''
+  ]
+
+  const seen = new Set<string>()
+  for (const remote of candidateRemotes) {
+    if (!remote || seen.has(remote)) {
+      continue
+    }
+    seen.add(remote)
+    try {
+      const remoteUrl = getRemoteUrlByName(path, remote)
+      if (parseHostedRemote(remoteUrl)?.provider === 'github') {
+        return remoteUrl
+      }
+    } catch {
+      // Missing candidate remotes are expected; try the next repo-level fallback.
+    }
+  }
+  // Why: `gh` reports a GitHub account. For GitLab/Bitbucket/self-hosted
+  // repos, using that identity would create the wrong provider prefix.
+  return ''
+}
+
 /**
- * Get the best username-style branch prefix for the repo.
+ * Get the GitHub/explicit username-style branch prefix for the repo.
  */
 export function getGitUsername(path: string): string {
-  return normalizeUsername(
+  // Why: this backs the "Git Username" branch-prefix setting. Commit author
+  // email/name are not hosted-account usernames, so keep them out of this path.
+  return normalizeGitUsername(
     getGitConfigValue(path, 'github.user') ||
       getGitConfigValue(path, 'user.username') ||
-      // Why: GitHub CLI login can touch network/keychain state. A repo-local
-      // email is already enough for the branch prefix and keeps repo add fast.
-      getGitConfigValue(path, 'user.email').split('@')[0] ||
-      getGhLogin() ||
-      getGitConfigValue(path, 'user.name')
+      getGhLoginForGitHubRemote(path)
   )
 }
 
@@ -385,12 +461,11 @@ async function getDefaultBaseRefAsync(path: string): Promise<string | null> {
  * `upstream/main`). The picker would otherwise structurally deny the
  * correct answer for fork contributors — see docs/upstream-base-ref-design.md.
  *
- * Why two remote globs for a single-segment query: `git for-each-ref`
- * uses fnmatch-style globs where `*` does NOT cross `/`. A single
- * `refs/remotes/*\/*<q>*` pattern only matches when `<q>` appears in the
- * branch-name segment, so typing `upstream` (a remote name) would return
- * nothing. The extra `refs/remotes/*<q>*\/*` glob matches when the query
- * appears in the remote-name segment, making remote-name filtering work.
+ * Why paired leaf/ancestor globs for a single-segment query: `git for-each-ref`
+ * uses fnmatch-style globs where `*` does NOT cross `/`. Slash-named branch
+ * refs need an ancestor-segment glob for `user` in `user/feature`, a leaf glob
+ * for `feature`, and the same remote-side shape so typing a remote name like
+ * `upstream` keeps working.
  *
  * Why the multi-segment branch: the picker displays results as
  * `upstream/main`, so users naturally retype that format. With a single
@@ -403,8 +478,39 @@ async function getDefaultBaseRefAsync(path: string): Promise<string | null> {
  * Why shared: the local path and the SSH relay path must send the exact
  * same argv so results cannot diverge between transports.
  */
-export function buildSearchBaseRefsArgv(normalizedQuery: string): string[] {
-  const base = ['for-each-ref', '--format=%(refname)%00%(refname:short)', '--sort=-committerdate']
+const REF_SEARCH_CANDIDATE_MULTIPLIER = 4
+const REF_SEARCH_LEGACY_HEADROOM = 100
+
+function getRefSearchCandidateCount(limit: number, excludesRemoteHead: boolean): number {
+  if (!Number.isInteger(limit) || limit <= 0) {
+    throw new Error('invalid_limit')
+  }
+  const baseCount = limit * REF_SEARCH_CANDIDATE_MULTIPLIER
+  return excludesRemoteHead ? baseCount : baseCount + REF_SEARCH_LEGACY_HEADROOM
+}
+
+export function buildSearchBaseRefsArgv(
+  normalizedQuery: string,
+  limit: number,
+  options: { excludeRemoteHead?: boolean } = {}
+): string[] {
+  const excludeRemoteHead = options.excludeRemoteHead ?? true
+  const candidateCount = getRefSearchCandidateCount(limit, excludeRemoteHead)
+  const base = [
+    'for-each-ref',
+    '--format=%(refname)%00%(refname:short)',
+    '--sort=-committerdate',
+    ...(excludeRemoteHead
+      ? [
+          // Why: exclude remote HEAD pseudo-refs before --count so the bounded
+          // candidate window is spent on refs the picker can actually display.
+          '--exclude=refs/remotes/**/HEAD'
+        ]
+      : []),
+    // Why: empty Branch-tab searches use broad globs; cap git output before
+    // execFile/SSH buffers capture every ref in very large repositories.
+    `--count=${candidateCount}`
+  ]
   // Why: split on `/` so display-format queries (`upstream/main`) route
   // each token to one git ref segment. Filter empty tokens so trailing
   // (`upstream/`), leading (`/main`), or doubled (`upstream//main`)
@@ -415,13 +521,18 @@ export function buildSearchBaseRefsArgv(normalizedQuery: string): string[] {
   const tokens = normalizedQuery.split('/').filter((t) => t.length > 0)
   if (tokens.length <= 1) {
     const q = tokens[0] ?? ''
-    // Why three globs for a single-segment query: `git for-each-ref`
-    // uses fnmatch-style globs where `*` does NOT cross `/`. A single
-    // `refs/remotes/*\/*<q>*` only matches when `<q>` is in the branch
-    // segment, so typing `upstream` (a remote name) returns nothing.
-    // The extra `refs/remotes/*<q>*\/*` matches when the query lives in
-    // the remote segment, making remote-name filtering work.
-    return [...base, `refs/remotes/*${q}*/*`, `refs/remotes/*/*${q}*`, `refs/heads/*${q}*`]
+    // Why `**`, not `*`: git for-each-ref globs are fnmatch-style where a
+    // single `*` does NOT cross `/`. Slash-named branches (`user/feature`)
+    // are the norm, so match both leaf and ancestor branch-name segments.
+    // The remote ancestor glob also preserves remote-name queries like
+    // `upstream` while `**/` keeps flat names like `main` working.
+    return [
+      ...base,
+      `refs/heads/**/*${q}*`,
+      `refs/heads/**/*${q}*/**`,
+      `refs/remotes/**/*${q}*`,
+      `refs/remotes/**/*${q}*/**`
+    ]
   }
   // Why: multi-token queries like `upstream/main` map one `*token*` per
   // ref segment, so each token is matched within a single git ref
@@ -430,6 +541,18 @@ export function buildSearchBaseRefsArgv(normalizedQuery: string): string[] {
   // branch is what makes re-typing a visible result actually find it.
   const segmented = tokens.map((token) => `*${token}*`).join('/')
   return [...base, `refs/remotes/${segmented}`, `refs/heads/${segmented}`]
+}
+
+export function isForEachRefExcludeUnsupportedError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') {
+    return false
+  }
+  const maybe = error as { message?: unknown; stderr?: unknown; stdout?: unknown }
+  const text = [maybe.message, maybe.stderr, maybe.stdout]
+    .filter((value): value is string => typeof value === 'string')
+    .join('\n')
+    .toLowerCase()
+  return text.includes('unknown option') && text.includes('exclude')
 }
 
 /**
@@ -498,20 +621,32 @@ export async function searchBaseRefDetails(
   query: string,
   limit = 25
 ): Promise<BaseRefSearchResult[]> {
-  const normalizedQuery = normalizeRefSearchQuery(query)
-  if (!normalizedQuery) {
+  if (!Number.isInteger(limit) || limit <= 0) {
     return []
   }
+  const normalizedQuery = normalizeRefSearchQuery(query)
 
   try {
     // Why: argv (including the two-remote-glob rationale) lives in
     // buildSearchBaseRefsArgv so the SSH sibling cannot drift.
-    const [{ stdout }, remotes] = await Promise.all([
-      gitExecFileAsync(buildSearchBaseRefsArgv(normalizedQuery), { cwd: path }),
-      listRemoteNames(path)
-    ])
+    const remotesPromise = listRemoteNames(path)
+    let result: { stdout: string }
+    try {
+      result = await gitExecFileAsync(buildSearchBaseRefsArgv(normalizedQuery, limit), {
+        cwd: path
+      })
+    } catch (err) {
+      if (!isForEachRefExcludeUnsupportedError(err)) {
+        throw err
+      }
+      result = await gitExecFileAsync(
+        buildSearchBaseRefsArgv(normalizedQuery, limit, { excludeRemoteHead: false }),
+        { cwd: path }
+      )
+    }
+    const remotes = await remotesPromise
 
-    return parseAndFilterSearchRefDetails(stdout, limit, remotes)
+    return parseAndFilterSearchRefDetails(result.stdout, limit, remotes)
   } catch (err) {
     // Why: surface the failure for diagnostics; callers treat `[]` as "no
     // matches", but silently swallowing the error makes a missing result

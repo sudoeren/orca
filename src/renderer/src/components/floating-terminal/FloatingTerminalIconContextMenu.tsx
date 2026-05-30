@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useCallback, useMemo, useRef, useState } from 'react'
 import { EyeOff, PanelBottom, PanelTop } from 'lucide-react'
 import {
   DropdownMenu,
@@ -14,16 +14,28 @@ type FloatingTerminalIconContextMenuProps = {
   children: React.ReactNode
   currentLocation: FloatingTerminalTriggerLocation
   className?: string
+  style?: React.CSSProperties
 }
 
 export function FloatingTerminalIconContextMenu({
   children,
   currentLocation,
-  className
+  className,
+  style
 }: FloatingTerminalIconContextMenuProps): React.JSX.Element {
   const updateSettings = useAppStore((s) => s.updateSettings)
   const [open, setOpen] = useState(false)
   const [menuPoint, setMenuPoint] = useState({ x: 0, y: 0 })
+  const reopenFrameRef = useRef<number | null>(null)
+
+  const setTriggerRef = useCallback((node: HTMLSpanElement | null): void => {
+    if (node === null) {
+      if (reopenFrameRef.current !== null) {
+        window.cancelAnimationFrame(reopenFrameRef.current)
+        reopenFrameRef.current = null
+      }
+    }
+  }, [])
 
   const moveAction = useMemo(() => {
     if (currentLocation === 'floating-button') {
@@ -43,7 +55,9 @@ export function FloatingTerminalIconContextMenu({
   return (
     <>
       <span
+        ref={setTriggerRef}
         className={className}
+        style={style}
         data-floating-terminal-toggle
         onContextMenuCapture={(event) => {
           // Why: workspace cards use DropdownMenu anchored at the cursor for
@@ -52,7 +66,13 @@ export function FloatingTerminalIconContextMenu({
           event.stopPropagation()
           setMenuPoint({ x: event.clientX, y: event.clientY })
           setOpen(false)
-          window.requestAnimationFrame(() => setOpen(true))
+          if (reopenFrameRef.current !== null) {
+            window.cancelAnimationFrame(reopenFrameRef.current)
+          }
+          reopenFrameRef.current = window.requestAnimationFrame(() => {
+            reopenFrameRef.current = null
+            setOpen(true)
+          })
         }}
         onContextMenu={(event) => {
           event.preventDefault()

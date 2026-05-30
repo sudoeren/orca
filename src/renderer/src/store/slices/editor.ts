@@ -23,6 +23,7 @@ import type {
   Tab,
   TabGroup,
   GitUpstreamStatus,
+  RightSidebarTab,
   SearchResult,
   WorkspaceSessionState,
   WorkspaceVisibleTabType
@@ -32,10 +33,12 @@ import { FLOATING_TERMINAL_WORKTREE_ID } from '../../../../shared/constants'
 import type { RemoteOpKind } from '@/components/right-sidebar/source-control-primary-action'
 import { shouldForcePushWithLeaseForUpstream } from '../../../../shared/git-upstream-status'
 import {
+  fastForwardRuntimeGit,
   fetchRuntimeGit,
   getRuntimeGitUpstreamStatus,
   pullRuntimeGit,
-  pushRuntimeGit
+  pushRuntimeGit,
+  rebaseRuntimeGitFromBase
 } from '@/runtime/runtime-git-client'
 import {
   deleteRuntimePath,
@@ -44,6 +47,10 @@ import {
 } from '@/runtime/runtime-file-client'
 import { settingsForRuntimeOwner } from '@/runtime/runtime-rpc-client'
 import { findWorktreeById, getRepoIdFromWorktreeId } from './worktree-helpers'
+import { createUntitledMarkdownFile } from '@/lib/create-untitled-markdown'
+import { extractIpcErrorMessage } from '@/lib/ipc-error'
+
+export type { RightSidebarTab } from '../../../../shared/types'
 
 export type DiffSource =
   | 'unstaged'
@@ -175,7 +182,6 @@ export type OpenFile = {
   mode: 'edit' | 'diff' | 'conflict-review' | 'markdown-preview'
 }
 
-export type RightSidebarTab = 'explorer' | 'search' | 'source-control' | 'checks' | 'ports'
 export type ActivityBarPosition = 'top' | 'side'
 
 export type MarkdownViewMode = 'source' | 'rich' | 'preview'
@@ -200,6 +206,36 @@ export type PendingEditorReveal = {
   matchLength: number
 }
 
+const pendingEditorLineRevealFrameIds = new Set<number>()
+
+function cancelPendingEditorLineRevealFrames(): void {
+  if (typeof cancelAnimationFrame === 'function') {
+    for (const frameId of pendingEditorLineRevealFrameIds) {
+      cancelAnimationFrame(frameId)
+    }
+  }
+  pendingEditorLineRevealFrameIds.clear()
+}
+
+function trackEditorLineRevealFrameId(frameId: number): void {
+  pendingEditorLineRevealFrameIds.add(frameId)
+}
+
+function requestTrackedEditorLineRevealFrame(callback: FrameRequestCallback): void {
+  let completed = false
+  let frameId: number | undefined
+  frameId = requestAnimationFrame((timestamp) => {
+    completed = true
+    if (frameId !== undefined) {
+      pendingEditorLineRevealFrameIds.delete(frameId)
+    }
+    callback(timestamp)
+  })
+  if (!completed) {
+    trackEditorLineRevealFrameId(frameId)
+  }
+}
+
 function scheduleEditorLineReveal(
   get: () => AppState,
   filePath: string,
@@ -209,9 +245,10 @@ function scheduleEditorLineReveal(
 ): void {
   // Why: openFile can replace a preview and remount Monaco asynchronously; the
   // reveal must land after that remount or the old editor can clear it.
+  cancelPendingEditorLineRevealFrames()
   get().setPendingEditorReveal(null)
-  requestAnimationFrame(() => {
-    requestAnimationFrame(() => {
+  requestTrackedEditorLineRevealFrame(() => {
+    requestTrackedEditorLineRevealFrame(() => {
       get().setPendingEditorReveal({
         filePath,
         fileId,
@@ -285,6 +322,7 @@ export type EditorSlice = {
       suppressActiveRuntimeFallback?: boolean
     }
   ) => void
+  openNewMarkdownInActiveWorkspace: (groupId: string) => Promise<void>
   // Why: dispatcher for markdown link activation. Lives on the slice because it
   // sequences openFile, setMarkdownViewMode, and setPendingEditorReveal around
   // an async Monaco remount — all reading/writing state in this slice. See
@@ -412,7 +450,8 @@ export type EditorSlice = {
   fetchUpstreamStatus: (
     worktreeId: string,
     worktreePath: string,
-    connectionId?: string
+    connectionId?: string,
+    pushTarget?: GitPushTarget
   ) => Promise<void>
   pushBranch: (
     worktreeId: string,
@@ -422,14 +461,37 @@ export type EditorSlice = {
     pushTarget?: GitPushTarget,
     options?: { forceWithLease?: boolean }
   ) => Promise<void>
-  pullBranch: (worktreeId: string, worktreePath: string, connectionId?: string) => Promise<void>
+  pullBranch: (
+    worktreeId: string,
+    worktreePath: string,
+    connectionId?: string,
+    pushTarget?: GitPushTarget
+  ) => Promise<void>
+  fastForwardBranch: (
+    worktreeId: string,
+    worktreePath: string,
+    connectionId?: string,
+    pushTarget?: GitPushTarget
+  ) => Promise<void>
   syncBranch: (
     worktreeId: string,
     worktreePath: string,
     connectionId?: string,
     pushTarget?: GitPushTarget
   ) => Promise<void>
-  fetchBranch: (worktreeId: string, worktreePath: string, connectionId?: string) => Promise<void>
+  rebaseFromBase: (
+    worktreeId: string,
+    worktreePath: string,
+    baseRef: string,
+    connectionId?: string,
+    pushTarget?: GitPushTarget
+  ) => Promise<void>
+  fetchBranch: (
+    worktreeId: string,
+    worktreePath: string,
+    connectionId?: string,
+    pushTarget?: GitPushTarget
+  ) => Promise<void>
   gitBranchChangesByWorktree: Record<string, GitBranchChangeEntry[]>
   gitBranchCompareSummaryByWorktree: Record<string, GitBranchCompareSummary | null>
   gitBranchCompareRequestKeyByWorktree: Record<string, string>
@@ -835,19 +897,32 @@ function isNonFastForwardRemoteError(error: unknown): boolean {
 
 export function resolveRemoteOperationErrorMessage(
   error: unknown,
-  options?: { publish?: boolean; isPush?: boolean; isSync?: boolean; isFetch?: boolean }
+  options?: {
+    publish?: boolean
+    isPush?: boolean
+    isSync?: boolean
+    isFetch?: boolean
+    isFastForward?: boolean
+    isRebase?: boolean
+  }
 ): string {
   if (!(error instanceof Error)) {
     return REMOTE_OPERATION_FAILED_MESSAGE
   }
 
   if (/unmerged files|needs merge|you have not concluded your merge/i.test(error.message)) {
+    if (options?.isRebase) {
+      return 'Rebase blocked — resolve existing conflicts first.'
+    }
     return options?.isSync
       ? 'Sync blocked — resolve existing merge conflicts first.'
       : 'Pull blocked — resolve existing merge conflicts first.'
   }
 
   if (/automatic merge failed|CONFLICT \(|fix conflicts/i.test(error.message)) {
+    if (options?.isRebase) {
+      return 'Rebase stopped with conflicts. Resolve them in Source Control, then continue the rebase.'
+    }
     return options?.isSync
       ? 'Sync stopped with merge conflicts. Resolve them in Source Control, then commit the merge.'
       : 'Pull stopped with merge conflicts. Resolve them in Source Control, then commit the merge.'
@@ -879,7 +954,33 @@ export function resolveRemoteOperationErrorMessage(
       error.message
     )
   ) {
+    if (options?.isRebase) {
+      return 'Rebase blocked — commit or stash your local changes first.'
+    }
+    if (options?.isFastForward) {
+      return 'Fast-forward blocked — commit or stash your local changes first.'
+    }
     return 'Pull blocked — commit or stash your local changes first.'
+  }
+
+  if (/Pull would overwrite local changes/i.test(error.message)) {
+    if (options?.isRebase) {
+      return 'Rebase blocked — commit or stash your local changes first.'
+    }
+    if (options?.isFastForward) {
+      return 'Fast-forward blocked — commit or stash your local changes first.'
+    }
+    return 'Pull blocked — commit or stash your local changes first.'
+  }
+
+  if (/Pull would overwrite untracked files/i.test(error.message)) {
+    if (options?.isRebase) {
+      return 'Rebase blocked — move, remove, or add untracked files first.'
+    }
+    if (options?.isFastForward) {
+      return 'Fast-forward blocked — move, remove, or add untracked files first.'
+    }
+    return 'Pull blocked — move, remove, or add untracked files first.'
   }
 
   if (options?.publish) {
@@ -919,6 +1020,20 @@ export function resolveRemoteOperationErrorMessage(
       extractPublishFailureDetail(error.message) ??
       truncateDetail(stripCredentialsFromMessage(error.message))
     return `Fetch failed. ${detail}`
+  }
+
+  if (options?.isFastForward) {
+    const detail =
+      extractPublishFailureDetail(error.message) ??
+      truncateDetail(stripCredentialsFromMessage(error.message))
+    return `Fast-forward failed. ${detail}`
+  }
+
+  if (options?.isRebase) {
+    const detail =
+      extractPublishFailureDetail(error.message) ??
+      truncateDetail(stripCredentialsFromMessage(error.message))
+    return `Rebase failed. ${detail}`
   }
 
   return error.message
@@ -1019,13 +1134,7 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
   toggleRightSidebar: () => set((s) => ({ rightSidebarOpen: !s.rightSidebarOpen })),
   setRightSidebarOpen: (open) => set({ rightSidebarOpen: open }),
   setRightSidebarWidth: (width) => set({ rightSidebarWidth: width }),
-  setRightSidebarTab: (tab) =>
-    set((s) => ({
-      rightSidebarTab: tab,
-      rightSidebarTabByWorktree: s.activeWorktreeId
-        ? { ...s.rightSidebarTabByWorktree, [s.activeWorktreeId]: tab }
-        : s.rightSidebarTabByWorktree
-    })),
+  setRightSidebarTab: (tab) => set({ rightSidebarTab: tab }),
   setActivityBarPosition: (position) => set({ activityBarPosition: position }),
 
   // File explorer
@@ -1070,15 +1179,11 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
     }),
   pendingExplorerReveal: null,
   revealInExplorer: (worktreeId, filePath) =>
-    set((s) => ({
+    set({
       rightSidebarOpen: true,
       rightSidebarTab: 'explorer',
-      rightSidebarTabByWorktree: {
-        ...s.rightSidebarTabByWorktree,
-        [worktreeId]: 'explorer'
-      },
       pendingExplorerReveal: { worktreeId, filePath, requestId: Date.now() }
-    })),
+    }),
   clearPendingExplorerReveal: () => set({ pendingExplorerReveal: null }),
 
   // Open files
@@ -1337,6 +1442,31 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
       options?.preview ?? false,
       editorItemTargetGroupId
     )
+  },
+
+  openNewMarkdownInActiveWorkspace: async (groupId) => {
+    const state = get()
+    const worktreeId = state.activeWorktreeId
+    if (!worktreeId) {
+      return
+    }
+    const worktree = state.getKnownWorktreeById(worktreeId)
+    if (!worktree) {
+      return
+    }
+    try {
+      const connectionId =
+        state.repos.find((entry) => entry.id === worktree.repoId)?.connectionId ?? undefined
+      const fileInfo = await createUntitledMarkdownFile(
+        worktree.path,
+        worktreeId,
+        connectionId,
+        get().settings
+      )
+      get().openFile(fileInfo, { preview: false, targetGroupId: groupId })
+    } catch (err) {
+      toast.error(extractIpcErrorMessage(err, 'Failed to create untitled markdown file.'))
+    }
   },
 
   openMarkdownPreview: (file, options) => {
@@ -2666,14 +2796,17 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
         inFlightRemoteOpKind: next > 0 ? s.inFlightRemoteOpKind : null
       }
     }),
-  fetchUpstreamStatus: async (worktreeId, worktreePath, connectionId) => {
+  fetchUpstreamStatus: async (worktreeId, worktreePath, connectionId, pushTarget) => {
     try {
-      const status = await getRuntimeGitUpstreamStatus({
-        settings: get().settings,
-        worktreeId,
-        worktreePath,
-        connectionId
-      })
+      const status = await getRuntimeGitUpstreamStatus(
+        {
+          settings: get().settings,
+          worktreeId,
+          worktreePath,
+          connectionId
+        },
+        pushTarget
+      )
       get().setUpstreamStatus(worktreeId, status)
     } catch (error) {
       // Why: on error we leave the prior status in place rather than writing a
@@ -2720,28 +2853,50 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
         // Why: the rejected push proved the publish branch moved. Fetch first
         // so legacy base-tracking worktrees can discover origin/<branch>, then
         // refresh ahead/behind so Pull/Sync become actionable immediately.
-        void fetchRuntimeGit(context)
+        void fetchRuntimeGit(context, pushTarget)
           .catch(() => undefined)
-          .then(() => get().fetchUpstreamStatus(worktreeId, worktreePath, connectionId))
+          .then(() => get().fetchUpstreamStatus(worktreeId, worktreePath, connectionId, pushTarget))
       }
     }
-    void get().fetchUpstreamStatus(worktreeId, worktreePath, connectionId)
+    void get().fetchUpstreamStatus(worktreeId, worktreePath, connectionId, pushTarget)
     const refreshGitHubForWorktree = get().refreshGitHubForWorktree
     if (typeof refreshGitHubForWorktree === 'function') {
       refreshGitHubForWorktree(worktreeId)
     }
   },
-  pullBranch: async (worktreeId, worktreePath, connectionId) => {
+  pullBranch: async (worktreeId, worktreePath, connectionId, pushTarget) => {
     get().beginRemoteOperation('pull')
     try {
-      await pullRuntimeGit({ settings: get().settings, worktreeId, worktreePath, connectionId })
+      await pullRuntimeGit(
+        { settings: get().settings, worktreeId, worktreePath, connectionId },
+        pushTarget
+      )
     } catch (error) {
       toast.error(resolveRemoteOperationErrorMessage(error))
       throw error
     } finally {
       get().endRemoteOperation()
     }
-    void get().fetchUpstreamStatus(worktreeId, worktreePath, connectionId)
+    void get().fetchUpstreamStatus(worktreeId, worktreePath, connectionId, pushTarget)
+    const refreshGitHubForWorktree = get().refreshGitHubForWorktree
+    if (typeof refreshGitHubForWorktree === 'function') {
+      refreshGitHubForWorktree(worktreeId)
+    }
+  },
+  fastForwardBranch: async (worktreeId, worktreePath, connectionId, pushTarget) => {
+    get().beginRemoteOperation('fast_forward')
+    try {
+      await fastForwardRuntimeGit(
+        { settings: get().settings, worktreeId, worktreePath, connectionId },
+        pushTarget
+      )
+    } catch (error) {
+      toast.error(resolveRemoteOperationErrorMessage(error, { isFastForward: true }))
+      throw error
+    } finally {
+      get().endRemoteOperation()
+    }
+    void get().fetchUpstreamStatus(worktreeId, worktreePath, connectionId, pushTarget)
     const refreshGitHubForWorktree = get().refreshGitHubForWorktree
     if (typeof refreshGitHubForWorktree === 'function') {
       refreshGitHubForWorktree(worktreeId)
@@ -2760,8 +2915,8 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
     let pushed = false
     try {
       const context = { settings: get().settings, worktreeId, worktreePath, connectionId }
-      await fetchRuntimeGit(context)
-      const upstreamStatusBeforePull = await getRuntimeGitUpstreamStatus(context)
+      await fetchRuntimeGit(context, pushTarget)
+      const upstreamStatusBeforePull = await getRuntimeGitUpstreamStatus(context, pushTarget)
       if (shouldForcePushWithLeaseForUpstream(upstreamStatusBeforePull)) {
         try {
           await pushRuntimeGit(context, { pushTarget, forceWithLease: true })
@@ -2772,12 +2927,12 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
           throw error
         }
       } else {
-        await pullRuntimeGit(context)
+        await pullRuntimeGit(context, pushTarget)
         // Why: push only if the pull left local commits that aren't on the
         // remote. After a merge pull the ahead count can be >0 (local commits +
         // the new merge commit) or 0 (pure fast-forward), and we avoid a
         // no-op push round-trip in the fast-forward case.
-        const upstreamStatus = await getRuntimeGitUpstreamStatus(context)
+        const upstreamStatus = await getRuntimeGitUpstreamStatus(context, pushTarget)
         if (upstreamStatus.ahead > 0) {
           try {
             await pushRuntimeGit(context, { pushTarget })
@@ -2804,7 +2959,7 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
     } finally {
       get().endRemoteOperation()
     }
-    void get().fetchUpstreamStatus(worktreeId, worktreePath, connectionId)
+    void get().fetchUpstreamStatus(worktreeId, worktreePath, connectionId, pushTarget)
     if (pushed) {
       const refreshGitHubForWorktree = get().refreshGitHubForWorktree
       if (typeof refreshGitHubForWorktree === 'function') {
@@ -2812,21 +2967,43 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
       }
     }
   },
-  fetchBranch: async (worktreeId, worktreePath, connectionId) => {
+  rebaseFromBase: async (worktreeId, worktreePath, baseRef, connectionId, pushTarget) => {
+    get().beginRemoteOperation('rebase')
+    try {
+      await rebaseRuntimeGitFromBase(
+        { settings: get().settings, worktreeId, worktreePath, connectionId },
+        baseRef
+      )
+    } catch (error) {
+      toast.error(resolveRemoteOperationErrorMessage(error, { isRebase: true }))
+      throw error
+    } finally {
+      get().endRemoteOperation()
+    }
+    void get().fetchUpstreamStatus(worktreeId, worktreePath, connectionId, pushTarget)
+    const refreshGitHubForWorktree = get().refreshGitHubForWorktree
+    if (typeof refreshGitHubForWorktree === 'function') {
+      refreshGitHubForWorktree(worktreeId)
+    }
+  },
+  fetchBranch: async (worktreeId, worktreePath, connectionId, pushTarget) => {
     // Why: same shape as pushBranch / pullBranch — fire-and-forget the
     // upstream refresh after the busy flag clears. Fetch updates the
     // remote refs only, so the visible signal we want is the new
     // ahead/behind counts on the upstream-status payload.
     get().beginRemoteOperation('fetch')
     try {
-      await fetchRuntimeGit({ settings: get().settings, worktreeId, worktreePath, connectionId })
+      await fetchRuntimeGit(
+        { settings: get().settings, worktreeId, worktreePath, connectionId },
+        pushTarget
+      )
     } catch (error) {
       toast.error(resolveRemoteOperationErrorMessage(error, { isFetch: true }))
       throw error
     } finally {
       get().endRemoteOperation()
     }
-    void get().fetchUpstreamStatus(worktreeId, worktreePath, connectionId)
+    void get().fetchUpstreamStatus(worktreeId, worktreePath, connectionId, pushTarget)
   },
   gitBranchChangesByWorktree: {},
   gitBranchCompareSummaryByWorktree: {},
@@ -3369,7 +3546,9 @@ function areGitStatusEntriesEqual(prev: GitStatusEntry[], next: GitStatusEntry[]
         entry.oldPath === next[index].oldPath &&
         entry.conflictKind === next[index].conflictKind &&
         entry.conflictStatus === next[index].conflictStatus &&
-        entry.conflictStatusSource === next[index].conflictStatusSource
+        entry.conflictStatusSource === next[index].conflictStatusSource &&
+        entry.added === next[index].added &&
+        entry.removed === next[index].removed
     )
   )
 }

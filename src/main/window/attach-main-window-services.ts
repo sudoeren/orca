@@ -2,7 +2,7 @@
 import { randomUUID } from 'node:crypto'
 
 import { app, ipcMain, session } from 'electron'
-import type { BrowserWindow } from 'electron'
+import type { BrowserWindow, Session } from 'electron'
 import type { Store } from '../persistence'
 import type { CreateWorktreeResult, WorktreeStartupLaunch } from '../../shared/types'
 import { ORCA_BROWSER_PARTITION } from '../../shared/constants'
@@ -33,14 +33,19 @@ import type {
   RuntimeMarkdownSaveTabResult
 } from '../../shared/mobile-markdown-document'
 import type { RuntimeMobileSessionTabMove } from '../../shared/runtime-types'
+import type { NativeFileDropPayload } from '../../shared/native-file-drop'
 import { requestMobileMarkdownFromRenderer } from './mobile-markdown-request-relay'
+import type { CodexAccountSelectionTarget } from '../codex-accounts/runtime-selection'
+import type { ClaudeAccountSelectionTarget } from '../claude-accounts/runtime-selection'
 
 export function attachMainWindowServices(
   mainWindow: BrowserWindow,
   store: Store,
   runtime: OrcaRuntimeService,
-  getSelectedCodexHomePath?: () => string | null,
-  prepareClaudeAuth?: () => Promise<ClaudeRuntimeAuthPreparation>,
+  getSelectedCodexHomePath?: (target?: CodexAccountSelectionTarget) => string | null,
+  prepareClaudeAuth?: (
+    target?: ClaudeAccountSelectionTarget
+  ) => Promise<ClaudeRuntimeAuthPreparation>,
   options?: {
     onBeforeRendererReload?: (args: { webContentsId: number; ignoreCache: boolean }) => void
   }
@@ -196,12 +201,7 @@ export function attachMainWindowServices(
     // signature while still denying the request.
     callback({ video: undefined, audio: undefined })
   })
-  browserSession.on('will-download', (_event, item, webContents) => {
-    // Why: browser-tab downloads need explicit product UX before arbitrary sites
-    // can write files through Orca. Pause the item and route it through
-    // BrowserManager so the user must explicitly accept the save path first.
-    browserManager.handleGuestWillDownload({ guestWebContentsId: webContents.id, item })
-  })
+  registerBrowserDownloadHandler(browserSession)
 
   mainWindow.on('closed', () => {
     // Why: parked browser webviews can outlive the visible tab body until the
@@ -210,6 +210,24 @@ export function attachMainWindowServices(
     // or hot-reload cycles.
     browserManager.unregisterAll()
   })
+}
+
+function handleBrowserWillDownload(
+  _event: Electron.Event,
+  item: Electron.DownloadItem,
+  webContents: Electron.WebContents
+): void {
+  // Why: browser-tab downloads need explicit product UX before arbitrary sites
+  // can write files through Orca. Pause the item and route it through
+  // BrowserManager so the user must explicitly accept the save path first.
+  browserManager.handleGuestWillDownload({ guestWebContentsId: webContents.id, item })
+}
+
+function registerBrowserDownloadHandler(browserSession: Session): void {
+  // Why: browser sessions are process-persistent while main windows can be
+  // recreated; replace the named handler so re-attach does not stack listeners.
+  browserSession.removeListener('will-download', handleBrowserWillDownload)
+  browserSession.on('will-download', handleBrowserWillDownload)
 }
 
 function registerAppReloadHandler(
@@ -355,26 +373,23 @@ function registerRuntimeWindowLifecycle(
 }
 
 function registerFileDropRelay(mainWindow: BrowserWindow): void {
-  ipcMain.removeAllListeners('terminal:file-dropped-from-preload')
-  ipcMain.on(
-    'terminal:file-dropped-from-preload',
-    (
-      _event,
-      args:
-        | { paths: string[]; target: 'editor' }
-        | { paths: string[]; target: 'terminal'; tabId?: string }
-        | { paths: string[]; target: 'composer' }
-        | { paths: string[]; target: 'file-explorer'; destinationDir: string }
-    ) => {
-      if (mainWindow.isDestroyed()) {
-        return
-      }
-
-      // Why: relay exactly one IPC event per drop gesture so the renderer
-      // receives the full batch of paths without timer-based reconstruction.
-      mainWindow.webContents.send('terminal:file-drop', args)
+  const channel = 'terminal:file-dropped-from-preload'
+  ipcMain.removeAllListeners(channel)
+  const relayFileDrop = (_event: Electron.IpcMainEvent, args: NativeFileDropPayload): void => {
+    if (mainWindow.isDestroyed()) {
+      return
     }
-  )
+
+    // Why: relay exactly one IPC event per drop gesture so the renderer
+    // receives the full batch of paths without timer-based reconstruction.
+    mainWindow.webContents.send('terminal:file-drop', args)
+  }
+  ipcMain.on(channel, relayFileDrop)
+  mainWindow.on('closed', () => {
+    // Why: macOS can keep the app process alive after the window closes; drop
+    // the relay closure so a destroyed BrowserWindow is not retained.
+    ipcMain.removeListener(channel, relayFileDrop)
+  })
 }
 
 export function registerUpdaterHandlers(_store: Store): void {

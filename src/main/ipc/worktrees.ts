@@ -1,7 +1,7 @@
 /* oxlint-disable max-lines */
 import type { BrowserWindow } from 'electron'
 import { ipcMain } from 'electron'
-import { readFile, rm } from 'fs/promises'
+import { readFile, rm, stat } from 'fs/promises'
 import { randomUUID } from 'crypto'
 import type { Store } from '../persistence'
 import { isFolderRepo } from '../../shared/repo-kind'
@@ -10,11 +10,20 @@ import { deleteWorktreeHistoryDir } from '../terminal-history'
 import type {
   CreateWorktreeArgs,
   CreateWorktreeResult,
+  DetectedWorktree,
+  DetectedWorktreeListResult,
   GitPushTarget,
   GitWorktreeInfo,
+  OrcaHooks,
   Repo,
+  Worktree,
   WorktreeMeta
 } from '../../shared/types'
+import {
+  buildKnownOrcaWorkspaceLayouts,
+  isLegacyRepoForExternalWorktreeVisibility,
+  toDetectedWorktree
+} from '../../shared/worktree-ownership'
 import {
   assertWorktreeCleanForRemoval,
   listWorktrees as listGitWorktrees,
@@ -22,16 +31,16 @@ import {
 } from '../git/worktree'
 import { gitExecFileAsync } from '../git/runner'
 import { withWorktreeSpan } from '../observability/instrumentation'
-import { getDefaultRemote } from '../git/repo'
 import { resolveGitHubPrStartPoint } from '../github/pr-start-point'
-import { getProjectRef as getGlabProjectRef, getGlabKnownHosts } from '../gitlab/gl-utils'
-import { getWorkItemByProjectRef as getGitLabWorkItemByProjectRef } from '../gitlab/client'
-import { listRepoWorktrees, createFolderWorktree } from '../repo-worktrees'
+import { getDefaultRemote } from '../git/repo'
+import { listRepoWorktrees } from '../repo-worktrees'
 import { getSshGitProvider, requireSshGitProvider } from '../providers/ssh-git-dispatch'
 import { getSshFilesystemProvider } from '../providers/ssh-filesystem-dispatch'
 import {
   createIssueCommandRunnerScript,
   getEffectiveHooks,
+  getEffectiveHooksFromConfig,
+  getSetupRunnerEnvVars,
   loadHooks,
   parseOrcaYaml,
   readIssueCommand,
@@ -70,9 +79,19 @@ import { getCohortAtEmit } from '../telemetry/cohort-classifier'
 import { workspaceSourceSchema, type WorkspaceSource } from '../../shared/telemetry-events'
 import { classifyWorkspaceCreateError } from './workspace-create-error-classifier'
 import {
+  assertWorktreeDoesNotContainRegisteredWorktree,
+  canCleanupUnregisteredOrcaWorktreeDirectory,
   canSafelyRemoveOrphanedWorktreeDirectory,
-  getRegisteredDeletableWorktree
+  findRegisteredDeletableWorktree,
+  isWorktreePathMissing,
+  ORPHANED_WORKTREE_DIRECTORY_MESSAGE,
+  stripOrcaProvenanceMetaUpdates
 } from '../worktree-removal-safety'
+import { isWindowsAbsolutePathLike } from '../../shared/cross-platform-path'
+import { DEFAULT_WORKSPACE_STATUS_ID } from '../../shared/workspace-statuses'
+import { FOLDER_WORKSPACE_INSTANCE_SEPARATOR } from '../../shared/worktree-id'
+
+const WORKTREE_ARCHIVE_HOOK_TIMEOUT_MS = 120_000
 
 // Why: worktrees discovered on disk (not created via Orca's UI) have no
 // persisted WorktreeMeta, so mergeWorktree falls back to `lastActivityAt: 0`.
@@ -92,6 +111,95 @@ function resolveWorktreeMetaWithDiscoveryStamp(store: Store, worktreeId: string)
     return existing
   }
   return store.setWorktreeMeta(worktreeId, { lastActivityAt: Date.now() })
+}
+
+async function isAlreadyRemovedWorktreePath(repo: Repo, worktreePath: string): Promise<boolean> {
+  if (!repo.connectionId) {
+    return isWorktreePathMissing(worktreePath)
+  }
+
+  const fsProvider = getSshFilesystemProvider(repo.connectionId)
+  if (!fsProvider) {
+    return false
+  }
+  return isWorktreePathMissing(worktreePath, (path) => fsProvider.stat(path))
+}
+
+function getWorktreeRemovalOptionsKey(args: { force?: boolean; skipArchive?: boolean }): string {
+  const forceKey = args.force === true ? 'force' : 'normal'
+  const archiveKey = args.skipArchive === true ? 'skip-archive' : 'run-archive'
+  return `${forceKey}:${archiveKey}`
+}
+
+async function getArchiveHooksForRemoval(repo: Repo): Promise<OrcaHooks | null> {
+  if (!repo.connectionId) {
+    return getEffectiveHooks(repo)
+  }
+
+  const fsProvider = getSshFilesystemProvider(repo.connectionId)
+  if (!fsProvider) {
+    return getEffectiveHooksFromConfig(repo, null)
+  }
+
+  try {
+    const result = await fsProvider.readFile(joinWorktreeRelativePath(repo.path, 'orca.yaml'))
+    const yamlHooks = result.isBinary ? null : parseOrcaYaml(result.content)
+    return getEffectiveHooksFromConfig(repo, yamlHooks)
+  } catch {
+    return getEffectiveHooksFromConfig(repo, null)
+  }
+}
+
+async function runRemoteArchiveHook(
+  repo: Repo,
+  worktreePath: string,
+  script: string
+): Promise<{ success: boolean; output: string }> {
+  if (!repo.connectionId) {
+    return { success: true, output: '' }
+  }
+
+  const provider = requireSshGitProvider(repo.connectionId)
+  const env = getSetupRunnerEnvVars(repo, worktreePath)
+  const isWindowsRemote = isWindowsAbsolutePathLike(worktreePath)
+  const result = await provider
+    .execNonInteractive(
+      isWindowsRemote ? 'cmd.exe' : '/bin/bash',
+      isWindowsRemote ? ['/d', '/s', '/c', script] : ['-lc', script],
+      worktreePath,
+      WORKTREE_ARCHIVE_HOOK_TIMEOUT_MS,
+      undefined,
+      env
+    )
+    .catch((error) => ({
+      stdout: '',
+      stderr: '',
+      exitCode: null,
+      timedOut: false,
+      spawnError: error instanceof Error ? error.message : String(error)
+    }))
+  const output = [
+    result.stdout,
+    result.stderr,
+    result.spawnError,
+    result.timedOut ? 'archive hook timed out' : null,
+    typeof result.exitCode === 'number' && result.exitCode !== 0
+      ? `archive hook exited ${result.exitCode}`
+      : null
+  ]
+    .filter((part): part is string => Boolean(part))
+    .join('\n')
+    .trim()
+
+  return {
+    success: !result.spawnError && !result.timedOut && result.exitCode === 0,
+    output
+  }
+}
+
+type WorktreeRemovalInFlight = {
+  optionsKey: string
+  promise: Promise<void>
 }
 
 const loggedUnavailableSshGitProviders = new Set<string>()
@@ -223,6 +331,208 @@ function listDisconnectedSshWorktrees(
   return [...byWorktreeId.values()]
 }
 
+function buildDetectedGitWorktrees(
+  store: Store,
+  repo: Repo,
+  gitWorktrees: GitWorktreeInfo[]
+): DetectedWorktree[] {
+  const settings = store.getSettings()
+  const knownOrcaLayouts = repo.connectionId ? [] : buildKnownOrcaWorkspaceLayouts(settings, repo)
+  const isLegacyRepoForVisibility = isLegacyRepoForExternalWorktreeVisibility(repo)
+  return gitWorktrees.map((gitWorktree) => {
+    const worktreeId = `${repo.id}::${gitWorktree.path}`
+    let meta = store.getWorktreeMeta(worktreeId)
+    const worktree = mergeWorktree(repo.id, gitWorktree, meta, repo.displayName)
+    const detected = toDetectedWorktree({
+      repo,
+      worktree,
+      meta,
+      settings,
+      knownOrcaLayouts,
+      isLegacyRepoForVisibility
+    })
+    if (!detected.visible) {
+      return detected
+    }
+
+    meta = resolveWorktreeMetaWithDiscoveryStamp(store, worktreeId)
+    return toDetectedWorktree({
+      repo,
+      worktree: mergeWorktree(repo.id, gitWorktree, meta, repo.displayName),
+      meta,
+      settings,
+      knownOrcaLayouts,
+      isLegacyRepoForVisibility
+    })
+  })
+}
+
+function stampAndMergeVisibleDetectedWorktree(
+  store: Store,
+  repo: Repo,
+  detected: DetectedWorktree
+) {
+  const meta = resolveWorktreeMetaWithDiscoveryStamp(store, detected.id)
+  return mergeWorktree(repo.id, detected, meta, repo.displayName)
+}
+
+function getFolderWorkspaceRootId(repo: Repo): string {
+  return `${repo.id}::${repo.path}`
+}
+
+function getFolderWorkspaceInstanceId(repo: Repo, instanceId: string): string {
+  return `${getFolderWorkspaceRootId(repo)}${FOLDER_WORKSPACE_INSTANCE_SEPARATOR}${instanceId}`
+}
+
+function getFolderWorkspaceInstanceIdentity(repo: Repo, worktreeId: string): string {
+  const prefix = `${getFolderWorkspaceRootId(repo)}${FOLDER_WORKSPACE_INSTANCE_SEPARATOR}`
+  return worktreeId.startsWith(prefix) ? worktreeId.slice(prefix.length) : randomUUID()
+}
+
+function isFolderWorkspaceIdForRepo(repo: Repo, worktreeId: string): boolean {
+  const rootId = getFolderWorkspaceRootId(repo)
+  return (
+    worktreeId === rootId ||
+    worktreeId.startsWith(`${rootId}${FOLDER_WORKSPACE_INSTANCE_SEPARATOR}`)
+  )
+}
+
+function mergeFolderWorkspace(repo: Repo, worktreeId: string, meta: WorktreeMeta): Worktree {
+  return {
+    id: worktreeId,
+    ...(meta.instanceId !== undefined ? { instanceId: meta.instanceId } : {}),
+    repoId: repo.id,
+    path: repo.path,
+    head: '',
+    branch: '',
+    isBare: false,
+    isMainWorktree: worktreeId === getFolderWorkspaceRootId(repo),
+    displayName: meta.displayName || repo.displayName,
+    comment: meta.comment || '',
+    linkedIssue: meta.linkedIssue ?? null,
+    linkedPR: meta.linkedPR ?? null,
+    linkedLinearIssue: meta.linkedLinearIssue ?? null,
+    linkedGitLabMR: meta.linkedGitLabMR ?? null,
+    linkedGitLabIssue: meta.linkedGitLabIssue ?? null,
+    isArchived: meta.isArchived ?? false,
+    isUnread: meta.isUnread ?? false,
+    isPinned: meta.isPinned ?? false,
+    sortOrder: meta.sortOrder ?? 0,
+    ...(meta.manualOrder !== undefined ? { manualOrder: meta.manualOrder } : {}),
+    lastActivityAt: meta.lastActivityAt ?? 0,
+    ...(meta.createdAt !== undefined ? { createdAt: meta.createdAt } : {}),
+    ...(meta.createdWithAgent !== undefined ? { createdWithAgent: meta.createdWithAgent } : {}),
+    workspaceStatus: meta.workspaceStatus ?? DEFAULT_WORKSPACE_STATUS_ID,
+    diffComments: meta.diffComments
+  }
+}
+
+function listFolderWorkspaces(store: Store, repo: Repo): Worktree[] {
+  const rootId = getFolderWorkspaceRootId(repo)
+  const allMeta = store.getAllWorktreeMeta()
+  const ids = Object.keys(allMeta).filter((worktreeId) =>
+    isFolderWorkspaceIdForRepo(repo, worktreeId)
+  )
+  if (!ids.includes(rootId)) {
+    ids.unshift(rootId)
+  }
+
+  return ids
+    .map((worktreeId) => {
+      const existing = allMeta[worktreeId]
+      const meta = existing?.instanceId
+        ? existing
+        : store.setWorktreeMeta(worktreeId, {
+            instanceId: getFolderWorkspaceInstanceIdentity(repo, worktreeId),
+            ...(existing ? {} : { displayName: repo.displayName, lastActivityAt: Date.now() })
+          })
+      return mergeFolderWorkspace(repo, worktreeId, meta)
+    })
+    .sort((a, b) => {
+      if (a.id === rootId) {
+        return -1
+      }
+      if (b.id === rootId) {
+        return 1
+      }
+      return (b.createdAt ?? b.lastActivityAt) - (a.createdAt ?? a.lastActivityAt)
+    })
+}
+
+function buildFolderDetectedWorktrees(store: Store, repo: Repo): DetectedWorktree[] {
+  const settings = store.getSettings()
+  return listFolderWorkspaces(store, repo).map((worktree) =>
+    toDetectedWorktree({
+      repo,
+      worktree,
+      meta: store.getWorktreeMeta(worktree.id),
+      settings,
+      knownOrcaLayouts: [],
+      isLegacyRepoForVisibility: true
+    })
+  )
+}
+
+function listVisibleFolderWorkspaces(store: Store, repo: Repo): Worktree[] {
+  return buildFolderDetectedWorktrees(store, repo)
+    .filter((worktree) => worktree.visible)
+    .map((worktree) => {
+      const meta = store.getWorktreeMeta(worktree.id)
+      return mergeFolderWorkspace(repo, worktree.id, meta ?? store.setWorktreeMeta(worktree.id, {}))
+    })
+}
+
+function createFolderWorkspace(
+  args: CreateWorktreeArgs,
+  repo: Repo,
+  store: Store
+): CreateWorktreeResult {
+  const now = Date.now()
+  const instanceId = randomUUID()
+  const worktreeId = getFolderWorkspaceInstanceId(repo, instanceId)
+  const meta = store.setWorktreeMeta(worktreeId, {
+    instanceId,
+    displayName: args.displayName || args.name,
+    lastActivityAt: now,
+    createdAt: now,
+    orcaCreatedAt: now,
+    orcaCreationSource: 'desktop',
+    ...(args.createdWithAgent ? { createdWithAgent: args.createdWithAgent } : {}),
+    ...(args.linkedIssue !== undefined ? { linkedIssue: args.linkedIssue } : {}),
+    ...(args.linkedPR !== undefined ? { linkedPR: args.linkedPR } : {}),
+    ...(args.linkedLinearIssue !== undefined ? { linkedLinearIssue: args.linkedLinearIssue } : {}),
+    ...(args.manualOrder !== undefined ? { manualOrder: args.manualOrder } : {}),
+    ...(args.workspaceStatus !== undefined ? { workspaceStatus: args.workspaceStatus } : {}),
+    ...(args.linkedGitLabIssue !== undefined ? { linkedGitLabIssue: args.linkedGitLabIssue } : {}),
+    ...(args.linkedGitLabMR !== undefined ? { linkedGitLabMR: args.linkedGitLabMR } : {})
+  })
+  return { worktree: mergeFolderWorkspace(repo, worktreeId, meta) }
+}
+
+function buildDisconnectedDetectedWorktrees(
+  store: Store,
+  repo: Repo,
+  worktrees: Worktree[]
+): DetectedWorktree[] {
+  const settings = store.getSettings()
+  return worktrees.map((worktree) => {
+    const meta = store.getWorktreeMeta(worktree.id)
+    const detected = toDetectedWorktree({
+      repo,
+      worktree,
+      meta,
+      settings,
+      knownOrcaLayouts: [],
+      isLegacyRepoForVisibility: true
+    })
+    return {
+      ...detected,
+      visible: true,
+      ownership: detected.ownership === 'orca-managed' ? 'orca-managed' : 'unknown-legacy'
+    }
+  })
+}
+
 export function registerWorktreeHandlers(
   mainWindow: BrowserWindow,
   store: Store,
@@ -232,8 +542,10 @@ export function registerWorktreeHandlers(
   // (e.g. when macOS re-activates the app and creates a new window).
   ipcMain.removeHandler('worktrees:listAll')
   ipcMain.removeHandler('worktrees:list')
+  ipcMain.removeHandler('worktrees:listDetected')
   ipcMain.removeHandler('worktrees:create')
   ipcMain.removeHandler('worktrees:resolvePrBase')
+  ipcMain.removeHandler('worktrees:resolveMrBase')
   ipcMain.removeHandler('worktrees:remove')
   ipcMain.removeHandler('worktrees:updateMeta')
   ipcMain.removeHandler('worktrees:listLineage')
@@ -258,7 +570,7 @@ export function registerWorktreeHandlers(
         try {
           let gitWorktrees
           if (isFolderRepo(repo)) {
-            gitWorktrees = [createFolderWorktree(repo)]
+            return listVisibleFolderWorkspaces(store, repo)
           } else if (repo.connectionId) {
             const provider = getSshGitProvider(repo.connectionId)
             if (!provider) {
@@ -287,11 +599,9 @@ export function registerWorktreeHandlers(
           rememberLocalWorktreeRoots(store, repo, gitWorktrees)
           pruneLineageForMissingRepoWorktrees(store, repo, gitWorktrees)
           loggedWorktreeListFailures.delete(`${repo.id}:${repo.path}`)
-          return gitWorktrees.map((gw) => {
-            const worktreeId = `${repo.id}::${gw.path}`
-            const meta = resolveWorktreeMetaWithDiscoveryStamp(store, worktreeId)
-            return mergeWorktree(repo.id, gw, meta, repo.displayName)
-          })
+          return buildDetectedGitWorktrees(store, repo, gitWorktrees)
+            .filter((worktree) => worktree.visible)
+            .map((worktree) => stampAndMergeVisibleDetectedWorktree(store, repo, worktree))
         } catch (err) {
           warnOnce(
             loggedWorktreeListFailures,
@@ -326,7 +636,7 @@ export function registerWorktreeHandlers(
     try {
       let gitWorktrees
       if (isFolderRepo(repo)) {
-        gitWorktrees = [createFolderWorktree(repo)]
+        return listVisibleFolderWorkspaces(store, repo)
       } else if (repo.connectionId) {
         const provider = getSshGitProvider(repo.connectionId)
         if (!provider) {
@@ -355,11 +665,9 @@ export function registerWorktreeHandlers(
       rememberLocalWorktreeRoots(store, repo, gitWorktrees)
       pruneLineageForMissingRepoWorktrees(store, repo, gitWorktrees)
       loggedWorktreeListFailures.delete(`${repo.id}:${repo.path}`)
-      return gitWorktrees.map((gw) => {
-        const worktreeId = `${repo.id}::${gw.path}`
-        const meta = resolveWorktreeMetaWithDiscoveryStamp(store, worktreeId)
-        return mergeWorktree(repo.id, gw, meta, repo.displayName)
-      })
+      return buildDetectedGitWorktrees(store, repo, gitWorktrees)
+        .filter((worktree) => worktree.visible)
+        .map((worktree) => stampAndMergeVisibleDetectedWorktree(store, repo, worktree))
     } catch (err) {
       warnOnce(
         loggedWorktreeListFailures,
@@ -372,6 +680,76 @@ export function registerWorktreeHandlers(
       return []
     }
   })
+
+  ipcMain.handle(
+    'worktrees:listDetected',
+    async (_event, args: { repoId: string }): Promise<DetectedWorktreeListResult> => {
+      const repo = store.getRepo(args.repoId)
+      if (!repo) {
+        return {
+          repoId: args.repoId,
+          authoritative: false,
+          source: 'metadata-fallback',
+          worktrees: []
+        }
+      }
+      const sshWorktreeMetaIndex = repo.connectionId
+        ? createSshWorktreeMetaIndex(Object.entries(store.getAllWorktreeMeta()))
+        : new Map()
+
+      try {
+        let gitWorktrees: GitWorktreeInfo[]
+        if (isFolderRepo(repo)) {
+          return {
+            repoId: repo.id,
+            authoritative: true,
+            source: 'git',
+            worktrees: buildFolderDetectedWorktrees(store, repo)
+          }
+        } else if (repo.connectionId) {
+          const provider = getSshGitProvider(repo.connectionId)
+          if (!provider) {
+            const worktrees = listDisconnectedSshWorktrees(repo, sshWorktreeMetaIndex)
+            return {
+              repoId: repo.id,
+              authoritative: false,
+              source: 'metadata-fallback',
+              worktrees: buildDisconnectedDetectedWorktrees(store, repo, worktrees)
+            }
+          }
+          gitWorktrees = await provider.listWorktrees(repo.path)
+        } else {
+          gitWorktrees = await listRepoWorktrees(repo)
+        }
+        rememberLocalWorktreeRoots(store, repo, gitWorktrees)
+        pruneLineageForMissingRepoWorktrees(store, repo, gitWorktrees)
+        loggedWorktreeListFailures.delete(`${repo.id}:${repo.path}`)
+        return {
+          repoId: repo.id,
+          authoritative: true,
+          source: 'git',
+          worktrees: buildDetectedGitWorktrees(store, repo, gitWorktrees)
+        }
+      } catch (err) {
+        warnOnce(
+          loggedWorktreeListFailures,
+          `${repo.id}:${repo.path}`,
+          `[worktrees] failed to list detected worktrees for repo "${repo.displayName}" (${repo.id}) at ${repo.path}`,
+          err
+        )
+        if (repo.connectionId) {
+          const worktrees = listDisconnectedSshWorktrees(repo, sshWorktreeMetaIndex)
+          return {
+            repoId: repo.id,
+            authoritative: false,
+            source: 'metadata-fallback',
+            worktrees: buildDisconnectedDetectedWorktrees(store, repo, worktrees)
+          }
+        }
+        return { repoId: repo.id, authoritative: false, source: 'metadata-fallback', worktrees: [] }
+      }
+    }
+  )
 
   ipcMain.handle(
     'worktrees:create',
@@ -389,9 +767,6 @@ export function registerWorktreeHandlers(
         if (!repo) {
           throw new Error(`Repo not found: ${args.repoId}`)
         }
-        if (isFolderRepo(repo)) {
-          throw new Error('Folder mode does not support creating worktrees.')
-        }
 
         const sourceParse = workspaceSourceSchema.safeParse(args.telemetrySource)
         const source: WorkspaceSource = sourceParse.success ? sourceParse.data : 'unknown'
@@ -403,9 +778,11 @@ export function registerWorktreeHandlers(
           // worktrees`) signal IPC-shape bugs, not the user-visible
           // git/filesystem failures the funnel cares about — bucketing them
           // into `unknown` would pollute the failure taxonomy.
-          result = repo.connectionId
-            ? await createRemoteWorktree(args, repo, store, mainWindow)
-            : await createLocalWorktree(args, repo, store, mainWindow, runtime)
+          result = isFolderRepo(repo)
+            ? createFolderWorkspace(args, repo, store)
+            : repo.connectionId
+              ? await createRemoteWorktree(args, repo, store, mainWindow)
+              : await createLocalWorktree(args, repo, store, mainWindow, runtime)
         } catch (error) {
           track('workspace_create_failed', {
             source,
@@ -425,9 +802,16 @@ export function registerWorktreeHandlers(
         // the branch name itself.
         track('workspace_created', {
           source,
-          from_existing_branch: typeof args.baseBranch === 'string' && args.baseBranch.length > 0,
+          from_existing_branch:
+            !isFolderRepo(repo) &&
+            typeof args.baseBranch === 'string' &&
+            args.baseBranch.length > 0,
           ...getCohortAtEmit()
         })
+
+        if (isFolderRepo(repo)) {
+          notifyWorktreesChanged(mainWindow, repo.id)
+        }
 
         return result
       })
@@ -488,13 +872,8 @@ export function registerWorktreeHandlers(
     }
   )
 
-  // Why: GitLab parallel of worktrees:resolvePrBase. Same shape, same
-  // semantics — caller passes mrIid (with optional source_branch +
-  // isCrossRepository hints from the picker) and we return either a
-  // `<remote>/<source_branch>` ref (same-project MRs) or a SHA fetched
-  // from refs/merge-requests/<iid>/head (fork MRs). The returned value
-  // is the workspace's base ref; the new worktree branch derives from
-  // the workspace name, not from the source ref.
+  // Why: keep desktop IPC and mobile/runtime RPC on the same MR base
+  // resolution path so SSH repos do not regress differently by surface.
   ipcMain.handle(
     'worktrees:resolveMrBase',
     async (
@@ -505,216 +884,201 @@ export function registerWorktreeHandlers(
         sourceBranch?: string
         isCrossRepository?: boolean
       }
-    ): Promise<{ baseBranch: string } | { error: string }> => {
-      const repo = store.getRepo(args.repoId)
-      if (!repo) {
-        return { error: 'Repo not found' }
-      }
-      // Why: parity with the gh-side guard above. Remote SSH repos are
-      // out of v1 scope; the picker disables the GitLab tab for them too.
-      if (repo.connectionId) {
-        return { error: 'MR start points are not supported for remote repos yet.' }
-      }
-      if (isFolderRepo(repo)) {
-        return { error: 'Folder mode does not support creating worktrees.' }
-      }
-
-      let sourceBranch = args.sourceBranch?.trim() ?? ''
-      let isCrossRepository = args.isCrossRepository === true
-
-      if (!sourceBranch) {
-        const knownHosts = await getGlabKnownHosts()
-        const projectRef = await getGlabProjectRef(repo.path, knownHosts)
-        if (!projectRef) {
-          return { error: 'No GitLab project found for this repository.' }
-        }
-        const item = await getGitLabWorkItemByProjectRef(repo.path, projectRef, args.mrIid, 'mr')
-        if (!item || item.type !== 'mr') {
-          return { error: `MR !${args.mrIid} not found.` }
-        }
-        sourceBranch = (item.branchName ?? '').trim()
-        if (!sourceBranch) {
-          return { error: `MR !${args.mrIid} has no source branch.` }
-        }
-        if (item.isCrossRepository === true) {
-          isCrossRepository = true
-        }
-      }
-
-      let remote: string
-      try {
-        remote = await getDefaultRemote(repo.path)
-      } catch (error) {
-        return { error: error instanceof Error ? error.message : 'Could not resolve git remote.' }
-      }
-
-      // Why: GitLab exposes every MR head (fork or same-project) as
-      // refs/merge-requests/<iid>/head on the target project. Using that
-      // ref lets us snapshot fork MRs without configuring the fork as a
-      // remote — same SHA-as-baseBranch shape as the gh-side branch above.
-      if (isCrossRepository) {
-        const mrRef = `refs/merge-requests/${args.mrIid}/head`
-        try {
-          await gitExecFileAsync(['fetch', remote, mrRef], { cwd: repo.path })
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error)
-          return { error: `Failed to fetch ${mrRef}: ${message.split('\n')[0]}` }
-        }
-        let sha: string
-        try {
-          const { stdout } = await gitExecFileAsync(['rev-parse', '--verify', 'FETCH_HEAD'], {
-            cwd: repo.path
-          })
-          sha = stdout.trim()
-        } catch {
-          return { error: `Could not resolve fork MR !${args.mrIid} head after fetch.` }
-        }
-        if (!sha) {
-          return { error: `Empty SHA resolving fork MR !${args.mrIid} head.` }
-        }
-        return { baseBranch: sha }
-      }
-
-      try {
-        await gitExecFileAsync(['fetch', remote, sourceBranch], { cwd: repo.path })
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-        return { error: `Failed to fetch ${remote}/${sourceBranch}: ${message.split('\n')[0]}` }
-      }
-
-      const remoteRef = `${remote}/${sourceBranch}`
-      try {
-        await gitExecFileAsync(['rev-parse', '--verify', remoteRef], { cwd: repo.path })
-      } catch {
-        return { error: `Remote ref ${remoteRef} does not exist after fetch.` }
-      }
-
-      return { baseBranch: remoteRef }
+    ): Promise<{ baseBranch: string; pushTarget?: GitPushTarget } | { error: string }> => {
+      return runtime.resolveManagedMrBase({
+        repoSelector: `id:${args.repoId}`,
+        mrIid: args.mrIid,
+        sourceBranch: args.sourceBranch,
+        isCrossRepository: args.isCrossRepository
+      })
     }
   )
+
+  const worktreeRemovalsInFlight = new Map<string, WorktreeRemovalInFlight>()
 
   ipcMain.handle(
     'worktrees:remove',
     async (_event, args: { worktreeId: string; force?: boolean; skipArchive?: boolean }) => {
-      const { repoId, worktreePath } = parseWorktreeId(args.worktreeId)
-      const repo = store.getRepo(repoId)
-      if (!repo) {
-        throw new Error(`Repo not found: ${repoId}`)
-      }
-      if (isFolderRepo(repo)) {
-        throw new Error('Folder mode does not support deleting worktrees.')
-      }
-
-      // Why: the renderer-supplied worktreeId contains a filesystem path.
-      // Re-derive the canonical path from git before any destructive action.
-      const provider = repo.connectionId ? requireSshGitProvider(repo.connectionId) : null
-      const registeredWorktrees = repo.connectionId
-        ? await provider!.listWorktrees(repo.path)
-        : await listGitWorktrees(repo.path)
-      const canonicalWorktreePath = getRegisteredDeletableWorktree(
-        repo.path,
-        worktreePath,
-        registeredWorktrees
-      ).path
-      const removedMeta = store.getWorktreeMeta(args.worktreeId)
-      const removedPushTarget = removedMeta?.pushTarget
-      const deleteBranch = removedMeta?.preserveBranchOnDelete !== true
-
-      if (repo.connectionId) {
-        await (deleteBranch
-          ? provider!.removeWorktree(canonicalWorktreePath, args.force)
-          : provider!.removeWorktree(canonicalWorktreePath, args.force, { deleteBranch }))
-        await cleanupUnusedWorktreePushTargetRemoteSsh(
-          provider!,
-          repo.path,
-          args.worktreeId,
-          removedPushTarget,
-          store
-        )
-        runtime.clearOptimisticReconcileToken(args.worktreeId)
-        store.removeWorktreeMeta(args.worktreeId)
-        deleteWorktreeHistoryDir(args.worktreeId)
-        notifyWorktreesChanged(mainWindow, repoId)
-        return
-      }
-
-      // Run archive hook before removal
-      const hooks = getEffectiveHooks(repo)
-      if (hooks?.scripts.archive && !args.skipArchive) {
-        const result = await runHook('archive', canonicalWorktreePath, repo)
-        if (!result.success) {
-          console.error(`[hooks] archive hook failed for ${canonicalWorktreePath}:`, result.output)
+      const optionsKey = getWorktreeRemovalOptionsKey(args)
+      const inFlightRemoval = worktreeRemovalsInFlight.get(args.worktreeId)
+      if (inFlightRemoval) {
+        if (inFlightRemoval.optionsKey === optionsKey) {
+          return inFlightRemoval.promise
         }
+        throw new Error(`Worktree deletion already in progress: ${args.worktreeId}`)
       }
 
-      // Why: `git worktree remove` (non-force) refuses to delete a worktree
-      // that has untracked files, and a symlink pointing into the primary
-      // checkout looks untracked to git. Unlink the user-configured symlinks
-      // first so the normal delete path keeps working — otherwise every
-      // deletion would require the Force Delete toast once the feature is on.
-      if (repo.symlinkPaths && repo.symlinkPaths.length > 0) {
-        await removeWorktreeSymlinks(canonicalWorktreePath, repo.symlinkPaths)
-      }
-
-      let shouldTearDownPtys = true
-      try {
-        await assertWorktreeCleanForRemoval(canonicalWorktreePath, args.force ?? false)
-      } catch (error) {
-        if (!isOrphanCompatiblePreflightError(error)) {
-          throw new Error(
-            formatWorktreeRemovalError(error, canonicalWorktreePath, args.force ?? false)
-          )
+      // Why: stale toast actions, double-clicks, and Space/sidebar races can
+      // target the same worktree concurrently. Share the destructive backend
+      // operation so only one path touches Git and the filesystem.
+      const removal = (async (): Promise<void> => {
+        const { repoId, worktreePath } = parseWorktreeId(args.worktreeId)
+        const repo = store.getRepo(repoId)
+        if (!repo) {
+          throw new Error(`Repo not found: ${repoId}`)
         }
-        // Why: orphan cleanup does not need live shells to be killed first,
-        // and preflight did not prove the worktree is cleanly removable.
-        shouldTearDownPtys = false
-      }
-
-      if (shouldTearDownPtys) {
-        // Why: once preflight proves normal deletion is clean, kill PTYs before
-        // git-level removal so shells cannot keep the directory busy.
-        await killAllProcessesForWorktree(args.worktreeId, {
-          runtime,
-          localProvider: getLocalPtyProvider()
-        })
-          .then((r) => {
-            const total = r.runtimeStopped + r.providerStopped + r.registryStopped
-            if (total > 0) {
-              console.info(
-                `[worktree-teardown] ${args.worktreeId} killed runtime=${r.runtimeStopped} provider=${r.providerStopped} registry=${r.registryStopped}`
-              )
-            }
-          })
-          .catch((err) => {
-            console.warn(`[worktree-teardown] failed for ${args.worktreeId}:`, err)
-          })
-      }
-
-      try {
-        await (deleteBranch
-          ? removeWorktree(repo.path, canonicalWorktreePath, args.force ?? false)
-          : removeWorktree(repo.path, canonicalWorktreePath, args.force ?? false, {
-              deleteBranch
-            }))
-      } catch (error) {
-        // If git no longer tracks this worktree, clean up the directory and metadata
-        if (isOrphanedWorktreeError(error)) {
-          console.warn(
-            `[worktrees] Orphaned worktree detected at ${canonicalWorktreePath}, cleaning up`
-          )
-          if (await canSafelyRemoveOrphanedWorktreeDirectory(canonicalWorktreePath, repo.path)) {
-            await rm(canonicalWorktreePath, { recursive: true, force: true }).catch(() => {})
-          } else {
-            console.warn(
-              `[worktrees] Refusing recursive cleanup for unproven worktree directory: ${canonicalWorktreePath}`
+        if (isFolderRepo(repo)) {
+          if (args.worktreeId === getFolderWorkspaceRootId(repo)) {
+            throw new Error(
+              'Cannot delete the project root workspace. Remove the folder project instead.'
             )
           }
-          // Why: `git worktree remove` failed, so git's internal worktree tracking
-          // (`.git/worktrees/<name>`) is still intact. Without pruning, `git worktree
-          // list` continues to show the stale entry and the branch it had checked out
-          // remains locked — other worktrees cannot check it out.
-          await gitExecFileAsync(['worktree', 'prune'], { cwd: repo.path }).catch(() => {})
-          await cleanupUnusedWorktreePushTargetRemote(
+          // Why: folder workspaces share one filesystem root, so there is no Git
+          // remove step to close shells; sweep PTYs before dropping metadata.
+          await killAllProcessesForWorktree(args.worktreeId, {
+            runtime,
+            localProvider: getLocalPtyProvider()
+          }).catch((err) => {
+            console.warn(`[worktree-teardown] failed for ${args.worktreeId}:`, err)
+          })
+          store.removeWorktreeMeta(args.worktreeId)
+          deleteWorktreeHistoryDir(args.worktreeId)
+          notifyWorktreesChanged(mainWindow, repoId)
+          return
+        }
+
+        // Why: the renderer-supplied worktreeId contains a filesystem path.
+        // Re-derive the canonical path from git before any destructive action.
+        const provider = repo.connectionId ? requireSshGitProvider(repo.connectionId) : null
+        const registeredWorktrees = repo.connectionId
+          ? await provider!.listWorktrees(repo.path)
+          : await listGitWorktrees(repo.path)
+        const removedMeta = store.getWorktreeMeta(args.worktreeId)
+        const removedPushTarget = removedMeta?.pushTarget
+        const registeredWorktree = findRegisteredDeletableWorktree(
+          repo.path,
+          worktreePath,
+          registeredWorktrees
+        )
+        if (!registeredWorktree) {
+          const fsProvider = repo.connectionId ? getSshFilesystemProvider(repo.connectionId) : null
+          let canCleanOrphanedDirectory = false
+          const knownOrcaLayouts = repo.connectionId
+            ? []
+            : buildKnownOrcaWorkspaceLayouts(store.getSettings(), repo)
+          if (
+            canCleanupUnregisteredOrcaWorktreeDirectory({
+              meta: removedMeta,
+              worktreePath,
+              repo,
+              knownOrcaLayouts
+            })
+          ) {
+            if (repo.connectionId) {
+              if (!fsProvider) {
+                throw new Error('SSH filesystem provider unavailable')
+              }
+              if (!fsProvider.lstat) {
+                throw new Error('SSH filesystem provider lstat unavailable')
+              }
+              canCleanOrphanedDirectory = await canSafelyRemoveOrphanedWorktreeDirectory(
+                worktreePath,
+                repo.path,
+                (path) => fsProvider.lstat!(path),
+                (path) => fsProvider.readFile(path)
+              )
+            } else {
+              canCleanOrphanedDirectory = await canSafelyRemoveOrphanedWorktreeDirectory(
+                worktreePath,
+                repo.path
+              )
+            }
+          }
+          if (canCleanOrphanedDirectory) {
+            assertWorktreeDoesNotContainRegisteredWorktree(worktreePath, registeredWorktrees)
+            if (!args.force) {
+              throw new Error(ORPHANED_WORKTREE_DIRECTORY_MESSAGE)
+            }
+            if (repo.connectionId) {
+              await fsProvider!.deletePath(worktreePath, true)
+              await cleanupUnusedWorktreePushTargetRemoteSsh(
+                provider!,
+                repo.path,
+                args.worktreeId,
+                removedPushTarget,
+                store
+              )
+            } else {
+              await rm(worktreePath, { recursive: true, force: true })
+              await cleanupUnusedWorktreePushTargetRemote(
+                repo.path,
+                args.worktreeId,
+                removedPushTarget,
+                store
+              )
+              invalidateAuthorizedRootsCache()
+            }
+            runtime.clearOptimisticReconcileToken(args.worktreeId)
+            store.removeWorktreeMeta(args.worktreeId)
+            deleteWorktreeHistoryDir(args.worktreeId)
+            notifyWorktreesChanged(mainWindow, repoId)
+            return
+          }
+          if (args.force && (await isAlreadyRemovedWorktreePath(repo, worktreePath))) {
+            // Why: Force-delete can be retried from stale UI after a prior delete
+            // already removed the directory and Git registration. Treat that as
+            // successful cleanup, but do not delete any unregistered existing path.
+            if (repo.connectionId) {
+              await cleanupUnusedWorktreePushTargetRemoteSsh(
+                provider!,
+                repo.path,
+                args.worktreeId,
+                removedPushTarget,
+                store
+              )
+            } else {
+              await cleanupUnusedWorktreePushTargetRemote(
+                repo.path,
+                args.worktreeId,
+                removedPushTarget,
+                store
+              )
+              invalidateAuthorizedRootsCache()
+            }
+            runtime.clearOptimisticReconcileToken(args.worktreeId)
+            store.removeWorktreeMeta(args.worktreeId)
+            deleteWorktreeHistoryDir(args.worktreeId)
+            notifyWorktreesChanged(mainWindow, repoId)
+            return
+          }
+          throw new Error(`Refusing to delete unregistered worktree path: ${worktreePath}`)
+        }
+        const canonicalWorktreePath = registeredWorktree.path
+        const deleteBranch = removedMeta?.preserveBranchOnDelete !== true
+
+        let shouldTearDownPtys = true
+
+        // Run archive hook before removal so teardown scripts still see the worktree directory.
+        const hooks = await getArchiveHooksForRemoval(repo)
+        if (hooks?.scripts.archive && !args.skipArchive) {
+          const result = repo.connectionId
+            ? await runRemoteArchiveHook(repo, canonicalWorktreePath, hooks.scripts.archive)
+            : await runHook('archive', canonicalWorktreePath, repo)
+          if (!result.success) {
+            console.error(
+              `[hooks] archive hook failed for ${canonicalWorktreePath}:`,
+              result.output
+            )
+          }
+        }
+
+        if (repo.connectionId) {
+          // Why: SSH deletion mirrors the local flow: hooks run while the
+          // directory is intact, then the clean check guards destructive removal.
+          if (!args.force) {
+            const { clean, stdout } = await provider!.worktreeIsClean(canonicalWorktreePath)
+            if (!clean) {
+              const error = new Error('Worktree has uncommitted or untracked changes.')
+              ;(error as Error & { stdout?: string }).stdout = stdout
+              throw error
+            }
+          }
+
+          await (deleteBranch
+            ? provider!.removeWorktree(canonicalWorktreePath, args.force)
+            : provider!.removeWorktree(canonicalWorktreePath, args.force, { deleteBranch }))
+          await cleanupUnusedWorktreePushTargetRemoteSsh(
+            provider!,
             repo.path,
             args.worktreeId,
             removedPushTarget,
@@ -723,33 +1087,124 @@ export function registerWorktreeHandlers(
           runtime.clearOptimisticReconcileToken(args.worktreeId)
           store.removeWorktreeMeta(args.worktreeId)
           deleteWorktreeHistoryDir(args.worktreeId)
-          invalidateAuthorizedRootsCache()
           notifyWorktreesChanged(mainWindow, repoId)
           return
         }
-        throw new Error(
-          formatWorktreeRemovalError(error, canonicalWorktreePath, args.force ?? false)
-        )
-      }
-      await cleanupUnusedWorktreePushTargetRemote(
-        repo.path,
-        args.worktreeId,
-        removedPushTarget,
-        store
-      )
-      runtime.clearOptimisticReconcileToken(args.worktreeId)
-      store.removeWorktreeMeta(args.worktreeId)
-      deleteWorktreeHistoryDir(args.worktreeId)
-      invalidateAuthorizedRootsCache()
 
-      notifyWorktreesChanged(mainWindow, repoId)
+        // Why: `git worktree remove` (non-force) refuses to delete a worktree
+        // that has untracked files, and a symlink pointing into the primary
+        // checkout looks untracked to git. Unlink the user-configured symlinks
+        // first so the normal delete path keeps working — otherwise every
+        // deletion would require the Force Delete toast once the feature is on.
+        if (repo.symlinkPaths && repo.symlinkPaths.length > 0) {
+          await removeWorktreeSymlinks(canonicalWorktreePath, repo.symlinkPaths)
+        }
+
+        try {
+          await assertWorktreeCleanForRemoval(canonicalWorktreePath, args.force ?? false)
+        } catch (error) {
+          if (!isOrphanCompatiblePreflightError(error)) {
+            throw new Error(
+              formatWorktreeRemovalError(error, canonicalWorktreePath, args.force ?? false)
+            )
+          }
+          // Why: orphan cleanup does not need live shells to be killed first,
+          // and preflight did not prove the worktree is cleanly removable.
+          shouldTearDownPtys = false
+        }
+
+        if (shouldTearDownPtys) {
+          // Why: once preflight proves normal deletion is clean, kill PTYs before
+          // git-level removal so shells cannot keep the directory busy.
+          await killAllProcessesForWorktree(args.worktreeId, {
+            runtime,
+            localProvider: getLocalPtyProvider()
+          })
+            .then((r) => {
+              const total = r.runtimeStopped + r.providerStopped + r.registryStopped
+              if (total > 0) {
+                console.info(
+                  `[worktree-teardown] ${args.worktreeId} killed runtime=${r.runtimeStopped} provider=${r.providerStopped} registry=${r.registryStopped}`
+                )
+              }
+            })
+            .catch((err) => {
+              console.warn(`[worktree-teardown] failed for ${args.worktreeId}:`, err)
+            })
+        }
+
+        try {
+          await (deleteBranch
+            ? removeWorktree(repo.path, canonicalWorktreePath, args.force ?? false)
+            : removeWorktree(repo.path, canonicalWorktreePath, args.force ?? false, {
+                deleteBranch
+              }))
+        } catch (error) {
+          // If git no longer tracks this worktree, clean up the directory and metadata
+          if (isOrphanedWorktreeError(error)) {
+            console.warn(
+              `[worktrees] Orphaned worktree detected at ${canonicalWorktreePath}, cleaning up`
+            )
+            if (await canSafelyRemoveOrphanedWorktreeDirectory(canonicalWorktreePath, repo.path)) {
+              await rm(canonicalWorktreePath, { recursive: true, force: true }).catch(() => {})
+            } else {
+              console.warn(
+                `[worktrees] Refusing recursive cleanup for unproven worktree directory: ${canonicalWorktreePath}`
+              )
+            }
+            // Why: `git worktree remove` failed, so git's internal worktree tracking
+            // (`.git/worktrees/<name>`) is still intact. Without pruning, `git worktree
+            // list` continues to show the stale entry and the branch it had checked out
+            // remains locked — other worktrees cannot check it out.
+            await gitExecFileAsync(['worktree', 'prune'], { cwd: repo.path }).catch(() => {})
+            await cleanupUnusedWorktreePushTargetRemote(
+              repo.path,
+              args.worktreeId,
+              removedPushTarget,
+              store
+            )
+            runtime.clearOptimisticReconcileToken(args.worktreeId)
+            store.removeWorktreeMeta(args.worktreeId)
+            deleteWorktreeHistoryDir(args.worktreeId)
+            invalidateAuthorizedRootsCache()
+            notifyWorktreesChanged(mainWindow, repoId)
+            return
+          }
+          throw new Error(
+            formatWorktreeRemovalError(error, canonicalWorktreePath, args.force ?? false)
+          )
+        }
+        await cleanupUnusedWorktreePushTargetRemote(
+          repo.path,
+          args.worktreeId,
+          removedPushTarget,
+          store
+        )
+        runtime.clearOptimisticReconcileToken(args.worktreeId)
+        store.removeWorktreeMeta(args.worktreeId)
+        deleteWorktreeHistoryDir(args.worktreeId)
+        invalidateAuthorizedRootsCache()
+
+        notifyWorktreesChanged(mainWindow, repoId)
+      })()
+      worktreeRemovalsInFlight.set(args.worktreeId, { optionsKey, promise: removal })
+      try {
+        await removal
+      } finally {
+        if (worktreeRemovalsInFlight.get(args.worktreeId)?.promise === removal) {
+          worktreeRemovalsInFlight.delete(args.worktreeId)
+        }
+      }
     }
   )
 
   ipcMain.handle(
     'worktrees:updateMeta',
     (_event, args: { worktreeId: string; updates: Partial<WorktreeMeta> }) => {
-      const meta = store.setWorktreeMeta(args.worktreeId, args.updates)
+      const meta = store.setWorktreeMeta(
+        args.worktreeId,
+        stripOrcaProvenanceMetaUpdates(args.updates)
+      )
       // Do NOT call notifyWorktreesChanged here. The renderer applies meta
       // updates optimistically before calling this IPC, so a notification
       // would trigger a redundant fetchWorktrees round-trip that bumps
@@ -803,23 +1258,29 @@ export function registerWorktreeHandlers(
   ipcMain.handle('hooks:check', async (_event, args: { repoId: string }) => {
     const repo = store.getRepo(args.repoId)
     if (!repo || isFolderRepo(repo)) {
-      return { hasHooks: false, hooks: null, mayNeedUpdate: false }
+      return { status: 'ok', hasHooks: false, hooks: null, mayNeedUpdate: false }
     }
 
     if (repo.connectionId) {
       const fsProvider = getSshFilesystemProvider(repo.connectionId)
       if (!fsProvider) {
-        return { hasHooks: false, hooks: null, mayNeedUpdate: false }
+        return { status: 'error', hasHooks: false, hooks: null, mayNeedUpdate: false }
       }
       try {
         const result = await fsProvider.readFile(joinWorktreeRelativePath(repo.path, 'orca.yaml'))
         return {
+          status: 'ok',
           hasHooks: !result.isBinary,
           hooks: result.isBinary ? null : parseOrcaYaml(result.content),
           mayNeedUpdate: false
         }
-      } catch {
-        return { hasHooks: false, hooks: null, mayNeedUpdate: false }
+      } catch (error) {
+        return {
+          status: isENOENT(error) ? 'ok' : 'error',
+          hasHooks: false,
+          hooks: null,
+          mayNeedUpdate: false
+        }
       }
     }
 
@@ -831,6 +1292,7 @@ export function registerWorktreeHandlers(
     // instead of implying the file is broken.
     const mayNeedUpdate = has && !hooks && hasUnrecognizedOrcaYamlKeys(repo.path)
     return {
+      status: 'ok',
       hasHooks: has,
       hooks,
       mayNeedUpdate
@@ -855,36 +1317,66 @@ export function registerWorktreeHandlers(
       return []
     }
 
-    return inspectSetupScriptImportCandidates(async (relativePath) => {
-      const filePath = joinWorktreeRelativePath(repo.path, relativePath)
-      if (repo.connectionId) {
-        const fsProvider = getSshFilesystemProvider(repo.connectionId)
-        if (!fsProvider) {
-          return null
+    return inspectSetupScriptImportCandidates(
+      async (relativePath) => {
+        const filePath = joinWorktreeRelativePath(repo.path, relativePath)
+        if (repo.connectionId) {
+          const fsProvider = getSshFilesystemProvider(repo.connectionId)
+          if (!fsProvider) {
+            return null
+          }
+          try {
+            const result = await fsProvider.readFile(filePath)
+            return result.isBinary ? null : result.content
+          } catch {
+            return null
+          }
         }
-        try {
-          const result = await fsProvider.readFile(filePath)
-          return result.isBinary ? null : result.content
-        } catch {
-          return null
-        }
-      }
 
-      try {
-        return await readFile(filePath, 'utf-8')
-      } catch (error) {
-        if (!isENOENT(error)) {
-          console.warn('[hooks] Failed to inspect setup script import candidate:', error)
+        try {
+          return await readFile(filePath, 'utf-8')
+        } catch (error) {
+          if (!isENOENT(error)) {
+            console.warn('[hooks] Failed to inspect setup script import candidate:', error)
+          }
+          return null
         }
-        return null
+      },
+      {
+        fileExists: async (relativePath) => {
+          const filePath = joinWorktreeRelativePath(repo.path, relativePath)
+          if (repo.connectionId) {
+            const fsProvider = getSshFilesystemProvider(repo.connectionId)
+            if (!fsProvider) {
+              return false
+            }
+            try {
+              const fileStat = await fsProvider.stat(filePath)
+              return fileStat.type !== 'directory'
+            } catch {
+              return false
+            }
+          }
+
+          try {
+            const fileStat = await stat(filePath)
+            return !fileStat.isDirectory()
+          } catch (error) {
+            if (!isENOENT(error)) {
+              console.warn('[hooks] Failed to stat setup script import candidate:', error)
+            }
+            return false
+          }
+        }
       }
-    })
+    )
   })
 
-  ipcMain.handle('hooks:readIssueCommand', (_event, args: { repoId: string }) => {
+  ipcMain.handle('hooks:readIssueCommand', async (_event, args: { repoId: string }) => {
     const repo = store.getRepo(args.repoId)
     if (!repo || isFolderRepo(repo)) {
       return {
+        status: 'ok',
         localContent: null,
         sharedContent: null,
         effectiveContent: null,
@@ -892,14 +1384,100 @@ export function registerWorktreeHandlers(
         source: 'none' as const
       }
     }
+    if (repo.connectionId) {
+      const issueCommandPath = joinWorktreeRelativePath(repo.path, '.orca/issue-command')
+      const fsProvider = getSshFilesystemProvider(repo.connectionId)
+      if (!fsProvider) {
+        return {
+          status: 'error',
+          localContent: null,
+          sharedContent: null,
+          effectiveContent: null,
+          localFilePath: issueCommandPath,
+          source: 'none' as const
+        }
+      }
+
+      let status: 'ok' | 'error' = 'ok'
+      let localContent: string | null = null
+      let sharedContent: string | null = null
+      try {
+        const result = await fsProvider.readFile(issueCommandPath)
+        localContent = result.isBinary ? null : result.content.trim() || null
+      } catch (error) {
+        if (!isENOENT(error)) {
+          status = 'error'
+        }
+      }
+      try {
+        const result = await fsProvider.readFile(joinWorktreeRelativePath(repo.path, 'orca.yaml'))
+        sharedContent = result.isBinary
+          ? null
+          : parseOrcaYaml(result.content)?.issueCommand?.trim() || null
+      } catch (error) {
+        if (!isENOENT(error)) {
+          status = 'error'
+        }
+      }
+      const effectiveContent = localContent ?? sharedContent
+      return {
+        status: localContent ? 'ok' : status,
+        localContent,
+        sharedContent,
+        effectiveContent,
+        localFilePath: issueCommandPath,
+        source: localContent
+          ? ('local' as const)
+          : sharedContent
+            ? ('shared' as const)
+            : ('none' as const)
+      }
+    }
     return readIssueCommand(repo.path)
   })
 
-  ipcMain.handle('hooks:writeIssueCommand', (_event, args: { repoId: string; content: string }) => {
-    const repo = store.getRepo(args.repoId)
-    if (!repo || isFolderRepo(repo)) {
-      return
+  ipcMain.handle(
+    'hooks:writeIssueCommand',
+    async (_event, args: { repoId: string; content: string }) => {
+      const repo = store.getRepo(args.repoId)
+      if (!repo || isFolderRepo(repo)) {
+        return
+      }
+      if (repo.connectionId) {
+        const issueCommandPath = joinWorktreeRelativePath(repo.path, '.orca/issue-command')
+        const fsProvider = getSshFilesystemProvider(repo.connectionId)
+        if (!fsProvider) {
+          throw new Error(
+            'Remote filesystem unavailable. Reconnect the SSH target before retrying.'
+          )
+        }
+        const trimmed = args.content.trim()
+        if (!trimmed) {
+          await fsProvider.deletePath(issueCommandPath, false).catch((error: unknown) => {
+            if (!isENOENT(error)) {
+              throw error
+            }
+          })
+          return
+        }
+        await fsProvider.createDir(joinWorktreeRelativePath(repo.path, '.orca'))
+        const gitignorePath = joinWorktreeRelativePath(repo.path, '.gitignore')
+        try {
+          const result = await fsProvider.readFile(gitignorePath)
+          if (!result.isBinary && !/^\.orca\/?$/m.test(result.content)) {
+            const separator = result.content.endsWith('\n') ? '' : '\n'
+            await fsProvider.writeFile(gitignorePath, `${result.content}${separator}.orca\n`)
+          }
+        } catch (error) {
+          if (!isENOENT(error)) {
+            throw error
+          }
+          await fsProvider.writeFile(gitignorePath, '.orca\n')
+        }
+        await fsProvider.writeFile(issueCommandPath, `${trimmed}\n`)
+        return
+      }
+      writeIssueCommand(repo.path, args.content)
     }
-    writeIssueCommand(repo.path, args.content)
-  })
+  )
 }

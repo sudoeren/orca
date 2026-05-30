@@ -1,3 +1,4 @@
+/* eslint-disable max-lines -- Why: Claude rate-limit fallback tests share account/keychain/PTY mocks that would be noisier split apart. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -98,6 +99,30 @@ describe('fetchClaudeRateLimits', () => {
     }
   })
 
+  it('does not read host credentials when WSL config resolution fails', async () => {
+    await expect(
+      fetchClaudeRateLimits({
+        authPreparation: {
+          configDir: '/Users/test/.claude',
+          runtime: 'wsl',
+          wslDistro: 'Ubuntu',
+          wslLinuxConfigDir: null,
+          envPatch: {},
+          stripAuthEnv: true,
+          provenance: 'wsl:Ubuntu:system'
+        }
+      })
+    ).resolves.toMatchObject({
+      provider: 'claude',
+      status: 'error',
+      error: 'WSL Claude config unavailable for Ubuntu'
+    })
+
+    expect(readFileMock).not.toHaveBeenCalled()
+    expect(readActiveClaudeKeychainCredentialsStrict).not.toHaveBeenCalled()
+    expect(fetchViaPty).not.toHaveBeenCalled()
+  })
+
   it('reads scoped default-config Keychain credentials for OAuth usage fetches', async () => {
     const configDir = '/Users/test/.claude'
     const authPreparation: ClaudeRuntimeAuthPreparation = {
@@ -167,7 +192,10 @@ describe('fetchClaudeRateLimits', () => {
       status: 'ok'
     })
 
-    expect(readFileMock).toHaveBeenCalledWith('/Users/test/.claude/.credentials.json', 'utf-8')
+    expect(readFileMock).toHaveBeenCalledWith(
+      join('/Users/test/.claude', '.credentials.json'),
+      'utf-8'
+    )
     expect(netFetchMock).toHaveBeenCalledWith(
       'https://api.anthropic.com/api/oauth/usage',
       expect.objectContaining({
@@ -269,7 +297,15 @@ describe('fetchClaudeRateLimits', () => {
       })
     )
     netFetchMock.mockResolvedValueOnce(
-      new Response(JSON.stringify({ error: { type: 'rate_limit_error' } }), { status: 429 })
+      new Response(
+        JSON.stringify({
+          error: {
+            type: 'rate_limit_error',
+            message: 'Rate limited. Please try again later.'
+          }
+        }),
+        { status: 429 }
+      )
     )
 
     await expect(fetchClaudeRateLimits({ authPreparation })).resolves.toMatchObject({

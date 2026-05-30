@@ -156,6 +156,14 @@ describe('telemetry IPC handlers', () => {
     })
   })
 
+  it('drops main-owned events from renderer telemetry IPC', () => {
+    registerWith({ installId: 'x', existedBeforeTelemetryRelease: false, optedIn: true })
+    const handler = handlers.get('telemetry:track')!
+    handler({}, 'app_starred_orca', { source: 'settings' })
+    expect(trackMock).not.toHaveBeenCalled()
+    expect(getCohortAtEmitMock).not.toHaveBeenCalled()
+  })
+
   it('injects cohort for setup script prompt events', () => {
     registerWith({ installId: 'x', existedBeforeTelemetryRelease: false, optedIn: true })
     getCohortAtEmitMock.mockReturnValue({ nth_repo_added: 3 })
@@ -221,9 +229,10 @@ describe('telemetry IPC handlers', () => {
     registerWith({ installId: 'x', existedBeforeTelemetryRelease: false, optedIn: true })
     getOnboardingCohortAtEmitMock.mockReturnValue({ cohort: 'fresh_install' })
     const handler = handlers.get('telemetry:track')!
-    handler({}, 'onboarding_step_viewed', { step: 1 })
+    handler({}, 'onboarding_step_viewed', { step: 1, value_kind: 'agent' })
     expect(trackMock).toHaveBeenCalledWith('onboarding_step_viewed', {
       step: 1,
+      value_kind: 'agent',
       cohort: 'fresh_install'
     })
   })

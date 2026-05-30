@@ -1,6 +1,7 @@
 import type { ClaudeRuntimeAuthPreparation } from '../claude-accounts/runtime-auth-service'
 import { applyClaudeEnvPatch } from '../claude-accounts/environment'
 import { readShellStartupEnvVar } from '../pty/shell-startup-env'
+import { parseWslUncPath } from '../../shared/wsl-paths'
 
 export type CommitMessageAgentEnvironmentResolvers = {
   prepareForCodexLaunch?: () => string | null
@@ -27,16 +28,26 @@ function readInheritedOrShellEnvVar(name: string, sourceName?: string): string |
 
 function prepareShellConfigDirEnv(agentId: string): { ok: true; env?: NodeJS.ProcessEnv } | null {
   const configVar =
-    agentId === 'opencode' ? 'OPENCODE_CONFIG_DIR' : agentId === 'pi' ? 'PI_CODING_AGENT_DIR' : null
+    agentId === 'opencode'
+      ? 'OPENCODE_CONFIG_DIR'
+      : agentId === 'pi' || agentId === 'omp'
+        ? 'PI_CODING_AGENT_DIR'
+        : null
   if (!configVar) {
     return null
   }
+  // Why: each kind owns a distinct ORCA_*_SOURCE_* shadow so a headless commit
+  // run from inside an OMP overlay restores the OMP source dir, never the Pi
+  // one (and vice versa). PI_CODING_AGENT_DIR is the binary-facing var both
+  // kinds emit — see src/main/pi/titlebar-extension-service.ts.
   const sourceVar =
     agentId === 'opencode'
       ? 'ORCA_OPENCODE_SOURCE_CONFIG_DIR'
       : agentId === 'pi'
         ? 'ORCA_PI_SOURCE_AGENT_DIR'
-        : undefined
+        : agentId === 'omp'
+          ? 'ORCA_OMP_SOURCE_AGENT_DIR'
+          : undefined
 
   const value = readInheritedOrShellEnvVar(configVar, sourceVar)
   if (!value) {
@@ -64,6 +75,11 @@ export async function prepareLocalCommitMessageAgentEnv(
   try {
     if (agentId === 'codex' && resolvers.prepareForCodexLaunch) {
       const codexHomePath = resolvers.prepareForCodexLaunch()
+      if (codexHomePath && parseWslUncPath(codexHomePath)) {
+        // Why: this local generation path spawns the host Codex binary. A WSL
+        // managed home is only valid when the process is routed through wsl.exe.
+        return { ok: true }
+      }
       return {
         ok: true,
         env: codexHomePath ? { ...cloneProcessEnv(), CODEX_HOME: codexHomePath } : undefined

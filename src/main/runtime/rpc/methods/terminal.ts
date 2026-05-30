@@ -338,7 +338,8 @@ const TerminalSplit = TerminalHandle.extend({
     .transform((v) => (v === 'vertical' || v === 'horizontal' ? v : undefined))
     .pipe(z.union([z.enum(['vertical', 'horizontal']), z.undefined()]))
     .optional(),
-  command: OptionalString
+  command: OptionalString,
+  env: z.record(z.string(), z.string()).optional()
 })
 
 const TerminalStop = z.object({
@@ -571,7 +572,8 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
     handler: async (params, { runtime }) => ({
       split: await runtime.splitTerminal(params.terminal, {
         direction: params.direction,
-        command: params.command
+        command: params.command,
+        env: params.env
       })
     })
   }),
@@ -690,7 +692,7 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
     params: TerminalMultiplex,
     handler: async (
       _params,
-      { runtime, connectionId, sendBinary, registerBinaryStreamHandler },
+      { runtime, connectionId, sendBinary, registerBinaryStreamHandler, signal },
       emit
     ) => {
       if (!sendBinary || !registerBinaryStreamHandler || !connectionId) {
@@ -807,9 +809,12 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
         const isMobile = request.client?.type === 'mobile'
         if (!leaf?.ptyId && isMobile) {
           try {
-            const ptyId = await runtime.waitForLeafPtyId(request.terminal)
+            const ptyId = await runtime.waitForLeafPtyId(request.terminal, 10_000, signal)
             leaf = { ptyId }
           } catch {
+            if (closed || signal?.aborted) {
+              return
+            }
             // Fall through to the explicit no_connected_pty error below.
           }
         }
@@ -995,7 +1000,7 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
     params: TerminalSubscribe,
     handler: async (
       params,
-      { runtime, connectionId, sendBinary, registerBinaryStreamHandler },
+      { runtime, connectionId, sendBinary, registerBinaryStreamHandler, signal },
       emit
     ) => {
       let leaf = runtime.resolveLeafForHandle(params.terminal)
@@ -1008,9 +1013,12 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
       // the subscribe can proceed normally.
       if (!leaf?.ptyId && isMobile) {
         try {
-          const ptyId = await runtime.waitForLeafPtyId(params.terminal)
+          const ptyId = await runtime.waitForLeafPtyId(params.terminal, 10_000, signal)
           leaf = { ptyId }
         } catch {
+          if (signal?.aborted) {
+            return
+          }
           // PTY wait timed out — fall through to scrollback-only path below
         }
       }

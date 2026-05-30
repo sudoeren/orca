@@ -22,14 +22,23 @@ import {
   GENERAL_CACHE_TIMER_SEARCH_ENTRIES,
   GENERAL_CLI_SEARCH_ENTRIES,
   GENERAL_EDITOR_SEARCH_ENTRIES,
+  GENERAL_NAVIGATION_SEARCH_ENTRIES,
   GENERAL_PANE_SEARCH_ENTRIES,
   GENERAL_SUPPORT_SEARCH_ENTRIES,
   GENERAL_UPDATE_SEARCH_ENTRIES,
   GENERAL_WORKSPACE_SEARCH_ENTRIES
 } from './general-search'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../ui/select'
+import { RecentTabOrderControl } from './RecentTabOrderControl'
 import { SearchableSetting } from './SearchableSetting'
 import { matchesSettingsSearch } from './settings-search'
+import {
+  SettingsSegmentedControl,
+  SettingsSubsectionHeader,
+  SettingsSwitch,
+  SettingsSwitchRow
+} from './SettingsFormControls'
+import { useMountedRef } from '@/hooks/useMountedRef'
 
 function createOpenInApplication(): OpenInApplication {
   return {
@@ -67,6 +76,65 @@ export function getDesktopPlatformFromUserAgent(userAgent: string): 'darwin' | '
 
 export { GENERAL_PANE_SEARCH_ENTRIES }
 
+export type AutoSaveDelayDraftState = {
+  sourceDelayMs: number
+  draft: string
+}
+
+export function createAutoSaveDelayDraftState(
+  editorAutoSaveDelayMs: number
+): AutoSaveDelayDraftState {
+  return {
+    sourceDelayMs: editorAutoSaveDelayMs,
+    draft: String(editorAutoSaveDelayMs)
+  }
+}
+
+function resolveAutoSaveDelayDraftState(
+  state: AutoSaveDelayDraftState,
+  editorAutoSaveDelayMs: number
+): AutoSaveDelayDraftState {
+  return state.sourceDelayMs === editorAutoSaveDelayMs
+    ? state
+    : createAutoSaveDelayDraftState(editorAutoSaveDelayMs)
+}
+
+export function updateAutoSaveDelayDraftState(
+  state: AutoSaveDelayDraftState,
+  editorAutoSaveDelayMs: number,
+  draft: string
+): AutoSaveDelayDraftState {
+  return {
+    // Why: settings persistence is async, so a committed draft must stay tied
+    // to the current source until the persisted value reloads.
+    ...resolveAutoSaveDelayDraftState(state, editorAutoSaveDelayMs),
+    draft
+  }
+}
+
+type OpenInApplicationsDraftState = {
+  sourceApplications: OpenInApplication[] | undefined
+  draft: OpenInApplication[]
+}
+
+function createOpenInApplicationsDraftState(
+  openInApplications: OpenInApplication[] | undefined
+): OpenInApplicationsDraftState {
+  return {
+    sourceApplications: openInApplications,
+    draft: openInApplications ?? []
+  }
+}
+
+function resolveOpenInApplicationsDraftState(
+  state: OpenInApplicationsDraftState,
+  openInApplications: OpenInApplication[] | undefined
+): OpenInApplicationsDraftState {
+  return state.sourceApplications === openInApplications
+    ? state
+    : createOpenInApplicationsDraftState(openInApplications)
+}
+
 type GeneralPaneProps = {
   settings: GlobalSettings
   updateSettings: (updates: Partial<GlobalSettings>) => void
@@ -75,6 +143,7 @@ type GeneralPaneProps = {
 export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): React.JSX.Element {
   const searchQuery = useAppStore((s) => s.settingsSearchQuery)
   const updateStatus = useAppStore((s) => s.updateStatus)
+  const mountedRef = useMountedRef()
   // Why: the 'error' variant of UpdateStatus does not carry a `version` field.
   // The main process emits `{ state: 'error' }` for both check failures (no
   // version known yet) and download/install failures (version was known from
@@ -100,11 +169,11 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
     updateVersionRef.current = null
   }
   const [appVersion, setAppVersion] = useState<string | null>(null)
-  const [autoSaveDelayDraft, setAutoSaveDelayDraft] = useState(
-    String(settings.editorAutoSaveDelayMs)
+  const [autoSaveDelayDraftState, setAutoSaveDelayDraftState] = useState(() =>
+    createAutoSaveDelayDraftState(settings.editorAutoSaveDelayMs)
   )
-  const [openInApplicationsDraft, setOpenInApplicationsDraft] = useState<OpenInApplication[]>(
-    settings.openInApplications ?? []
+  const [openInApplicationsDraftState, setOpenInApplicationsDraftState] = useState(() =>
+    createOpenInApplicationsDraftState(settings.openInApplications)
   )
   // Why: the star state is derived from gh, not from settings, so it does not
   // live in the global settings store. 'hidden' covers the gh-unavailable and
@@ -120,7 +189,15 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
   >('loading')
 
   useEffect(() => {
-    window.api.updater.getVersion().then(setAppVersion)
+    let cancelled = false
+    void window.api.updater.getVersion().then((version) => {
+      if (!cancelled) {
+        setAppVersion(version)
+      }
+    })
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   useEffect(() => {
@@ -145,24 +222,53 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
       return
     }
     setStarState('starring')
-    const ok = await window.api.gh.starOrca()
+    const ok = await window.api.gh.starOrca('settings')
     if (!ok) {
-      setStarState('error')
+      if (mountedRef.current) {
+        setStarState('error')
+      }
       return
     }
-    setStarState('starred')
+    if (mountedRef.current) {
+      setStarState('starred')
+    }
     // Why: clicking star anywhere should also permanently mute the
     // threshold-based nag so the user isn't re-prompted via the popup.
     await window.api.starNag.complete()
   }
 
-  useEffect(() => {
-    setAutoSaveDelayDraft(String(settings.editorAutoSaveDelayMs))
-  }, [settings.editorAutoSaveDelayMs])
+  const resolvedAutoSaveDelayDraftState = resolveAutoSaveDelayDraftState(
+    autoSaveDelayDraftState,
+    settings.editorAutoSaveDelayMs
+  )
+  if (resolvedAutoSaveDelayDraftState !== autoSaveDelayDraftState) {
+    // Why: Settings can be updated outside this pane; reconcile drafts before
+    // paint so the visible input never lags behind the persisted value.
+    setAutoSaveDelayDraftState(resolvedAutoSaveDelayDraftState)
+  }
+  const autoSaveDelayDraft = resolvedAutoSaveDelayDraftState.draft
+  const updateAutoSaveDelayDraft = (draft: string): void => {
+    setAutoSaveDelayDraftState((current) =>
+      updateAutoSaveDelayDraftState(current, settings.editorAutoSaveDelayMs, draft)
+    )
+  }
 
-  useEffect(() => {
-    setOpenInApplicationsDraft(settings.openInApplications ?? [])
-  }, [settings.openInApplications])
+  const resolvedOpenInApplicationsDraftState = resolveOpenInApplicationsDraftState(
+    openInApplicationsDraftState,
+    settings.openInApplications
+  )
+  if (resolvedOpenInApplicationsDraftState !== openInApplicationsDraftState) {
+    // Why: the Open In rows are a local draft, but Settings can reload them
+    // externally; sync before paint instead of after an Effect pass.
+    setOpenInApplicationsDraftState(resolvedOpenInApplicationsDraftState)
+  }
+  const openInApplicationsDraft = resolvedOpenInApplicationsDraftState.draft
+  const updateOpenInApplicationsDraft = (draft: OpenInApplication[]): void => {
+    setOpenInApplicationsDraftState((current) => ({
+      ...resolveOpenInApplicationsDraftState(current, settings.openInApplications),
+      draft
+    }))
+  }
 
   const commitOpenInApplications = (applications: OpenInApplication[]): void => {
     if (!shouldCommitOpenInApplicationsDraft(applications)) {
@@ -172,7 +278,7 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
   }
 
   const applyOpenInApplicationsDraft = (applications: OpenInApplication[]): void => {
-    setOpenInApplicationsDraft(applications)
+    updateOpenInApplicationsDraft(applications)
     commitOpenInApplications(applications)
   }
 
@@ -186,13 +292,13 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
   const commitAutoSaveDelay = (): void => {
     const trimmed = autoSaveDelayDraft.trim()
     if (trimmed === '') {
-      setAutoSaveDelayDraft(String(settings.editorAutoSaveDelayMs))
+      setAutoSaveDelayDraftState(createAutoSaveDelayDraftState(settings.editorAutoSaveDelayMs))
       return
     }
 
     const value = Number(trimmed)
     if (!Number.isFinite(value)) {
-      setAutoSaveDelayDraft(String(settings.editorAutoSaveDelayMs))
+      setAutoSaveDelayDraftState(createAutoSaveDelayDraftState(settings.editorAutoSaveDelayMs))
       return
     }
 
@@ -202,7 +308,9 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
       MAX_EDITOR_AUTO_SAVE_DELAY_MS
     )
     updateSettings({ editorAutoSaveDelayMs: next })
-    setAutoSaveDelayDraft(String(next))
+    setAutoSaveDelayDraftState((current) =>
+      updateAutoSaveDelayDraftState(current, settings.editorAutoSaveDelayMs, String(next))
+    )
   }
 
   const handleRestartToUpdate = (): void => {
@@ -214,14 +322,26 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
   }
 
   const visibleSections = [
+    matchesSettingsSearch(searchQuery, GENERAL_NAVIGATION_SEARCH_ENTRIES) ? (
+      <section key="navigation" className="space-y-4">
+        <SettingsSubsectionHeader title="Navigation" />
+        <RecentTabOrderControl
+          ctrlTabOrderMode={settings.ctrlTabOrderMode ?? 'mru'}
+          keywords={GENERAL_NAVIGATION_SEARCH_ENTRIES.flatMap((entry) => [
+            entry.title,
+            entry.description ?? '',
+            ...(entry.keywords ?? [])
+          ])}
+          updateSettings={updateSettings}
+        />
+      </section>
+    ) : null,
     matchesSettingsSearch(searchQuery, GENERAL_WORKSPACE_SEARCH_ENTRIES) ? (
       <section key="workspace" className="space-y-4">
-        <div className="space-y-1">
-          <h3 className="text-sm font-semibold">Workspace</h3>
-          <p className="text-xs text-muted-foreground">
-            Configure where new workspaces are created.
-          </p>
-        </div>
+        <SettingsSubsectionHeader
+          title="Workspace"
+          description="Configure where new workspaces are created."
+        />
 
         <SearchableSetting
           title="Workspace Directory"
@@ -255,32 +375,13 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
           title="Nest Workspaces"
           description="Create workspaces inside a repo-named subfolder."
           keywords={['nested', 'subfolder', 'directory']}
-          className="flex items-center justify-between gap-4 px-1 py-2"
         >
-          <div className="space-y-0.5">
-            <Label>Nest Workspaces</Label>
-            <p className="text-xs text-muted-foreground">
-              Create workspaces inside a repo-named subfolder.
-            </p>
-          </div>
-          <button
-            role="switch"
-            aria-checked={settings.nestWorkspaces}
-            onClick={() =>
-              updateSettings({
-                nestWorkspaces: !settings.nestWorkspaces
-              })
-            }
-            className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-colors ${
-              settings.nestWorkspaces ? 'bg-foreground' : 'bg-muted-foreground/30'
-            }`}
-          >
-            <span
-              className={`pointer-events-none block size-3.5 rounded-full bg-background shadow-sm transition-transform ${
-                settings.nestWorkspaces ? 'translate-x-4' : 'translate-x-0.5'
-              }`}
-            />
-          </button>
+          <SettingsSwitchRow
+            label="Nest Workspaces"
+            description="Create workspaces inside a repo-named subfolder."
+            checked={settings.nestWorkspaces}
+            onChange={() => updateSettings({ nestWorkspaces: !settings.nestWorkspaces })}
+          />
         </SearchableSetting>
 
         {/* Why: the "Don't ask again" toast in the delete-worktree dialog
@@ -291,33 +392,17 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
             title="Ask Before Deleting Workspaces"
             description="Show a confirmation dialog before deleting a workspace."
             keywords={['delete', 'worktree', 'confirm', 'dialog', 'skip', 'prompt']}
-            className="flex items-center justify-between gap-4 px-1 py-2"
           >
-            <div className="space-y-0.5">
-              <Label>Ask Before Deleting Workspaces</Label>
-              <p className="text-xs text-muted-foreground">
-                Show a confirmation before deleting a workspace from the context menu. Failed
-                deletes still surface a Force Delete fallback.
-              </p>
-            </div>
-            <button
-              role="switch"
-              aria-checked={!settings.skipDeleteWorktreeConfirm}
-              onClick={() =>
+            <SettingsSwitchRow
+              label="Ask Before Deleting Workspaces"
+              description="Show a confirmation before deleting a workspace from the context menu. Failed deletes still surface a Force Delete fallback."
+              checked={!settings.skipDeleteWorktreeConfirm}
+              onChange={() =>
                 updateSettings({
                   skipDeleteWorktreeConfirm: !settings.skipDeleteWorktreeConfirm
                 })
               }
-              className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-colors ${
-                !settings.skipDeleteWorktreeConfirm ? 'bg-foreground' : 'bg-muted-foreground/30'
-              }`}
-            >
-              <span
-                className={`pointer-events-none block size-3.5 rounded-full bg-background shadow-sm transition-transform ${
-                  !settings.skipDeleteWorktreeConfirm ? 'translate-x-4' : 'translate-x-0.5'
-                }`}
-              />
-            </button>
+            />
           </SearchableSetting>
         </div>
 
@@ -326,32 +411,17 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
             title="Ask Before Deleting Automations"
             description="Show a confirmation dialog before deleting an automation and its run history."
             keywords={['delete', 'automation', 'confirm', 'dialog', 'skip', 'prompt']}
-            className="flex items-center justify-between gap-4 px-1 py-2"
           >
-            <div className="space-y-0.5">
-              <Label>Ask Before Deleting Automations</Label>
-              <p className="text-xs text-muted-foreground">
-                Show a confirmation before deleting automations and their run history.
-              </p>
-            </div>
-            <button
-              role="switch"
-              aria-checked={!settings.skipDeleteAutomationConfirm}
-              onClick={() =>
+            <SettingsSwitchRow
+              label="Ask Before Deleting Automations"
+              description="Show a confirmation before deleting automations and their run history."
+              checked={!settings.skipDeleteAutomationConfirm}
+              onChange={() =>
                 updateSettings({
                   skipDeleteAutomationConfirm: !settings.skipDeleteAutomationConfirm
                 })
               }
-              className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-colors ${
-                !settings.skipDeleteAutomationConfirm ? 'bg-foreground' : 'bg-muted-foreground/30'
-              }`}
-            >
-              <span
-                className={`pointer-events-none block size-3.5 rounded-full bg-background shadow-sm transition-transform ${
-                  !settings.skipDeleteAutomationConfirm ? 'translate-x-4' : 'translate-x-0.5'
-                }`}
-              />
-            </button>
+            />
           </SearchableSetting>
         </div>
 
@@ -407,7 +477,7 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
                   onChange={(event) => {
                     const next = [...openInApplicationsDraft]
                     next[index] = { ...app, label: event.target.value }
-                    setOpenInApplicationsDraft(next)
+                    updateOpenInApplicationsDraft(next)
                   }}
                   onBlur={() => commitOpenInApplications(openInApplicationsDraft)}
                   onKeyDown={(event) => {
@@ -422,7 +492,7 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
                   onChange={(event) => {
                     const next = [...openInApplicationsDraft]
                     next[index] = { ...app, command: event.target.value }
-                    setOpenInApplicationsDraft(next)
+                    updateOpenInApplicationsDraft(next)
                   }}
                   onBlur={() => commitOpenInApplications(openInApplicationsDraft)}
                   onKeyDown={(event) => {
@@ -436,7 +506,7 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
                   size="sm"
                   onClick={() => {
                     const next = openInApplicationsDraft.filter((entry) => entry.id !== app.id)
-                    setOpenInApplicationsDraft(next)
+                    updateOpenInApplicationsDraft(next)
                     commitOpenInApplications(next)
                   }}
                 >
@@ -449,7 +519,7 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
             variant="outline"
             size="sm"
             onClick={() =>
-              setOpenInApplicationsDraft([...openInApplicationsDraft, createOpenInApplication()])
+              updateOpenInApplicationsDraft([...openInApplicationsDraft, createOpenInApplication()])
             }
             disabled={openInApplicationsDraft.length >= OPEN_IN_APPLICATIONS_MAX}
           >
@@ -460,50 +530,31 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
     ) : null,
     matchesSettingsSearch(searchQuery, GENERAL_EDITOR_SEARCH_ENTRIES) ? (
       <section key="editor" className="space-y-4">
-        <div className="space-y-1">
-          <h3 className="text-sm font-semibold">Editor</h3>
-          <p className="text-xs text-muted-foreground">Configure how Orca persists file edits.</p>
-        </div>
+        <SettingsSubsectionHeader
+          title="Editor"
+          description="Configure how Orca persists file edits."
+        />
 
         <SearchableSetting
           title="Auto Save Files"
           description="Save editor and editable diff changes automatically after a short pause."
           keywords={['autosave', 'save']}
-          className="flex items-center justify-between gap-4 px-1 py-2"
         >
-          <div className="space-y-0.5">
-            <Label>Auto Save Files</Label>
-            <p className="text-xs text-muted-foreground">
-              Save editor and editable diff changes automatically after a short pause.
-            </p>
-          </div>
-          <button
-            role="switch"
-            aria-checked={settings.editorAutoSave}
-            onClick={() =>
-              updateSettings({
-                editorAutoSave: !settings.editorAutoSave
-              })
-            }
-            className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-colors ${
-              settings.editorAutoSave ? 'bg-foreground' : 'bg-muted-foreground/30'
-            }`}
-          >
-            <span
-              className={`pointer-events-none block size-3.5 rounded-full bg-background shadow-sm transition-transform ${
-                settings.editorAutoSave ? 'translate-x-4' : 'translate-x-0.5'
-              }`}
-            />
-          </button>
+          <SettingsSwitchRow
+            label="Auto Save Files"
+            description="Save editor and editable diff changes automatically after a short pause."
+            checked={settings.editorAutoSave}
+            onChange={() => updateSettings({ editorAutoSave: !settings.editorAutoSave })}
+          />
         </SearchableSetting>
 
         <SearchableSetting
           title="Auto Save Delay"
           description="How long Orca waits after your last edit before saving automatically."
           keywords={['autosave', 'delay', 'milliseconds']}
-          className="flex items-center justify-between gap-4 px-1 py-2"
+          className="flex items-center justify-between gap-4 py-2"
         >
-          <div className="space-y-0.5">
+          <div className="min-w-0 flex-1 space-y-0.5">
             <Label>Auto Save Delay</Label>
             <p className="text-xs text-muted-foreground">
               How long Orca waits after your last edit before saving automatically. First launch
@@ -517,7 +568,7 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
               max={MAX_EDITOR_AUTO_SAVE_DELAY_MS}
               step={250}
               value={autoSaveDelayDraft}
-              onChange={(e) => setAutoSaveDelayDraft(e.target.value)}
+              onChange={(e) => updateAutoSaveDelayDraft(e.target.value)}
               onBlur={commitAutoSaveDelay}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') {
@@ -534,128 +585,78 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
           title="Default Diff View"
           description="Preferred presentation format for showing git diffs by default."
           keywords={['diff', 'view', 'inline', 'side-by-side', 'split']}
-          className="flex flex-col items-start gap-3 px-1 py-2 sm:flex-row sm:items-center sm:justify-between"
+          className="flex items-center justify-between gap-4 py-2"
         >
-          <div className="space-y-0.5">
+          <div className="min-w-0 flex-1 space-y-0.5">
             <Label>Default Diff View</Label>
             <p className="text-xs text-muted-foreground">
               Preferred presentation format for showing git diffs by default.
             </p>
           </div>
-          <div className="flex shrink-0 items-center rounded-md border border-border/60 bg-background/50 p-0.5">
-            {(['inline', 'side-by-side'] as const).map((option) => (
-              <button
-                key={option}
-                onClick={() => updateSettings({ diffDefaultView: option })}
-                className={`rounded-sm px-3 py-1 text-sm transition-colors ${
-                  settings.diffDefaultView === option
-                    ? 'bg-accent font-medium text-accent-foreground'
-                    : 'text-muted-foreground hover:text-foreground'
-                }`}
-              >
-                {option === 'inline' ? 'Inline' : 'Side-by-side'}
-              </button>
-            ))}
-          </div>
+          <SettingsSegmentedControl
+            ariaLabel="Default Diff View"
+            value={settings.diffDefaultView}
+            onChange={(option) => updateSettings({ diffDefaultView: option })}
+            options={[
+              { value: 'inline', label: 'Inline' },
+              { value: 'side-by-side', label: 'Side-by-side' }
+            ]}
+          />
         </SearchableSetting>
 
         <SearchableSetting
           title="Default Diff File Tree"
           description="Show or hide the file tree when opening combined diff views."
           keywords={['diff', 'tree', 'file tree', 'combined diff', 'sidebar']}
-          className="flex flex-col items-start gap-3 px-1 py-2 sm:flex-row sm:items-center sm:justify-between"
+          className="flex items-center justify-between gap-4 py-2"
         >
-          <div className="space-y-0.5">
+          <div className="min-w-0 flex-1 space-y-0.5">
             <Label>Default Diff File Tree</Label>
             <p className="text-xs text-muted-foreground">
               Show or hide the file tree when opening combined diff views.
             </p>
           </div>
-          <div className="flex shrink-0 items-center rounded-md border border-border/60 bg-background/50 p-0.5">
-            {[
-              { label: 'Shown', value: true },
-              { label: 'Hidden', value: false }
-            ].map((option) => (
-              <button
-                key={option.label}
-                type="button"
-                onClick={() =>
-                  updateSettings({ combinedDiffFileTreeVisibleByDefault: option.value })
-                }
-                className={`rounded-sm px-3 py-1 text-sm transition-colors ${
-                  settings.combinedDiffFileTreeVisibleByDefault === option.value
-                    ? 'bg-accent font-medium text-accent-foreground'
-                    : 'text-muted-foreground hover:text-foreground'
-                }`}
-              >
-                {option.label}
-              </button>
-            ))}
-          </div>
+          <SettingsSegmentedControl
+            ariaLabel="Default Diff File Tree"
+            value={settings.combinedDiffFileTreeVisibleByDefault ? 'shown' : 'hidden'}
+            onChange={(option) =>
+              updateSettings({ combinedDiffFileTreeVisibleByDefault: option === 'shown' })
+            }
+            options={[
+              { value: 'shown', label: 'Shown' },
+              { value: 'hidden', label: 'Hidden' }
+            ]}
+          />
         </SearchableSetting>
 
         <SearchableSetting
           title="Minimap"
           description="Show the minimap overview when editing a file."
           keywords={['minimap', 'overview', 'code', 'scroll']}
-          className="flex items-center justify-between gap-4 px-1 py-2"
         >
-          <div className="space-y-0.5">
-            <Label>Minimap</Label>
-            <p className="text-xs text-muted-foreground">
-              Show the minimap overview when editing a file.
-            </p>
-          </div>
-          <button
-            role="switch"
-            aria-checked={settings.editorMinimapEnabled}
-            onClick={() =>
-              updateSettings({
-                editorMinimapEnabled: !settings.editorMinimapEnabled
-              })
+          <SettingsSwitchRow
+            label="Minimap"
+            description="Show the minimap overview when editing a file."
+            checked={settings.editorMinimapEnabled}
+            onChange={() =>
+              updateSettings({ editorMinimapEnabled: !settings.editorMinimapEnabled })
             }
-            className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-colors ${
-              settings.editorMinimapEnabled ? 'bg-foreground' : 'bg-muted-foreground/30'
-            }`}
-          >
-            <span
-              className={`pointer-events-none block size-3.5 rounded-full bg-background shadow-sm transition-transform ${
-                settings.editorMinimapEnabled ? 'translate-x-4' : 'translate-x-0.5'
-              }`}
-            />
-          </button>
+          />
         </SearchableSetting>
 
         <SearchableSetting
           title="Markdown Review Notes"
           description="Show local markdown review note controls in rich editor mode."
           keywords={['markdown', 'review', 'notes', 'annotations', 'agents']}
-          className="flex items-center justify-between gap-4 px-1 py-2"
         >
-          <div className="space-y-0.5">
-            <Label>Markdown Review Notes</Label>
-            <p className="text-xs text-muted-foreground">
-              Show local markdown note controls in rich editor mode and agent handoff actions.
-            </p>
-          </div>
-          <button
-            role="switch"
-            aria-checked={settings.markdownReviewToolsEnabled}
-            onClick={() =>
-              updateSettings({
-                markdownReviewToolsEnabled: !settings.markdownReviewToolsEnabled
-              })
+          <SettingsSwitchRow
+            label="Markdown Review Notes"
+            description="Show local markdown note controls in rich editor mode and agent handoff actions."
+            checked={settings.markdownReviewToolsEnabled}
+            onChange={() =>
+              updateSettings({ markdownReviewToolsEnabled: !settings.markdownReviewToolsEnabled })
             }
-            className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-colors ${
-              settings.markdownReviewToolsEnabled ? 'bg-foreground' : 'bg-muted-foreground/30'
-            }`}
-          >
-            <span
-              className={`pointer-events-none block size-3.5 rounded-full bg-background shadow-sm transition-transform ${
-                settings.markdownReviewToolsEnabled ? 'translate-x-4' : 'translate-x-0.5'
-              }`}
-            />
-          </button>
+          />
         </SearchableSetting>
       </section>
     ) : null,
@@ -667,62 +668,41 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
     ) : null,
     matchesSettingsSearch(searchQuery, GENERAL_CACHE_TIMER_SEARCH_ENTRIES) ? (
       <section key="cache-timer" className="space-y-4">
-        <div className="space-y-1">
-          <h3 className="text-sm font-semibold">Prompt Cache Timer</h3>
-          <p className="text-xs text-muted-foreground">
-            Claude caches your conversation to reduce costs. When idle too long the cache expires
-            and the next message resends full context at higher cost. This shows a countdown so you
-            know when to resume.
-          </p>
-        </div>
+        <SettingsSubsectionHeader
+          title="Prompt Cache Timer"
+          description="Claude caches your conversation to reduce costs. When idle too long the cache expires and the next message resends full context at higher cost. This shows a countdown so you know when to resume."
+        />
 
         <SearchableSetting
           title="Cache Timer"
           description="Show a countdown after a Claude agent becomes idle."
-          // Why: this is the primary control for the section gated by
-          // GENERAL_CACHE_TIMER_SEARCH_ENTRIES (title "Prompt Cache Timer").
-          // Mirroring those keywords keeps a search for "Prompt Cache Timer"
-          // from rendering the section header with no body underneath.
           keywords={GENERAL_CACHE_TIMER_SEARCH_ENTRIES.flatMap((entry) => [
             entry.title,
             entry.description ?? '',
             ...(entry.keywords ?? [])
           ])}
-          className="flex items-center justify-between gap-4 px-1 py-2"
+          className="flex items-center justify-between gap-4 py-2"
         >
-          <div className="space-y-0.5">
+          <div className="min-w-0 flex-1 space-y-0.5">
             <div className="flex items-center gap-2">
-              <Timer className="size-4" />
+              <Timer className="size-4 text-muted-foreground" />
               <Label>Cache Timer</Label>
             </div>
             <p className="text-xs text-muted-foreground">
               Show a countdown in the sidebar after a Claude agent becomes idle.
             </p>
           </div>
-          <button
-            role="switch"
-            aria-checked={settings.promptCacheTimerEnabled}
-            aria-label="Cache Timer"
-            onClick={() => {
+          <SettingsSwitch
+            ariaLabel="Cache Timer"
+            checked={settings.promptCacheTimerEnabled}
+            onChange={() => {
               const enabling = !settings.promptCacheTimerEnabled
               updateSettings({ promptCacheTimerEnabled: enabling })
-              // Why: if enabling mid-session, seed timers for any Claude tabs that
-              // are already idle — their working→idle transition already happened
-              // and won't re-fire.
               if (enabling) {
                 useAppStore.getState().seedCacheTimersForIdleTabs()
               }
             }}
-            className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-colors ${
-              settings.promptCacheTimerEnabled ? 'bg-foreground' : 'bg-muted-foreground/30'
-            }`}
-          >
-            <span
-              className={`pointer-events-none block size-3.5 rounded-full bg-background shadow-sm transition-transform ${
-                settings.promptCacheTimerEnabled ? 'translate-x-4' : 'translate-x-0.5'
-              }`}
-            />
-          </button>
+          />
         </SearchableSetting>
 
         {settings.promptCacheTimerEnabled && (
@@ -730,9 +710,9 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
             title="Timer Duration"
             description="Match this to your provider's cache TTL."
             keywords={['cache', 'timer', 'duration', 'ttl']}
-            className="flex items-center justify-between gap-4 px-1 py-2 pl-7"
+            className="flex items-center justify-between gap-4 py-2 pl-7"
           >
-            <div className="space-y-0.5">
+            <div className="min-w-0 flex-1 space-y-0.5">
               <Label>Timer Duration</Label>
               <p className="text-xs text-muted-foreground">
                 Match this to your provider&apos;s cache TTL. The default is 5 minutes.
@@ -756,10 +736,10 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
     ) : null,
     matchesSettingsSearch(searchQuery, GENERAL_UPDATE_SEARCH_ENTRIES) ? (
       <section key="updates" className="space-y-4">
-        <div className="space-y-1">
-          <h3 className="text-sm font-semibold">Updates</h3>
-          <p className="text-xs text-muted-foreground">Current version: {appVersion ?? '…'}</p>
-        </div>
+        <SettingsSubsectionHeader
+          title="Updates"
+          description={`Current version: ${appVersion ?? '…'}`}
+        />
 
         <SearchableSetting
           title="Check for Updates"
@@ -873,9 +853,9 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
   ].filter(Boolean)
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-6">
       {visibleSections.map((section, index) => (
-        <div key={index} className="space-y-8">
+        <div key={index} className="space-y-6">
           {index > 0 ? <Separator /> : null}
           {section}
         </div>
@@ -921,9 +901,7 @@ function SupportSection({
         <div className="space-y-8">
           {hasPrecedingSections ? <Separator /> : null}
           <div className="space-y-4">
-            <div className="space-y-1">
-              <h3 className="text-sm font-semibold">Support Orca</h3>
-            </div>
+            <SettingsSubsectionHeader title="Support Orca" />
             {state === 'loading' ? <SupportRowSkeleton /> : null}
             {state !== 'loading' && state !== 'hidden' ? (
               <SupportRow state={state} onStarClick={onStarClick} />
@@ -937,7 +915,7 @@ function SupportSection({
 
 function SupportRowSkeleton(): React.JSX.Element {
   return (
-    <div className="flex items-center justify-between gap-4 px-1 py-2" aria-hidden="true">
+    <div className="flex items-center justify-between gap-4 py-2" aria-hidden="true">
       <div className="h-4 w-36 rounded bg-muted/50 animate-pulse" />
       <div className="h-8 w-24 rounded-md bg-muted/50 animate-pulse" />
     </div>
@@ -962,7 +940,7 @@ function SupportRow({
       title="Star Orca on GitHub"
       description="Support the project with a GitHub star via the gh CLI."
       keywords={['star', 'github', 'support', 'feedback', 'like']}
-      className="flex items-center justify-between gap-4 px-1 py-2"
+      className="flex items-center justify-between gap-4 py-2"
     >
       <Label>Star Orca on GitHub</Label>
       {state === 'starred' ? (

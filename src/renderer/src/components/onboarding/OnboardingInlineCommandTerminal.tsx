@@ -6,15 +6,20 @@ import { focusTerminalTabSurface } from '@/lib/focus-terminal-tab-surface'
 import { useAppStore } from '@/store'
 
 const ONBOARDING_INLINE_TERMINAL_WORKTREE_ID = 'onboarding-inline-terminal'
-const AUTO_INSERT_DELAY_MS = 700
+const AUTO_INSERT_DELAY_MS = 250
 const READY_RETRY_MS = 100
-const READY_MAX_ATTEMPTS = 50
+const PTY_TEXT_FALLBACK_MS = 750
 
 type OnboardingInlineCommandTerminalProps = {
   command: string
   title: string
-  description: string
+  description?: string
   ariaLabel: string
+  terminalHeightPx?: number
+  terminalTopMarginPx?: number
+  descriptionPaddingClassName?: string
+  autoScrollIntoView?: boolean
+  worktreeId?: string
   onOpened?: () => void
   onInteracted?: (method: 'keyboard' | 'pointer', event?: KeyboardEvent<HTMLElement>) => void
 }
@@ -24,6 +29,11 @@ export function OnboardingInlineCommandTerminal({
   title,
   description,
   ariaLabel,
+  terminalHeightPx = 280,
+  terminalTopMarginPx = 20,
+  descriptionPaddingClassName = 'px-4 py-3',
+  autoScrollIntoView = true,
+  worktreeId = ONBOARDING_INLINE_TERMINAL_WORKTREE_ID,
   onOpened,
   onInteracted
 }: OnboardingInlineCommandTerminalProps): React.JSX.Element {
@@ -52,19 +62,36 @@ export function OnboardingInlineCommandTerminal({
   }, [onOpened])
 
   useEffect(() => {
-    void window.api.app.getFloatingTerminalCwd({ path: '~' }).then(setCwd)
+    let cancelled = false
+    void window.api.app.getFloatingTerminalCwd({ path: '~' }).then((nextCwd) => {
+      if (!cancelled) {
+        setCwd(nextCwd)
+      }
+    })
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   useEffect(() => {
-    const tab = createTab(ONBOARDING_INLINE_TERMINAL_WORKTREE_ID, undefined, undefined, {
-      activate: false
+    const tab = createTab(worktreeId, undefined, undefined, {
+      activate: false,
+      recordInteraction: false
     })
-    setActiveTabForWorktree(ONBOARDING_INLINE_TERMINAL_WORKTREE_ID, tab.id)
-    setTabCustomTitle(tab.id, title)
+    setActiveTabForWorktree(worktreeId, tab.id)
+    setTabCustomTitle(tab.id, title, { recordInteraction: false })
     setTabId(tab.id)
-  }, [createTab, setActiveTabForWorktree, setTabCustomTitle, title])
+    return () => {
+      // Why: inline setup panels can disappear after detection succeeds; close
+      // the backing tab so installer shells do not keep running invisibly.
+      closeTab(tab.id, { recordInteraction: false })
+    }
+  }, [closeTab, createTab, setActiveTabForWorktree, setTabCustomTitle, title, worktreeId])
 
   useEffect(() => {
+    if (!autoScrollIntoView) {
+      return undefined
+    }
     if (prefersReducedMotion) {
       const scrollFrame = window.requestAnimationFrame(() => {
         terminalSectionRef.current?.scrollIntoView({ behavior: 'auto', block: 'center' })
@@ -74,11 +101,33 @@ export function OnboardingInlineCommandTerminal({
     // Why: double rAF guarantees the browser commits the initial collapsed
     // styles before we flip to `entered`, so the height/opacity transition
     // actually plays instead of snapping straight to the final state.
+    let enteredFrame: number | null = null
     const enterFrame = window.requestAnimationFrame(() => {
-      window.requestAnimationFrame(() => setEntered(true))
+      enteredFrame = window.requestAnimationFrame(() => setEntered(true))
     })
-    return () => window.cancelAnimationFrame(enterFrame)
-  }, [prefersReducedMotion])
+    return () => {
+      window.cancelAnimationFrame(enterFrame)
+      if (enteredFrame !== null) {
+        window.cancelAnimationFrame(enteredFrame)
+      }
+    }
+  }, [autoScrollIntoView, prefersReducedMotion])
+
+  useEffect(() => {
+    if (autoScrollIntoView) {
+      return undefined
+    }
+    let enteredFrame: number | null = null
+    const enterFrame = window.requestAnimationFrame(() => {
+      enteredFrame = window.requestAnimationFrame(() => setEntered(true))
+    })
+    return () => {
+      window.cancelAnimationFrame(enterFrame)
+      if (enteredFrame !== null) {
+        window.cancelAnimationFrame(enteredFrame)
+      }
+    }
+  }, [autoScrollIntoView])
 
   // Why: tracking scroll *during* the height transition is unavoidably
   // jumpy — ResizeObserver / rAF ticks land in pixel-sized chunks, and each
@@ -86,7 +135,7 @@ export function OnboardingInlineCommandTerminal({
   // the height has nearly settled fire a single native smooth scroll. The
   // browser eases that scroll itself, which is the smoothest path available.
   useEffect(() => {
-    if (!entered || prefersReducedMotion) {
+    if (!autoScrollIntoView || !entered || prefersReducedMotion) {
       return
     }
     const section = terminalSectionRef.current
@@ -97,16 +146,18 @@ export function OnboardingInlineCommandTerminal({
       section.scrollIntoView({ behavior: 'smooth', block: 'center' })
     }, 500)
     return () => window.clearTimeout(scrollTimer)
-  }, [entered, prefersReducedMotion])
+  }, [autoScrollIntoView, entered, prefersReducedMotion])
 
   const insertCommand = useCallback(() => {
     if (!tabId) {
       return
     }
-    terminalSectionRef.current?.scrollIntoView({
-      behavior: 'auto',
-      block: 'nearest'
-    })
+    if (autoScrollIntoView) {
+      terminalSectionRef.current?.scrollIntoView({
+        behavior: 'auto',
+        block: 'nearest'
+      })
+    }
     window.dispatchEvent(
       new CustomEvent<PasteTerminalTextDetail>(PASTE_TERMINAL_TEXT_EVENT, {
         detail: {
@@ -116,41 +167,65 @@ export function OnboardingInlineCommandTerminal({
       })
     )
     focusTerminalTabSurface(tabId)
-  }, [command, tabId])
+  }, [autoScrollIntoView, command, tabId])
 
   useEffect(() => {
-    if (!tabId || autoInsertedRef.current === command) {
+    if (!tabId || !cwd || autoInsertedRef.current === command) {
       return
     }
     let canceled = false
     let insertionTimer: number | null = null
+    let retryTimer: number | null = null
+    let ptyFirstSeenAt: number | null = null
 
-    const waitForTerminal = (attempt: number): void => {
+    const scheduleInsert = (): void => {
+      if (insertionTimer !== null) {
+        return
+      }
+      insertionTimer = window.setTimeout(() => {
+        if (!canceled) {
+          autoInsertedRef.current = command
+          insertCommand()
+        }
+      }, AUTO_INSERT_DELAY_MS)
+    }
+
+    const waitForTerminal = (): void => {
       if (canceled) {
         return
       }
-      if (findTerminalTabElement(tabId)?.querySelector('[data-pty-id]')) {
-        insertionTimer = window.setTimeout(() => {
-          if (!canceled) {
-            autoInsertedRef.current = command
-            insertCommand()
-          }
-        }, AUTO_INSERT_DELAY_MS)
+      const terminalElement = findTerminalTabElement(tabId)
+      const hasPty = Boolean(terminalElement?.querySelector('[data-pty-id]'))
+      if (terminalReadyForCommand(terminalElement)) {
+        scheduleInsert()
         return
       }
-      if (attempt < READY_MAX_ATTEMPTS) {
-        window.setTimeout(() => waitForTerminal(attempt + 1), READY_RETRY_MS)
+      if (hasPty) {
+        ptyFirstSeenAt ??= Date.now()
+        // Why: GPU/canvas terminal renderers may not expose visible prompt text
+        // in .xterm-rows. Once the PTY has settled briefly, paste the draft
+        // instead of waiting on a DOM signal that may never arrive.
+        if (Date.now() - ptyFirstSeenAt >= PTY_TEXT_FALLBACK_MS) {
+          scheduleInsert()
+          return
+        }
+      } else {
+        ptyFirstSeenAt = null
       }
+      retryTimer = window.setTimeout(waitForTerminal, READY_RETRY_MS)
     }
 
-    waitForTerminal(0)
+    waitForTerminal()
     return () => {
       canceled = true
+      if (retryTimer !== null) {
+        window.clearTimeout(retryTimer)
+      }
       if (insertionTimer !== null) {
         window.clearTimeout(insertionTimer)
       }
     }
-  }, [command, insertCommand, tabId])
+  }, [command, cwd, insertCommand, tabId])
 
   // Why: grid 0fr → 1fr animates to the child's natural height without a
   // hardcoded max-height, so we don't leave dead space if the terminal
@@ -163,7 +238,7 @@ export function OnboardingInlineCommandTerminal({
       style={{
         gridTemplateRows: entered ? '1fr' : '0fr',
         opacity: entered ? 1 : 0,
-        marginTop: entered ? 20 : 0
+        marginTop: entered ? terminalTopMarginPx : 0
       }}
     >
       <section
@@ -171,23 +246,26 @@ export function OnboardingInlineCommandTerminal({
         aria-label={ariaLabel}
         className="min-h-0 overflow-hidden rounded-xl border border-border bg-card"
       >
-        <div className="border-b border-border px-4 py-3">
-          <p className="text-xs leading-relaxed text-muted-foreground">{description}</p>
-        </div>
+        {description ? (
+          <div className={`border-b border-border ${descriptionPaddingClassName}`}>
+            <p className="text-xs leading-relaxed text-muted-foreground">{description}</p>
+          </div>
+        ) : null}
         <div
-          className="relative h-[280px] min-h-0 bg-background"
+          className="relative min-h-0 bg-background"
+          style={{ height: terminalHeightPx }}
           onKeyDownCapture={(event) => onInteracted?.('keyboard', event)}
           onPointerDownCapture={() => onInteracted?.('pointer')}
         >
           {cwd && tabId ? (
             <TerminalPane
               tabId={tabId}
-              worktreeId={ONBOARDING_INLINE_TERMINAL_WORKTREE_ID}
+              worktreeId={worktreeId}
               cwd={cwd}
               isActive
               isVisible
-              onPtyExit={() => closeTab(tabId)}
-              onCloseTab={() => closeTab(tabId)}
+              onPtyExit={() => closeTab(tabId, { recordInteraction: false })}
+              onCloseTab={() => closeTab(tabId, { recordInteraction: false })}
             />
           ) : (
             <div className="flex h-full items-center justify-center gap-2 text-xs text-muted-foreground">
@@ -208,4 +286,14 @@ function findTerminalTabElement(tabId: string): HTMLElement | null {
     }
   }
   return null
+}
+
+function terminalReadyForCommand(element: HTMLElement | null): boolean {
+  if (!element?.querySelector('[data-pty-id]')) {
+    return false
+  }
+  // Why: pasting before the login shell renders a prompt can double-echo the
+  // draft command. Visible terminal text is the least intrusive readiness signal.
+  const renderedText = element.querySelector('.xterm-rows')?.textContent?.trim() ?? ''
+  return renderedText.length > 0
 }

@@ -13,7 +13,7 @@ import {
   normalizeColor,
   resolveEffectiveTerminalAppearance
 } from '@/lib/terminal-theme'
-import type { PaneManager } from '@/lib/pane-manager/pane-manager'
+import type { ManagedPane, PaneManager } from '@/lib/pane-manager/pane-manager'
 import TerminalSearch from '@/components/TerminalSearch'
 import type { PtyTransport } from './pty-transport'
 import { fitPanes, isWindowsUserAgent, shellEscapePath } from './pane-helpers'
@@ -23,6 +23,7 @@ import { EMPTY_LAYOUT, serializeTerminalLayout } from './layout-serialization'
 import { makePaneKey } from '../../../../shared/stable-pane-id'
 import {
   applyExpandedLayoutTo,
+  cancelPendingPaneSizeRefreshFrames,
   createExpandCollapseActions,
   restoreExpandedLayoutFrom
 } from './expand-collapse'
@@ -67,18 +68,22 @@ import { FLOATING_TERMINAL_WORKTREE_ID } from '../../../../shared/constants'
 import { getRepoIdFromWorktreeId } from '../../../../shared/worktree-id'
 import {
   getTerminalQuickCommandScope,
+  isTerminalQuickCommandComplete,
   terminalQuickCommandMatchesRepo
 } from '../../../../shared/terminal-quick-commands'
 import {
   createTerminalQuickCommandDraft,
   TerminalQuickCommandDialog
 } from '@/components/terminal-quick-commands/TerminalQuickCommandDialog'
+import { keybindingMatchesAction } from '../../../../shared/keybindings'
+import { pasteTerminalClipboard } from './terminal-clipboard-paste'
 
 // Why: registry lives in a leaf module so the store slice can import it
 // without re-entering the `slice → TerminalPane → store → slice` cycle
 // that otherwise leaves createTerminalSlice undefined at store-init time.
 import { shutdownBufferCaptures } from './shutdown-buffer-captures'
 import { mergeCapturedLeafState } from './merge-captured-leaf-state'
+import { pasteTerminalText } from './terminal-bracketed-paste'
 
 type TerminalPaneProps = {
   tabId: string
@@ -101,6 +106,10 @@ function formatClipboardImagePasteError(error: unknown): string {
   return `Image paste failed: ${detail}`
 }
 
+function isXtermHelperTextarea(target: EventTarget | null): target is HTMLElement {
+  return target instanceof HTMLElement && target.classList.contains('xterm-helper-textarea')
+}
+
 export default function TerminalPane({
   tabId,
   worktreeId,
@@ -118,6 +127,7 @@ export default function TerminalPane({
   const expandedStyleSnapshotRef = useRef<Map<HTMLElement, { display: string; flex: string }>>(
     new Map()
   )
+  const pendingPaneSizeRefreshFrameIdsRef = useRef<number[]>([])
   // Why (separate from expandedStyleSnapshotRef): Activity isolation is a
   // transient view override that must not collide with the user-facing
   // expanded-pane state or the layout snapshot. Keeping its own snapshot
@@ -173,75 +183,104 @@ export default function TerminalPane({
   // (desktop-fit), we also trigger safeFit on affected panes so the terminal
   // resizes back to desktop dimensions.
   const [, setOverrideTick] = useState(0)
-  useEffect(
-    () =>
-      onOverrideChange((event) => {
-        setOverrideTick((n) => n + 1)
-        if (event.mode === 'desktop-fit') {
-          const manager = managerRef.current
-          if (!manager) {
-            return
-          }
-          // Why: pane IDs are per-tab, so resolve the affected PTY through this
-          // tab's live transport bindings instead of global numeric pane IDs.
-          const getAffectedPanes = (): ReturnType<typeof manager.getPanes> =>
-            manager
-              .getPanes()
-              .filter((pane) => paneTransportsRef.current.get(pane.id)?.getPtyId() === event.ptyId)
-          // Why: fitAddon.fit() measures DOM dimensions, so it must run after
-          // the browser has settled layout. Running synchronously inside the
-          // IPC callback can produce stale measurements. rAF ensures the DOM
-          // is ready. The follow-up timeout acts as a safety net: if
-          // fitAddon.fit() silently threw (its errors are caught), the timeout
-          // falls back to a direct terminal.resize() using the restored
-          // dimensions from the runtime. This guarantees xterm exits mobile
-          // dims even when the DOM-based fit path fails.
-          const fitAffectedPanes = (): void => {
-            for (const pane of getAffectedPanes()) {
-              safeFit(pane)
-            }
-          }
-          requestAnimationFrame(fitAffectedPanes)
-          // Why: belt-and-suspenders — if safeFit's fitAddon.fit() threw or
-          // was a no-op due to stale dimensions, fall back to a direct
-          // resize. ONLY fire if xterm is still parked at the prior
-          // mobile-fit dims, meaning safeFit failed to move it. Previously
-          // we also fired when xterm had moved to *any* size other than
-          // the captured baseline, which clobbered safeFit's correct
-          // DOM-measured fit when the desktop pane geometry had changed
-          // since mobile-fit started (e.g. user closed a split or resized
-          // the window while the phone was active). In that scenario the
-          // event.cols/rows is the stale baseline from the moment
-          // mobile-fit started, not the current pane geometry — applying
-          // it would shrink the terminal back to e.g. half-width.
-          setTimeout(() => {
-            for (const pane of getAffectedPanes()) {
-              // Why: skip the fallback for hidden/unmounted panes whose
-              // container is 0×0. Force-resizing xterm to the server's
-              // desktop dims while the DOM has no geometry leaves xterm
-              // with cols/rows that won't match when the tab is later
-              // activated (the activation refit will correct it). The
-              // fallback is for the *visible* pane that legitimately
-              // failed to refit via the rAF safeFit.
-              const rect = pane.container.getBoundingClientRect()
-              if (rect.width === 0 || rect.height === 0) {
-                continue
-              }
-              safeFit(pane)
-              const stuckAtMobile =
-                event.priorCols != null &&
-                event.priorRows != null &&
-                pane.terminal.cols === event.priorCols &&
-                pane.terminal.rows === event.priorRows
-              if (stuckAtMobile && event.cols > 0 && event.rows > 0) {
-                pane.terminal.resize(event.cols, event.rows)
-              }
-            }
-          }, 100)
+  useEffect(() => {
+    const pendingFitFrames = new Set<number>()
+    const pendingFallbackTimers = new Set<number>()
+
+    const scheduleFitFrame = (callback: () => void): void => {
+      const frameId = window.requestAnimationFrame(() => {
+        pendingFitFrames.delete(frameId)
+        callback()
+      })
+      pendingFitFrames.add(frameId)
+    }
+
+    const scheduleFallbackTimer = (callback: () => void): void => {
+      const timerId = window.setTimeout(() => {
+        pendingFallbackTimers.delete(timerId)
+        callback()
+      }, 100)
+      pendingFallbackTimers.add(timerId)
+    }
+
+    const unsubscribe = onOverrideChange((event) => {
+      setOverrideTick((n) => n + 1)
+      if (event.mode === 'desktop-fit') {
+        const manager = managerRef.current
+        if (!manager) {
+          return
         }
-      }),
-    []
-  )
+        // Why: pane IDs are per-tab, so resolve the affected PTY through this
+        // tab's live transport bindings instead of global numeric pane IDs.
+        const getAffectedPanes = (): ReturnType<typeof manager.getPanes> =>
+          manager
+            .getPanes()
+            .filter((pane) => paneTransportsRef.current.get(pane.id)?.getPtyId() === event.ptyId)
+        // Why: fitAddon.fit() measures DOM dimensions, so it must run after
+        // the browser has settled layout. Running synchronously inside the
+        // IPC callback can produce stale measurements. rAF ensures the DOM
+        // is ready. The follow-up timeout acts as a safety net: if
+        // fitAddon.fit() silently threw (its errors are caught), the timeout
+        // falls back to a direct terminal.resize() using the restored
+        // dimensions from the runtime. This guarantees xterm exits mobile
+        // dims even when the DOM-based fit path fails.
+        const fitAffectedPanes = (): void => {
+          for (const pane of getAffectedPanes()) {
+            safeFit(pane)
+          }
+        }
+        scheduleFitFrame(fitAffectedPanes)
+        // Why: belt-and-suspenders — if safeFit's fitAddon.fit() threw or
+        // was a no-op due to stale dimensions, fall back to a direct
+        // resize. ONLY fire if xterm is still parked at the prior
+        // mobile-fit dims, meaning safeFit failed to move it. Previously
+        // we also fired when xterm had moved to *any* size other than
+        // the captured baseline, which clobbered safeFit's correct
+        // DOM-measured fit when the desktop pane geometry had changed
+        // since mobile-fit started (e.g. user closed a split or resized
+        // the window while the phone was active). In that scenario the
+        // event.cols/rows is the stale baseline from the moment
+        // mobile-fit started, not the current pane geometry — applying
+        // it would shrink the terminal back to e.g. half-width.
+        scheduleFallbackTimer(() => {
+          for (const pane of getAffectedPanes()) {
+            // Why: skip the fallback for hidden/unmounted panes whose
+            // container is 0×0. Force-resizing xterm to the server's
+            // desktop dims while the DOM has no geometry leaves xterm
+            // with cols/rows that won't match when the tab is later
+            // activated (the activation refit will correct it). The
+            // fallback is for the *visible* pane that legitimately
+            // failed to refit via the rAF safeFit.
+            const rect = pane.container.getBoundingClientRect()
+            if (rect.width === 0 || rect.height === 0) {
+              continue
+            }
+            safeFit(pane)
+            const stuckAtMobile =
+              event.priorCols != null &&
+              event.priorRows != null &&
+              pane.terminal.cols === event.priorCols &&
+              pane.terminal.rows === event.priorRows
+            if (stuckAtMobile && event.cols > 0 && event.rows > 0) {
+              pane.terminal.resize(event.cols, event.rows)
+            }
+          }
+        })
+      }
+    })
+
+    return () => {
+      unsubscribe()
+      for (const frameId of pendingFitFrames) {
+        window.cancelAnimationFrame(frameId)
+      }
+      pendingFitFrames.clear()
+      for (const timerId of pendingFallbackTimers) {
+        window.clearTimeout(timerId)
+      }
+      pendingFallbackTimers.clear()
+    }
+  }, [])
 
   // Why: presence-lock banner re-render. Driver state lives in a plain Map
   // for perf; this counter forces a re-render when the driver flips so the
@@ -308,13 +347,20 @@ export default function TerminalPane({
   const clearTabPtyId = useAppStore((store) => store.clearTabPtyId)
   const markWorktreeUnread = useAppStore((store) => store.markWorktreeUnread)
   const markTerminalTabUnread = useAppStore((store) => store.markTerminalTabUnread)
+  const markTerminalPaneUnread = useAppStore((store) => store.markTerminalPaneUnread)
   const clearWorktreeUnread = useAppStore((store) => store.clearWorktreeUnread)
   const clearTerminalTabUnread = useAppStore((store) => store.clearTerminalTabUnread)
+  const clearTerminalPaneUnread = useAppStore((store) => store.clearTerminalPaneUnread)
+  const unreadTerminalPanes = useAppStore((store) => store.unreadTerminalPanes)
+  const terminalAttentionEnabled = useAppStore(
+    (store) => store.settings?.experimentalTerminalAttention === true
+  )
   const openSpacePage = useAppStore((store) => store.openSpacePage)
   const refreshWorkspaceSpace = useAppStore((store) => store.refreshWorkspaceSpace)
   const settings = useAppStore((store) => store.settings)
   const repos = useAppStore((store) => store.repos)
   const updateSettings = useAppStore((store) => store.updateSettings)
+  const keybindings = useAppStore((store) => store.keybindings)
   // Why: Windows is the only platform where bare right-click is repurposed as
   // a paste gesture; on macOS/Linux the terminal still owns right-click for the
   // context menu. The settings default keeps the Windows shortcut feeling native
@@ -352,8 +398,8 @@ export default function TerminalPane({
     : quickCommandRepoId
       ? 'This Repo'
       : null
-  const validQuickCommands = (settings?.terminalQuickCommands ?? []).filter(
-    (command) => command.label.trim() && command.command.trimEnd()
+  const validQuickCommands = (settings?.terminalQuickCommands ?? []).filter((command) =>
+    isTerminalQuickCommandComplete(command)
   )
   const repoQuickCommands = validQuickCommands.filter((command) => {
     const scope = getTerminalQuickCommandScope(command)
@@ -362,6 +408,15 @@ export default function TerminalPane({
   const globalQuickCommands = validQuickCommands.filter(
     (command) => getTerminalQuickCommandScope(command).type === 'global'
   )
+  const quickCommandGroupId =
+    useAppStore(
+      (s) =>
+        s.unifiedTabsByWorktree[worktreeId]?.find(
+          (tab) => tab.entityId === tabId && tab.contentType === 'terminal'
+        )?.groupId ??
+        s.activeGroupIdByWorktree[worktreeId] ??
+        null
+    ) ?? null
 
   const openQuickCommandEditor = useCallback((scope: TerminalQuickCommandScope): void => {
     setQuickCommandDraft(createTerminalQuickCommandDraft(scope))
@@ -576,6 +631,7 @@ export default function TerminalPane({
     expandedStyleSnapshotRef,
     containerRef,
     managerRef,
+    pendingPaneSizeRefreshFrameIdsRef,
     setExpandedPaneId,
     setTabPaneExpanded,
     tabId,
@@ -665,6 +721,7 @@ export default function TerminalPane({
     setupSplit,
     issueCommandSplit,
     isActive,
+    isVisible,
     systemPrefersDark,
     settings,
     settingsRef,
@@ -693,8 +750,10 @@ export default function TerminalPane({
     updateTabPtyId,
     markWorktreeUnread,
     markTerminalTabUnread,
+    markTerminalPaneUnread,
     clearWorktreeUnread,
     clearTerminalTabUnread,
+    clearTerminalPaneUnread,
     dispatchNotification,
     setCacheTimerStartedAt,
     syncPanePtyLayoutBinding,
@@ -844,6 +903,7 @@ export default function TerminalPane({
     const snapshots = activityIsolationSnapshotRef.current
     return () => {
       restoreExpandedLayoutFrom(snapshots)
+      cancelPendingPaneSizeRefreshFrames({ pendingPaneSizeRefreshFrameIdsRef })
     }
   }, [])
 
@@ -896,8 +956,10 @@ export default function TerminalPane({
         updateTabPtyId,
         markWorktreeUnread,
         markTerminalTabUnread,
+        markTerminalPaneUnread,
         clearWorktreeUnread,
         clearTerminalTabUnread,
+        clearTerminalPaneUnread,
         dispatchNotification,
         setCacheTimerStartedAt,
         syncPanePtyLayoutBinding
@@ -913,8 +975,10 @@ export default function TerminalPane({
       dispatchNotification,
       markWorktreeUnread,
       markTerminalTabUnread,
+      markTerminalPaneUnread,
       clearWorktreeUnread,
       clearTerminalTabUnread,
+      clearTerminalPaneUnread,
       onPtyExitRef,
       setCacheTimerStartedAt,
       setRuntimePaneTitle,
@@ -967,7 +1031,9 @@ export default function TerminalPane({
     onRequestClosePane: handleRequestClosePane,
     searchOpenRef,
     searchStateRef,
-    macOptionAsAltRef
+    macOptionAsAltRef,
+    keybindings,
+    terminalShortcutPolicy: settings?.terminalShortcutPolicy ?? 'orca-first'
   })
 
   useTerminalPaneGlobalEffects({
@@ -990,7 +1056,51 @@ export default function TerminalPane({
     toggleExpandPane
   })
 
-  // Intercept paste at the keydown level (Cmd+V / Ctrl+V) AND as a fallback
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container) {
+      return
+    }
+    const syncFocused = (focused: boolean): void => {
+      window.api.ui.setTerminalInputFocused?.(focused)
+    }
+    const onFocusIn = (event: FocusEvent): void => {
+      if (isXtermHelperTextarea(event.target)) {
+        syncFocused(true)
+      }
+    }
+    const onFocusOut = (event: FocusEvent): void => {
+      if (!isXtermHelperTextarea(event.target)) {
+        return
+      }
+      if (isXtermHelperTextarea(event.relatedTarget)) {
+        return
+      }
+      syncFocused(false)
+    }
+
+    if (
+      isXtermHelperTextarea(document.activeElement) &&
+      container.contains(document.activeElement)
+    ) {
+      syncFocused(true)
+    }
+    container.addEventListener('focusin', onFocusIn)
+    container.addEventListener('focusout', onFocusOut)
+    return () => {
+      container.removeEventListener('focusin', onFocusIn)
+      container.removeEventListener('focusout', onFocusOut)
+      if (
+        isXtermHelperTextarea(document.activeElement) &&
+        container.contains(document.activeElement)
+      ) {
+        syncFocused(false)
+      }
+    }
+  }, [])
+
+  // Intercept paste at the keydown level (configurable terminal paste chords)
+  // AND as a fallback
   // on the paste event. We must handle keydown because Chromium does not fire
   // a paste event when the clipboard contains only image data (no text
   // representation) and the target is a textarea — which is exactly how
@@ -1010,54 +1120,61 @@ export default function TerminalPane({
       return
     }
 
-    // Shared helper: try text first (fast path, single IPC call for the
-    // common case), then check for a clipboard image only when text is empty
-    // — which is the image-only clipboard scenario this fix targets.
-    const pasteFromClipboard = (pane: { terminal: { paste: (data: string) => void } }): void => {
-      void window.api.ui
-        .readClipboardText()
-        .then((text) => {
-          if (text) {
-            pane.terminal.paste(text)
-            return
-          }
-          // Why: clipboard has no text — check for an image. This is the
-          // image-only clipboard case (e.g. screenshot) where Chromium's paste
-          // event would never fire on a textarea. We save the image to a temp
-          // file owned by the terminal host and paste that path.
-          const connectionId = getConnectionId(worktreeId) ?? null
-          return window.api.ui
-            .saveClipboardImageAsTempFile({ connectionId })
-            .then((filePath) => {
-              if (filePath) {
-                pane.terminal.paste(filePath)
-              }
-            })
-            .catch((error: unknown) => {
-              setTerminalError(formatClipboardImagePasteError(error))
-            })
-        })
-        .catch(() => {
-          /* ignore clipboard failures */
-        })
+    const pasteFromClipboard = (pane: ManagedPane): void => {
+      const connectionId = getConnectionId(worktreeId) ?? null
+      void pasteTerminalClipboard({
+        readClipboardText: window.api.ui.readClipboardText,
+        saveClipboardImageAsTempFile: window.api.ui.saveClipboardImageAsTempFile,
+        connectionId,
+        pasteText: (text, options) => pasteTerminalText(pane.terminal, text, options),
+        onImagePasteError: (error) => setTerminalError(formatClipboardImagePasteError(error))
+      }).catch(() => {
+        /* ignore clipboard failures */
+      })
     }
 
-    // Why: intercept Cmd+V / Ctrl+V at the keydown level so we can check
-    // for clipboard images via Electron's main-process clipboard API. The
-    // browser's paste event is unreliable for image-only clipboards when the
-    // target is a <textarea> (xterm.js's hidden input), so this handler
-    // ensures image paste works regardless.
     const isMac = navigator.userAgent.includes('Mac')
+    const shortcutPlatform: NodeJS.Platform = isMac
+      ? 'darwin'
+      : navigator.userAgent.includes('Windows')
+        ? 'win32'
+        : 'linux'
+    let suppressNextNativePaste = false
+    let pasteSuppressionTimerId: number | null = null
+    const shouldSuppressNativePaste = (e: KeyboardEvent): boolean => {
+      const key = e.key.toLowerCase()
+      return (
+        (isMac && key === 'v' && e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) ||
+        (!isMac && key === 'v' && e.ctrlKey && !e.metaKey && !e.altKey) ||
+        (!isMac && e.key === 'Insert' && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey)
+      )
+    }
     const onKeyPaste = (e: KeyboardEvent): void => {
-      if (e.key.toLowerCase() !== 'v') {
-        return
-      }
-      const mod = isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey
-      if (!mod || e.altKey || e.shiftKey) {
-        return
-      }
       const target = e.target
       if (target instanceof Element && target.closest('[data-terminal-search-root]')) {
+        return
+      }
+      const matchesPaste = keybindingMatchesAction(
+        'terminal.paste',
+        e,
+        shortcutPlatform,
+        keybindings,
+        { context: 'terminal' }
+      )
+      if (!matchesPaste) {
+        if (shouldSuppressNativePaste(e)) {
+          // Why: bare Ctrl+V is readline's quote-insert on Windows/Linux. If
+          // Chromium turns it into a native paste event, suppress that follow-up
+          // paste while still letting xterm receive the original keydown.
+          suppressNextNativePaste = true
+          if (pasteSuppressionTimerId !== null) {
+            window.clearTimeout(pasteSuppressionTimerId)
+          }
+          pasteSuppressionTimerId = window.setTimeout(() => {
+            pasteSuppressionTimerId = null
+            suppressNextNativePaste = false
+          }, 0)
+        }
         return
       }
       e.preventDefault()
@@ -1080,6 +1197,16 @@ export default function TerminalPane({
       if (target instanceof Element && target.closest('[data-terminal-search-root]')) {
         return
       }
+      if (suppressNextNativePaste) {
+        suppressNextNativePaste = false
+        if (pasteSuppressionTimerId !== null) {
+          window.clearTimeout(pasteSuppressionTimerId)
+          pasteSuppressionTimerId = null
+        }
+        e.preventDefault()
+        e.stopPropagation()
+        return
+      }
       e.preventDefault()
       e.stopPropagation()
       const manager = managerRef.current
@@ -1096,13 +1223,16 @@ export default function TerminalPane({
     container.addEventListener('keydown', onKeyPaste, { capture: true })
     container.addEventListener('paste', onPaste, { capture: true })
     return () => {
+      if (pasteSuppressionTimerId !== null) {
+        window.clearTimeout(pasteSuppressionTimerId)
+      }
       container.removeEventListener('keydown', onKeyPaste, { capture: true })
       container.removeEventListener('paste', onPaste, { capture: true })
     }
-  }, [isActive, worktreeId])
+  }, [isActive, worktreeId, keybindings])
 
   // Why: a click inside the terminal container is a deliberate interaction
-  // with the pane — dismiss the bell indicator for this tab and worktree
+  // with the pane — dismiss the attention indicator for this tab and worktree
   // (ghostty "show until interact" semantics). onData already covers
   // keystrokes; pointerdown covers the mouse path, including right-click
   // and middle-click paste, which also count as engagement with the pane.
@@ -1122,15 +1252,36 @@ export default function TerminalPane({
     if (!container) {
       return
     }
-    const onPointerDown = (): void => {
+    const onPointerDown = (event: PointerEvent): void => {
       clearTerminalTabUnread(tabId)
       clearWorktreeUnread(worktreeId)
+      const paneElement =
+        event.target instanceof Element ? event.target.closest('.pane[data-leaf-id]') : null
+      const leafId = paneElement?.getAttribute('data-leaf-id')
+      if (leafId) {
+        clearTerminalPaneUnread(makePaneKey(tabId, leafId))
+      }
     }
     container.addEventListener('pointerdown', onPointerDown, { capture: true })
     return () => {
       container.removeEventListener('pointerdown', onPointerDown, { capture: true })
     }
-  }, [tabId, worktreeId, clearTerminalTabUnread, clearWorktreeUnread])
+  }, [tabId, worktreeId, clearTerminalTabUnread, clearTerminalPaneUnread, clearWorktreeUnread])
+
+  useLayoutEffect(() => {
+    const manager = managerRef.current
+    if (!manager) {
+      return
+    }
+    for (const pane of manager.getPanes()) {
+      const paneKey = makePaneKey(tabId, pane.leafId)
+      if (terminalAttentionEnabled && unreadTerminalPanes[paneKey]) {
+        pane.container.setAttribute('data-terminal-attention', '')
+      } else {
+        pane.container.removeAttribute('data-terminal-attention')
+      }
+    }
+  }, [tabId, paneCount, terminalAttentionEnabled, unreadTerminalPanes])
 
   // Sync the data-has-title attribute on pane containers when titles change,
   // and reflow terminals so safeFit() sees the correct available height.
@@ -1390,6 +1541,7 @@ export default function TerminalPane({
     paneTransportsRef,
     paneCwdRef,
     worktreeId,
+    groupId: quickCommandGroupId,
     fallbackCwd: cwd ?? '',
     toggleExpandPane,
     onRequestClosePane: handleRequestClosePane,
@@ -1449,7 +1601,7 @@ export default function TerminalPane({
       clickedPane.terminal.focus()
       void readPrimarySelectionText().then((text) => {
         if (text) {
-          clickedPane.terminal.paste(text)
+          pasteTerminalText(clickedPane.terminal, text)
         }
       })
     },

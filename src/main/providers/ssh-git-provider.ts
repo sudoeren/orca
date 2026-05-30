@@ -105,15 +105,22 @@ export class SshGitProvider implements IGitProvider {
   async executeCommitMessagePlan(
     plan: CommitMessagePlan,
     cwd: string,
-    timeoutMs: number
+    timeoutMs: number,
+    operation = 'commit-message'
   ): Promise<RemoteCommitMessageExecResult> {
-    return this.runQueuedNonInteractiveExec(cwd, {
-      binary: plan.binary,
-      args: plan.args,
+    return this.runQueuedNonInteractiveExec(
       cwd,
-      stdin: plan.stdinPayload,
-      timeoutMs
-    })
+      {
+        binary: plan.binary,
+        args: plan.args,
+        cwd,
+        stdin: plan.stdinPayload,
+        timeoutMs,
+        operation
+      },
+      undefined,
+      operation
+    )
   }
 
   async execNonInteractive(
@@ -121,7 +128,8 @@ export class SshGitProvider implements IGitProvider {
     args: string[],
     cwd: string,
     timeoutMs: number,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    env?: Record<string, string>
   ): Promise<RemoteCommitMessageExecResult> {
     return this.runQueuedNonInteractiveExec(
       cwd,
@@ -130,34 +138,45 @@ export class SshGitProvider implements IGitProvider {
         args,
         cwd,
         stdin: null,
-        timeoutMs
+        timeoutMs,
+        ...(env ? { env } : {})
       },
       signal
     )
   }
 
-  async cancelNonInteractiveExec(cwd: string): Promise<void> {
-    const queue = this.nonInteractiveExecQueues.get(cwd)
+  async cancelNonInteractiveExec(cwd: string, operation?: string): Promise<void> {
+    const queue = this.nonInteractiveExecQueues.get(this.nonInteractiveLaneKey(cwd, operation))
     const queuedEntry = queue?.find((entry) => !entry.started && !entry.canceled)
     if (queuedEntry) {
       queuedEntry.canceled = true
       return
     }
-    await this.cancelActiveNonInteractiveExec(cwd)
+    await this.cancelActiveNonInteractiveExec(cwd, operation)
   }
 
-  private async cancelActiveNonInteractiveExec(cwd: string): Promise<void> {
+  private async cancelActiveNonInteractiveExec(cwd: string, operation?: string): Promise<void> {
     try {
-      await this.mux.request('agent.cancelExec', { cwd })
+      await this.mux.request('agent.cancelExec', {
+        cwd,
+        ...(operation ? { operation } : {})
+      })
     } catch {
       // Best-effort: callers are already unwinding after cancellation.
     }
   }
 
-  async cancelGenerateCommitMessage(worktreePath: string): Promise<void> {
+  async cancelGenerateCommitMessage(
+    worktreePath: string,
+    operation = 'commit-message'
+  ): Promise<void> {
     // Why: best-effort — the relay returns `{canceled: false}` when there is
     // nothing in flight. Callers should not block UI updates on this.
-    await this.cancelNonInteractiveExec(worktreePath)
+    await this.cancelNonInteractiveExec(worktreePath, operation)
+  }
+
+  private nonInteractiveLaneKey(cwd: string, operation?: string): string {
+    return JSON.stringify([operation || 'default', cwd])
   }
 
   private async runQueuedNonInteractiveExec(
@@ -168,10 +187,14 @@ export class SshGitProvider implements IGitProvider {
       cwd: string
       stdin: string | null
       timeoutMs: number
+      env?: Record<string, string>
+      operation?: string
     },
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    operation?: string
   ): Promise<RemoteCommitMessageExecResult> {
-    const queue = this.nonInteractiveExecQueues.get(cwd) ?? []
+    const laneKey = this.nonInteractiveLaneKey(cwd, operation)
+    const queue = this.nonInteractiveExecQueues.get(laneKey) ?? []
     const previous = queue.at(-1)?.done ?? Promise.resolve()
     let releaseEntry!: () => void
     const entry: NonInteractiveExecQueueEntry = {
@@ -188,13 +211,13 @@ export class SshGitProvider implements IGitProvider {
       release: () => releaseEntry()
     }
     queue.push(entry)
-    this.nonInteractiveExecQueues.set(cwd, queue)
+    this.nonInteractiveExecQueues.set(laneKey, queue)
     const abortEntry = (): void => {
       if (!entry.started) {
         entry.canceled = true
         return
       }
-      void this.cancelActiveNonInteractiveExec(cwd)
+      void this.cancelActiveNonInteractiveExec(cwd, operation)
     }
     if (signal?.aborted) {
       entry.canceled = true
@@ -202,8 +225,8 @@ export class SshGitProvider implements IGitProvider {
       signal?.addEventListener('abort', abortEntry, { once: true })
     }
 
-    // Why: the SSH relay tracks one non-interactive child per cwd; serializing
-    // here keeps cache cleanup and commit-message generation from overwriting it.
+    // Why: the SSH relay tracks children per operation; serialize only matching
+    // lanes so commit-message and PR-field generation can coexist.
     await previous.catch(() => {})
     try {
       if (entry.canceled) {
@@ -223,13 +246,13 @@ export class SshGitProvider implements IGitProvider {
     } finally {
       signal?.removeEventListener('abort', abortEntry)
       entry.release()
-      const currentQueue = this.nonInteractiveExecQueues.get(cwd)
+      const currentQueue = this.nonInteractiveExecQueues.get(laneKey)
       const entryIndex = currentQueue?.indexOf(entry) ?? -1
       if (entryIndex >= 0) {
         currentQueue?.splice(entryIndex, 1)
       }
       if (currentQueue?.length === 0) {
-        this.nonInteractiveExecQueues.delete(cwd)
+        this.nonInteractiveExecQueues.delete(laneKey)
       }
     }
   }
@@ -278,6 +301,14 @@ export class SshGitProvider implements IGitProvider {
     })) as GitConflictOperation
   }
 
+  async abortMerge(worktreePath: string): Promise<void> {
+    await this.mux.request('git.abortMerge', { worktreePath })
+  }
+
+  async abortRebase(worktreePath: string): Promise<void> {
+    await this.mux.request('git.abortRebase', { worktreePath })
+  }
+
   async getBranchCompare(worktreePath: string, baseRef: string): Promise<GitBranchCompareResult> {
     return (await this.mux.request('git.branchCompare', {
       worktreePath,
@@ -292,9 +323,13 @@ export class SshGitProvider implements IGitProvider {
     })) as GitCommitCompareResult
   }
 
-  async getUpstreamStatus(worktreePath: string): Promise<GitUpstreamStatus> {
+  async getUpstreamStatus(
+    worktreePath: string,
+    pushTarget?: GitPushTarget
+  ): Promise<GitUpstreamStatus> {
     return (await this.mux.request('git.upstreamStatus', {
-      worktreePath
+      worktreePath,
+      ...(pushTarget ? { pushTarget } : {})
     })) as GitUpstreamStatus
   }
 
@@ -312,12 +347,23 @@ export class SshGitProvider implements IGitProvider {
     })
   }
 
-  async pullBranch(worktreePath: string): Promise<void> {
-    await this.mux.request('git.pull', { worktreePath })
+  async pullBranch(worktreePath: string, pushTarget?: GitPushTarget): Promise<void> {
+    await this.mux.request('git.pull', { worktreePath, ...(pushTarget ? { pushTarget } : {}) })
   }
 
-  async fetchRemote(worktreePath: string): Promise<void> {
-    await this.mux.request('git.fetch', { worktreePath })
+  async fastForwardBranch(worktreePath: string, pushTarget?: GitPushTarget): Promise<void> {
+    await this.mux.request('git.fastForward', {
+      worktreePath,
+      ...(pushTarget ? { pushTarget } : {})
+    })
+  }
+
+  async rebaseFromBase(worktreePath: string, baseRef: string): Promise<void> {
+    await this.mux.request('git.rebaseFromBase', { worktreePath, baseRef })
+  }
+
+  async fetchRemote(worktreePath: string, pushTarget?: GitPushTarget): Promise<void> {
+    await this.mux.request('git.fetch', { worktreePath, ...(pushTarget ? { pushTarget } : {}) })
   }
 
   async fetchRemoteTrackingRef(
@@ -373,7 +419,7 @@ export class SshGitProvider implements IGitProvider {
     repoPath: string,
     branchName: string,
     targetDir: string,
-    options?: { base?: string; checkoutExistingBranch?: boolean }
+    options?: { base?: string; checkoutExistingBranch?: boolean; noCheckout?: boolean }
   ): Promise<void> {
     await this.mux.request('git.addWorktree', {
       repoPath,
@@ -386,9 +432,20 @@ export class SshGitProvider implements IGitProvider {
   async removeWorktree(
     worktreePath: string,
     force?: boolean,
-    options?: { deleteBranch?: boolean }
+    options?: { deleteBranch?: boolean; forceBranchDelete?: boolean }
   ): Promise<void> {
     await this.mux.request('git.removeWorktree', { worktreePath, force, ...options })
+  }
+
+  async worktreeIsClean(worktreePath: string): Promise<{ clean: boolean; stdout?: string }> {
+    return (await this.mux.request('git.worktreeIsClean', { worktreePath })) as {
+      clean: boolean
+      stdout?: string
+    }
+  }
+
+  async renameCurrentBranch(worktreePath: string, newBranch: string): Promise<void> {
+    await this.mux.request('git.renameCurrentBranch', { worktreePath, newBranch })
   }
 
   async exec(args: string[], cwd: string): Promise<{ stdout: string; stderr: string }> {

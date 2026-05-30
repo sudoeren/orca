@@ -5,14 +5,14 @@ settings:
   excludeLinksFromLockfile: false
 
 patchedDependencies:
-  '@xterm/addon-ligatures@0.11.0-beta.216':
+  '@xterm/addon-ligatures@0.11.0-beta.220':
     hash: df21db050a4d85552cafbe583ece863d7fa19ed634a1219210a0455b986b6634
-    path: config/patches/@xterm__addon-ligatures@0.11.0-beta.216.patch
-  '@xterm/addon-webgl@0.20.0-beta.215':
-    hash: 4923357da531172cda1fd570a33fd852349d9eb6317f4befa8b3af18c221039d
-    path: config/patches/@xterm__addon-webgl@0.20.0-beta.215.patch
+    path: config/patches/@xterm__addon-ligatures@0.11.0-beta.220.patch
+  '@xterm/addon-webgl@0.20.0-beta.219':
+    hash: b7465b48cca8d596e3bf0e441f939100c95adaddef13e85df089ed0ad6f6b1ea
+    path: config/patches/@xterm__addon-webgl@0.20.0-beta.219.patch
   node-pty@1.1.0:
-    hash: 93c259888173175ad66ab303977deb17f2aee9e276cb35522dc61815c65358d4
+    hash: 407ae07e1e0e2ff2e8b58696449c54c31e51d87535bc6aa4a7a7b0b561407282
     path: config/patches/node-pty@1.1.0.patch
 
 importers:
@@ -25,9 +25,6 @@ importers:
       '@dnd-kit/sortable':
         specifier: ^10.0.0
         version: 10.0.0(@dnd-kit/core@6.3.1(react-dom@19.2.5(react@19.2.5))(react@19.2.5))(react@19.2.5)
-      '@dnd-kit/utilities':
-        specifier: ^3.2.2
-        version: 3.2.2(react@19.2.5)
       '@electron-toolkit/preload':
         specifier: ^3.0.2
         version: 3.0.2(electron@41.5.0)
@@ -49,6 +46,9 @@ importers:
       '@tiptap/extension-code-block-lowlight':
         specifier: ^3.22.5
         version: 3.22.5(@tiptap/core@3.22.5(@tiptap/pm@3.22.5))(@tiptap/extension-code-block@3.22.5(@tiptap/core@3.22.5(@tiptap/pm@3.22.5))(@tiptap/pm@3.22.5))(@tiptap/pm@3.22.5)(highlight.js@11.11.1)(lowlight@3.3.0)
+      '@tiptap/extension-details':
+        specifier: ^3.22.5
+        version: 3.22.5(@tiptap/core@3.22.5(@tiptap/pm@3.22.5))(@tiptap/extension-text-style@3.22.5(@tiptap/core@3.22.5(@tiptap/pm@3.22.5)))(@tiptap/pm@3.22.5)
       '@tiptap/extension-image':
         specifier: ^3.22.5
         version: 3.22.5(@tiptap/core@3.22.5(@tiptap/pm@3.22.5))
@@ -92,32 +92,32 @@ importers:
         specifier: ^3.22.5
         version: 3.22.5
       '@xterm/addon-fit':
-        specifier: 0.12.0-beta.216
-        version: 0.12.0-beta.216(@xterm/xterm@6.1.0-beta.216)
+        specifier: 0.12.0-beta.220
+        version: 0.12.0-beta.220(@xterm/xterm@6.1.0-beta.220)
       '@xterm/addon-ligatures':
-        specifier: 0.11.0-beta.216
-        version: 0.11.0-beta.216(patch_hash=df21db050a4d85552cafbe583ece863d7fa19ed634a1219210a0455b986b6634)(@xterm/xterm@6.1.0-beta.216)
+        specifier: 0.11.0-beta.220
+        version: 0.11.0-beta.220(patch_hash=df21db050a4d85552cafbe583ece863d7fa19ed634a1219210a0455b986b6634)(@xterm/xterm@6.1.0-beta.220)
       '@xterm/addon-search':
-        specifier: 0.17.0-beta.216
-        version: 0.17.0-beta.216(@xterm/xterm@6.1.0-beta.216)
+        specifier: 0.17.0-beta.220
+        version: 0.17.0-beta.220(@xterm/xterm@6.1.0-beta.220)
       '@xterm/addon-serialize':
-        specifier: 0.15.0-beta.216
-        version: 0.15.0-beta.216(@xterm/xterm@6.1.0-beta.216)
+        specifier: 0.15.0-beta.220
+        version: 0.15.0-beta.220(@xterm/xterm@6.1.0-beta.220)
       '@xterm/addon-unicode11':
-        specifier: 0.10.0-beta.216
-        version: 0.10.0-beta.216(@xterm/xterm@6.1.0-beta.216)
+        specifier: 0.10.0-beta.220
+        version: 0.10.0-beta.220(@xterm/xterm@6.1.0-beta.220)
       '@xterm/addon-web-links':
-        specifier: 0.13.0-beta.216
-        version: 0.13.0-beta.216(@xterm/xterm@6.1.0-beta.216)
+        specifier: 0.13.0-beta.220
+        version: 0.13.0-beta.220(@xterm/xterm@6.1.0-beta.220)
       '@xterm/addon-webgl':
-        specifier: 0.20.0-beta.215
-        version: 0.20.0-beta.215(patch_hash=4923357da531172cda1fd570a33fd852349d9eb6317f4befa8b3af18c221039d)(@xterm/xterm@6.1.0-beta.216)
+        specifier: 0.20.0-beta.219
+        version: 0.20.0-beta.219(patch_hash=b7465b48cca8d596e3bf0e441f939100c95adaddef13e85df089ed0ad6f6b1ea)(@xterm/xterm@6.1.0-beta.220)
       '@xterm/headless':
-        specifier: 6.1.0-beta.216
-        version: 6.1.0-beta.216
+        specifier: 6.1.0-beta.220
+        version: 6.1.0-beta.220
       '@xterm/xterm':
-        specifier: 6.1.0-beta.216
-        version: 6.1.0-beta.216
+        specifier: 6.1.0-beta.220
+        version: 6.1.0-beta.220
       agent-browser:
         specifier: ~0.24.1
         version: 0.24.1
@@ -135,7 +135,7 @@ importers:
         version: 1.1.1(@types/react-dom@19.2.3(@types/react@19.2.14))(@types/react@19.2.14)(react-dom@19.2.5(react@19.2.5))(react@19.2.5)
       dompurify:
         specifier: ^3.4.2
-        version: 3.4.2
+        version: 3.4.5
       electron-updater:
         specifier: ^6.8.3
         version: 6.8.3
@@ -162,7 +162,7 @@ importers:
         version: 0.55.1
       node-pty:
         specifier: ^1.1.0
-        version: 1.1.0(patch_hash=93c259888173175ad66ab303977deb17f2aee9e276cb35522dc61815c65358d4)
+        version: 1.1.0(patch_hash=407ae07e1e0e2ff2e8b58696449c54c31e51d87535bc6aa4a7a7b0b561407282)
       pdfjs-dist:
         specifier: ^5.7.284
         version: 5.7.284
@@ -175,6 +175,9 @@ importers:
       radix-ui:
         specifier: ^1.4.3
         version: 1.4.3(@types/react-dom@19.2.3(@types/react@19.2.14))(@types/react@19.2.14)(react-dom@19.2.5(react@19.2.5))(react@19.2.5)
+      react-colorful:
+        specifier: ^5.7.0
+        version: 5.7.0(react-dom@19.2.5(react@19.2.5))(react@19.2.5)
       react-markdown:
         specifier: ^10.1.0
         version: 10.1.0(@types/react@19.2.14)(react@19.2.5)
@@ -214,9 +217,6 @@ importers:
       sherpa-onnx:
         specifier: 1.12.37
         version: 1.12.37
-      simple-git:
-        specifier: ^3.36.0
-        version: 3.36.0
       sonner:
         specifier: ^2.0.7
         version: 2.0.7(react-dom@19.2.5(react@19.2.5))(react@19.2.5)
@@ -999,12 +999,6 @@ packages:
 
   '@jridgewell/trace-mapping@0.3.31':
     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
-
-  '@kwsites/file-exists@1.1.1':
-    resolution: {integrity: sha512-m9/5YGR18lIwxSFDwfE3oA7bWuq9kdau6ugN4H2rJeyhFQZcG9AgSHkQtSD15a8WvTgfz9aikZMrKPHvbpqFiw==}
-
-  '@kwsites/promise-deferred@1.1.1':
-    resolution: {integrity: sha512-GaHYm+c0O9MjZRu0ongGBRbinu8gVAMd2UZjji6jVmqKtZluZnptXGWhz1E8j8D2HJ3f/yMxKAUC0b+57wncIw==}
 
   '@linear/sdk@82.1.0':
     resolution: {integrity: sha512-Ok7o+LqXaenx6Um58NQqjQoQanDsCgAIe9yNgpVbqRSh5APz3Ds1kZUz2vWmSNTNATFZm1zDQtEktTMga2X7UQ==}
@@ -2359,12 +2353,6 @@ packages:
   '@sec-ant/readable-stream@0.4.1':
     resolution: {integrity: sha512-831qok9r2t8AlxLko40y2ebgSDhenenCatLVeW/uBtnHPyhHOvG0C7TvfgecV+wHzIm5KUICgzmVpWS+IMEAeg==}
 
-  '@simple-git/args-pathspec@1.0.3':
-    resolution: {integrity: sha512-ngJMaHlsWDTfjyq9F3VIQ8b7NXbBLq5j9i5bJ6XLYtD6qlDXT7fdKY2KscWWUF8t18xx052Y/PUO1K1TRc9yKA==}
-
-  '@simple-git/argv-parser@1.1.1':
-    resolution: {integrity: sha512-Q9lBcfQ+VQCpQqGJFHe5yooOS5hGdLFFbJ5R+R5aDsnkPCahtn1hSkMcORX65J2Z5lxSkD0lQorMsncuBQxYUw==}
-
   '@sindresorhus/is@4.6.0':
     resolution: {integrity: sha512-t09vSN3MdfsyCHoFcTRCH/iUtG7OJ0CsjzB8cjAmKc/va/kIgeDI/TxsigdncE/4be734m0cvIYwNaV4i2XqAw==}
     engines: {node: '>=10'}
@@ -2549,6 +2537,13 @@ packages:
     peerDependencies:
       '@tiptap/core': 3.22.5
 
+  '@tiptap/extension-details@3.22.5':
+    resolution: {integrity: sha512-+vg7wSO9DL8veAzC4jlHu4lQ4qL2iRxj/ONTfP+jnffN0TzrjAdkMLCUEX059gYyks22AXgoI5vEzWs0K7yeuw==}
+    peerDependencies:
+      '@tiptap/core': 3.22.5
+      '@tiptap/extension-text-style': 3.22.5
+      '@tiptap/pm': 3.22.5
+
   '@tiptap/extension-document@3.22.5':
     resolution: {integrity: sha512-8NJERd+pCtvSuEP4C4WMGYmRRCV12ePZL7bC+QUdFlbdXg+kNZS0zZ7hh879tYA0Kidbi8rWWD1Tx+H2ezkmMw==}
     peerDependencies:
@@ -2676,6 +2671,11 @@ packages:
     resolution: {integrity: sha512-SfZeJSALtFODs0i3fml1TSi4vQ4Uopu0p/LndK+mX5FGNBtNmWiy7Wr5cH03ANfzj8c2EzfGIyH+F2/V0HLK9g==}
     peerDependencies:
       '@tiptap/extension-list': 3.22.5
+
+  '@tiptap/extension-text-style@3.22.5':
+    resolution: {integrity: sha512-jt63jy8YbhZJUGMxTUzeivLhowGtFp6YbCFrrmZJ7G6IHu8X8LJzO81ksz5nT5l8DKpldGwnINUfA6iE91JIAg==}
+    peerDependencies:
+      '@tiptap/core': 3.22.5
 
   '@tiptap/extension-text@3.22.5':
     resolution: {integrity: sha512-bzpDOdAEo1JeoVZDIyV0oY0jGXkEG+AzF70SzHoRSjOvFDtKWunyXf9eO1OnOr2/fmMcckT2qwUBNBMQplWBzw==}
@@ -3018,47 +3018,47 @@ packages:
     resolution: {integrity: sha512-A9gOqLdi6cV4ibazAjcQufGj0B1y/vDqYrcuP6d/6x8P27gRS8643Dj9o1dEKtB6O7fwxb2FgBmJS2mX7gpvdw==}
     engines: {node: '>=14.6'}
 
-  '@xterm/addon-fit@0.12.0-beta.216':
-    resolution: {integrity: sha512-IgKE3ngNodSnmj1O+EEYpKQZkSbAUbghPlCWd8G32RL0piIMqb3FX3BuYLnWZeLNoD9iMtublLMG1T9XjGeVvA==}
+  '@xterm/addon-fit@0.12.0-beta.220':
+    resolution: {integrity: sha512-lTiEjsdJBYTvIdA8USs90j+pu7/9oCQEh8JYBDJoRxzzAcvk4V1GlEA++Ztspbfk4nSh2HVxwJvdeTD6ffAQlg==}
     peerDependencies:
-      '@xterm/xterm': ^6.1.0-beta.216
+      '@xterm/xterm': ^6.1.0-beta.220
 
-  '@xterm/addon-ligatures@0.11.0-beta.216':
-    resolution: {integrity: sha512-NJrK8MRi64Kb1Kxz5Jmrnd7H2gTlBqM3wHfObneD7T4xGFoPZkeX2/Kit4IcHt2Y5CTAQFAc92DilsncVm1HnQ==}
+  '@xterm/addon-ligatures@0.11.0-beta.220':
+    resolution: {integrity: sha512-fw/mSPqwgBNVX2ejW3rKhXablP3pelKJWYlt1QIr40+zZ//ERcHZWZNLB1I9fojiGW++tCnIHKh0GPpI2h5HgA==}
     engines: {node: '>8.0.0'}
     peerDependencies:
-      '@xterm/xterm': ^6.1.0-beta.216
+      '@xterm/xterm': ^6.1.0-beta.220
 
-  '@xterm/addon-search@0.17.0-beta.216':
-    resolution: {integrity: sha512-p//4yv5aB2eyQcCFmPQ/s7tTFSTwKbtxs89xP1gvMbT9QuZgjW9FNqaQKb1GLDWtMpSfZdy7RrUp4GiCg3PVJQ==}
+  '@xterm/addon-search@0.17.0-beta.220':
+    resolution: {integrity: sha512-2QwmGiZ8sn1ISYLuHIt0heUYN0wR6d+AWFZRGsekXbLCvRw/qjclCSKsDsIO1bTMBjey5K1MeZbse6kTKx+kDg==}
     peerDependencies:
-      '@xterm/xterm': ^6.1.0-beta.216
+      '@xterm/xterm': ^6.1.0-beta.220
 
-  '@xterm/addon-serialize@0.15.0-beta.216':
-    resolution: {integrity: sha512-scj/83XfYHg5LiDscYDP9dnadUMZt8To1tbdncQP/dZq2pD4TsTMokW1pciVYYazLBxCeKZybbVLEuOo7IPCqQ==}
+  '@xterm/addon-serialize@0.15.0-beta.220':
+    resolution: {integrity: sha512-ssZ8rnSU0EOdDsFS5cI5LHKy/T0rQfZBE9iPph7rUxSAwZXbMGz0Vrsob79IKRvfE6oMZlFn+NE0Gg/mKq62Iw==}
     peerDependencies:
-      '@xterm/xterm': ^6.1.0-beta.216
+      '@xterm/xterm': ^6.1.0-beta.220
 
-  '@xterm/addon-unicode11@0.10.0-beta.216':
-    resolution: {integrity: sha512-i7TrEHOTzUEOClH1+6IHoHy7bR/XHVRBjHc5e0u6A1HucFkAlCU+bqUY8EfwNOh1/iUjuB06EtNh6BM1o/ZAlA==}
+  '@xterm/addon-unicode11@0.10.0-beta.220':
+    resolution: {integrity: sha512-83VMUPOp7VKWsVlw+a6TrZP38VAQM7xigu0JcSj2gVO1xsYRyme9wlgKDX+lmgWrfJPSjgB0vfXpcxI4dt/Wvw==}
     peerDependencies:
-      '@xterm/xterm': ^6.1.0-beta.216
+      '@xterm/xterm': ^6.1.0-beta.220
 
-  '@xterm/addon-web-links@0.13.0-beta.216':
-    resolution: {integrity: sha512-ZP3BDy1na/37TZHO8FB+XHJFoO8muyPoOzkaL2X28n5A9ZFQPbf834EMRsvDczKnfQvtZcve+ZCmMJj1ZHGjow==}
+  '@xterm/addon-web-links@0.13.0-beta.220':
+    resolution: {integrity: sha512-XILFvFY0lOpTafIQxUOkS6x/MfZzarW3WbHZ40KEzAE8ImJqwOQiiqG17noLMUDD6rSOv7BRWNJACq4FflBNvg==}
     peerDependencies:
-      '@xterm/xterm': ^6.1.0-beta.216
+      '@xterm/xterm': ^6.1.0-beta.220
 
-  '@xterm/addon-webgl@0.20.0-beta.215':
-    resolution: {integrity: sha512-oCbH3YxiGOzRcKxwTfSRCA1TqpoT/AitO2X5MuqD14DVnb4Z3rTKQYfHBA7R6HA7U4K9OzmtIsi5+VyEIEaWsg==}
+  '@xterm/addon-webgl@0.20.0-beta.219':
+    resolution: {integrity: sha512-IaAcDDP0lhHIdYJuTFKZIMsRqlN8iR5U8lW9MiTK4mUAjettqZN2z/tkSsl4yV3GZ9/siOZofDl+GO1TK7y7ww==}
     peerDependencies:
-      '@xterm/xterm': ^6.1.0-beta.216
+      '@xterm/xterm': ^6.1.0-beta.220
 
-  '@xterm/headless@6.1.0-beta.216':
-    resolution: {integrity: sha512-HCut3ABwBv5zVUAB+5KVTW4svr/fCeVMW9xtaJIhmXZsNHOrhVFOGX7E2CYzRa8xdX/aI2JdTIhgLl8xjcHEoA==}
+  '@xterm/headless@6.1.0-beta.220':
+    resolution: {integrity: sha512-oc+cI28eP/ktv91ddk1MxsEdfS41dnNvB3eMjNxfP7v+SaM7aXgXAL8Kj0/zzbpX/dG0nbA9wi3YvsybzCN3OQ==}
 
-  '@xterm/xterm@6.1.0-beta.216':
-    resolution: {integrity: sha512-87rfymzVje5eYUlGG94hz1WkOYvFRcFDGdiOAbg4d8xt8OGSGR2nMNU4I1n5MDE1RBPBqRd+WVJ5w7q3pwMoZA==}
+  '@xterm/xterm@6.1.0-beta.220':
+    resolution: {integrity: sha512-rwEKE75wfwfNWeGnjl0iQRA1W50HigKoGcGMeF3o5CqDSdI9IjmwzpV9xHXqLH6CYj6s9N1g6bbKFVDou9dJ/A==}
 
   abbrev@4.0.0:
     resolution: {integrity: sha512-a1wflyaL0tHtJSmLSOVybYhy22vRih4eduhhrkcjgrWGnRfrZtovJ2FRjxuTtkkj47O/baf0R86QU5OuYpz8fA==}
@@ -3782,8 +3782,8 @@ packages:
   dompurify@3.2.7:
     resolution: {integrity: sha512-WhL/YuveyGXJaerVlMYGWhvQswa7myDG17P7Vu65EWC05o8vfeNbvNf4d/BOvH99+ZW+LlQsc1GDKMa1vNK6dw==}
 
-  dompurify@3.4.2:
-    resolution: {integrity: sha512-lHeS9SA/IKeIFFyYciHBr2n0v1VMPlSj843HdLOwjb2OxNwdq9Xykxqhk+FE42MzAdHvInbAolSE4mhahPpjXA==}
+  dompurify@3.4.5:
+    resolution: {integrity: sha512-OrwIBKsdNSVEeubdJ1HBv/wNENRM9ytAVCv7YXt//A3vPdVMNuACRqK9mXCGCBW2ln7BT/A4X0jXHo2Gu89miA==}
 
   dotenv-expand@11.0.7:
     resolution: {integrity: sha512-zIHwmZPRshsCdpMDyVsqGmgyP0yT8GAgXUnkdAoJisxvf33k7yO6OuoKmcTGuXPWSsm8Oh88nZicRLA9Y0rUeA==}
@@ -5454,6 +5454,12 @@ packages:
     resolution: {integrity: sha512-y3bGgqKj3QBdxLbLkomlohkvsA8gdAiUQlSBJnBhfn+BPxg4bc62d8TcBW15wavDfgexCgccckhcZvywyQYPOw==}
     hasBin: true
 
+  react-colorful@5.7.0:
+    resolution: {integrity: sha512-fuesYIemttah97XmsIHmz4OORDHiSFzyc9HMAIrCHJou2jaRQmL8cFJ76K4zQhhj8jzwOBlOi4BaGTjjOZCfTg==}
+    peerDependencies:
+      react: '>=16.8.0'
+      react-dom: '>=16.8.0'
+
   react-dom@19.2.5:
     resolution: {integrity: sha512-J5bAZz+DXMMwW/wV3xzKke59Af6CHY7G4uYLN1OvBcKEsWOs4pQExj86BBKamxl/Ik5bx9whOrvBlSDfWzgSag==}
     peerDependencies:
@@ -5768,9 +5774,6 @@ packages:
 
   simple-get@4.0.1:
     resolution: {integrity: sha512-brv7p5WgH0jmQJr1ZDDfKDOSeWWg+OVypG99A/5vYGPqJ6pxiaHLy8nxtFjBA7oMa01ebA9gfh1uMCFqOuXxvA==}
-
-  simple-git@3.36.0:
-    resolution: {integrity: sha512-cGQjLjK8bxJw4QuYT7gxHw3/IouVESbhahSsHrX97MzCL1gu2u7oy38W6L2ZIGECEfIBG4BabsWDPjBxJENv9Q==}
 
   simple-update-notifier@2.0.0:
     resolution: {integrity: sha512-a2B9Y0KlNXl9u/vsW6sTIu9vGEpfKu2wRV6l1H3XEas/0gUIzGzBoP/IouTcUQbm9JWZLH3COxyn03TYlFax6w==}
@@ -7030,14 +7033,6 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.5.5
 
-  '@kwsites/file-exists@1.1.1':
-    dependencies:
-      debug: 4.4.3
-    transitivePeerDependencies:
-      - supports-color
-
-  '@kwsites/promise-deferred@1.1.1': {}
-
   '@linear/sdk@82.1.0(graphql@16.13.2)':
     dependencies:
       '@graphql-typed-document-node/core': 3.2.0(graphql@16.13.2)
@@ -8220,12 +8215,6 @@ snapshots:
 
   '@sec-ant/readable-stream@0.4.1': {}
 
-  '@simple-git/args-pathspec@1.0.3': {}
-
-  '@simple-git/argv-parser@1.1.1':
-    dependencies:
-      '@simple-git/args-pathspec': 1.0.3
-
   '@sindresorhus/is@4.6.0': {}
 
   '@sindresorhus/merge-streams@4.0.0': {}
@@ -8376,6 +8365,12 @@ snapshots:
     dependencies:
       '@tiptap/core': 3.22.5(@tiptap/pm@3.22.5)
 
+  '@tiptap/extension-details@3.22.5(@tiptap/core@3.22.5(@tiptap/pm@3.22.5))(@tiptap/extension-text-style@3.22.5(@tiptap/core@3.22.5(@tiptap/pm@3.22.5)))(@tiptap/pm@3.22.5)':
+    dependencies:
+      '@tiptap/core': 3.22.5(@tiptap/pm@3.22.5)
+      '@tiptap/extension-text-style': 3.22.5(@tiptap/core@3.22.5(@tiptap/pm@3.22.5))
+      '@tiptap/pm': 3.22.5
+
   '@tiptap/extension-document@3.22.5(@tiptap/core@3.22.5(@tiptap/pm@3.22.5))':
     dependencies:
       '@tiptap/core': 3.22.5(@tiptap/pm@3.22.5)
@@ -8481,6 +8476,10 @@ snapshots:
   '@tiptap/extension-task-list@3.22.5(@tiptap/extension-list@3.22.5(@tiptap/core@3.22.5(@tiptap/pm@3.22.5))(@tiptap/pm@3.22.5))':
     dependencies:
       '@tiptap/extension-list': 3.22.5(@tiptap/core@3.22.5(@tiptap/pm@3.22.5))(@tiptap/pm@3.22.5)
+
+  '@tiptap/extension-text-style@3.22.5(@tiptap/core@3.22.5(@tiptap/pm@3.22.5))':
+    dependencies:
+      '@tiptap/core': 3.22.5(@tiptap/pm@3.22.5)
 
   '@tiptap/extension-text@3.22.5(@tiptap/core@3.22.5(@tiptap/pm@3.22.5))':
     dependencies:
@@ -8922,39 +8921,39 @@ snapshots:
   '@xmldom/xmldom@0.9.10':
     optional: true
 
-  '@xterm/addon-fit@0.12.0-beta.216(@xterm/xterm@6.1.0-beta.216)':
+  '@xterm/addon-fit@0.12.0-beta.220(@xterm/xterm@6.1.0-beta.220)':
     dependencies:
-      '@xterm/xterm': 6.1.0-beta.216
+      '@xterm/xterm': 6.1.0-beta.220
 
-  '@xterm/addon-ligatures@0.11.0-beta.216(patch_hash=df21db050a4d85552cafbe583ece863d7fa19ed634a1219210a0455b986b6634)(@xterm/xterm@6.1.0-beta.216)':
+  '@xterm/addon-ligatures@0.11.0-beta.220(patch_hash=df21db050a4d85552cafbe583ece863d7fa19ed634a1219210a0455b986b6634)(@xterm/xterm@6.1.0-beta.220)':
     dependencies:
-      '@xterm/xterm': 6.1.0-beta.216
+      '@xterm/xterm': 6.1.0-beta.220
       lru-cache: 6.0.0
       opentype.js: 0.8.0
 
-  '@xterm/addon-search@0.17.0-beta.216(@xterm/xterm@6.1.0-beta.216)':
+  '@xterm/addon-search@0.17.0-beta.220(@xterm/xterm@6.1.0-beta.220)':
     dependencies:
-      '@xterm/xterm': 6.1.0-beta.216
+      '@xterm/xterm': 6.1.0-beta.220
 
-  '@xterm/addon-serialize@0.15.0-beta.216(@xterm/xterm@6.1.0-beta.216)':
+  '@xterm/addon-serialize@0.15.0-beta.220(@xterm/xterm@6.1.0-beta.220)':
     dependencies:
-      '@xterm/xterm': 6.1.0-beta.216
+      '@xterm/xterm': 6.1.0-beta.220
 
-  '@xterm/addon-unicode11@0.10.0-beta.216(@xterm/xterm@6.1.0-beta.216)':
+  '@xterm/addon-unicode11@0.10.0-beta.220(@xterm/xterm@6.1.0-beta.220)':
     dependencies:
-      '@xterm/xterm': 6.1.0-beta.216
+      '@xterm/xterm': 6.1.0-beta.220
 
-  '@xterm/addon-web-links@0.13.0-beta.216(@xterm/xterm@6.1.0-beta.216)':
+  '@xterm/addon-web-links@0.13.0-beta.220(@xterm/xterm@6.1.0-beta.220)':
     dependencies:
-      '@xterm/xterm': 6.1.0-beta.216
+      '@xterm/xterm': 6.1.0-beta.220
 
-  '@xterm/addon-webgl@0.20.0-beta.215(patch_hash=4923357da531172cda1fd570a33fd852349d9eb6317f4befa8b3af18c221039d)(@xterm/xterm@6.1.0-beta.216)':
+  '@xterm/addon-webgl@0.20.0-beta.219(patch_hash=b7465b48cca8d596e3bf0e441f939100c95adaddef13e85df089ed0ad6f6b1ea)(@xterm/xterm@6.1.0-beta.220)':
     dependencies:
-      '@xterm/xterm': 6.1.0-beta.216
+      '@xterm/xterm': 6.1.0-beta.220
 
-  '@xterm/headless@6.1.0-beta.216': {}
+  '@xterm/headless@6.1.0-beta.220': {}
 
-  '@xterm/xterm@6.1.0-beta.216': {}
+  '@xterm/xterm@6.1.0-beta.220': {}
 
   abbrev@4.0.0: {}
 
@@ -9705,7 +9704,7 @@ snapshots:
     optionalDependencies:
       '@types/trusted-types': 2.0.7
 
-  dompurify@3.4.2:
+  dompurify@3.4.5:
     optionalDependencies:
       '@types/trusted-types': 2.0.7
 
@@ -11004,7 +11003,7 @@ snapshots:
       d3-sankey: 0.12.3
       dagre-d3-es: 7.0.14
       dayjs: 1.11.20
-      dompurify: 3.4.2
+      dompurify: 3.4.5
       es-toolkit: 1.46.1
       katex: 0.16.45
       khroma: 2.1.0
@@ -11367,7 +11366,7 @@ snapshots:
       undici: 6.25.0
       which: 6.0.1
 
-  node-pty@1.1.0(patch_hash=93c259888173175ad66ab303977deb17f2aee9e276cb35522dc61815c65358d4):
+  node-pty@1.1.0(patch_hash=407ae07e1e0e2ff2e8b58696449c54c31e51d87535bc6aa4a7a7b0b561407282):
     dependencies:
       node-addon-api: 7.1.1
 
@@ -11862,6 +11861,11 @@ snapshots:
       minimist: 1.2.8
       strip-json-comments: 2.0.1
 
+  react-colorful@5.7.0(react-dom@19.2.5(react@19.2.5))(react@19.2.5):
+    dependencies:
+      react: 19.2.5
+      react-dom: 19.2.5(react@19.2.5)
+
   react-dom@19.2.5(react@19.2.5):
     dependencies:
       react: 19.2.5
@@ -12309,16 +12313,6 @@ snapshots:
       decompress-response: 6.0.0
       once: 1.4.0
       simple-concat: 1.0.1
-
-  simple-git@3.36.0:
-    dependencies:
-      '@kwsites/file-exists': 1.1.1
-      '@kwsites/promise-deferred': 1.1.1
-      '@simple-git/args-pathspec': 1.0.3
-      '@simple-git/argv-parser': 1.1.1
-      debug: 4.4.3
-    transitivePeerDependencies:
-      - supports-color
 
   simple-update-notifier@2.0.0:
     dependencies:

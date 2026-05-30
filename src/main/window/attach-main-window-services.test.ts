@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const {
   onMock,
   removeAllListenersMock,
+  removeListenerMock,
   setPermissionRequestHandlerMock,
   setPermissionCheckHandlerMock,
   setDisplayMediaRequestHandlerMock,
@@ -22,6 +23,7 @@ const {
 } = vi.hoisted(() => ({
   onMock: vi.fn(),
   removeAllListenersMock: vi.fn(),
+  removeListenerMock: vi.fn(),
   setPermissionRequestHandlerMock: vi.fn(),
   setPermissionCheckHandlerMock: vi.fn(),
   setDisplayMediaRequestHandlerMock: vi.fn(),
@@ -52,8 +54,13 @@ vi.mock('electron', () => ({
   ipcMain: {
     on: onMock,
     removeAllListeners: removeAllListenersMock,
+    removeListener: removeListenerMock,
     removeHandler: removeHandlerMock,
     handle: handleMock
+  },
+  powerMonitor: {
+    on: vi.fn(),
+    off: vi.fn()
   }
 }))
 
@@ -148,6 +155,7 @@ describe('attachMainWindowServices', () => {
   beforeEach(() => {
     onMock.mockReset()
     removeAllListenersMock.mockReset()
+    removeListenerMock.mockReset()
     handleMock.mockReset()
     removeHandlerMock.mockReset()
     setPermissionRequestHandlerMock.mockReset()
@@ -167,7 +175,8 @@ describe('attachMainWindowServices', () => {
       setPermissionRequestHandler: setPermissionRequestHandlerMock,
       setPermissionCheckHandler: setPermissionCheckHandlerMock,
       setDisplayMediaRequestHandler: setDisplayMediaRequestHandlerMock,
-      on: vi.fn()
+      on: vi.fn(),
+      removeListener: vi.fn()
     })
     systemPreferencesAskForMediaAccessMock.mockResolvedValue(true)
     systemPreferencesGetMediaAccessStatusMock.mockReturnValue('granted')
@@ -312,7 +321,8 @@ describe('attachMainWindowServices', () => {
       setPermissionRequestHandler: setPermissionRequestHandlerMock,
       setPermissionCheckHandler: setPermissionCheckHandlerMock,
       setDisplayMediaRequestHandler: setDisplayMediaRequestHandlerMock,
-      on: browserSessionOnMock
+      on: browserSessionOnMock,
+      removeListener: vi.fn()
     })
 
     const mainWindowOnMock = vi.fn()
@@ -374,12 +384,38 @@ describe('attachMainWindowServices', () => {
     })
   })
 
+  it('replaces the persistent browser-session download handler on re-attach', () => {
+    const browserSessionOnMock = vi.fn()
+    const browserSessionRemoveListenerMock = vi.fn()
+    sessionFromPartitionMock.mockReturnValue({
+      setPermissionRequestHandler: setPermissionRequestHandlerMock,
+      setPermissionCheckHandler: setPermissionCheckHandlerMock,
+      setDisplayMediaRequestHandler: setDisplayMediaRequestHandlerMock,
+      on: browserSessionOnMock,
+      removeListener: browserSessionRemoveListenerMock
+    })
+
+    attachMainWindowServices(createMainWindow() as never, createStore(), createRuntime() as never)
+    attachMainWindowServices(createMainWindow() as never, createStore(), createRuntime() as never)
+
+    const downloadOnCalls = browserSessionOnMock.mock.calls.filter(
+      ([eventName]) => eventName === 'will-download'
+    )
+    const downloadRemoveCalls = browserSessionRemoveListenerMock.mock.calls.filter(
+      ([eventName]) => eventName === 'will-download'
+    )
+    expect(downloadOnCalls).toHaveLength(2)
+    expect(downloadRemoveCalls).toHaveLength(2)
+    expect(downloadRemoveCalls[1][1]).toBe(downloadOnCalls[0][1])
+  })
+
   it('clears browser guest registrations when the main window closes', () => {
     sessionFromPartitionMock.mockReturnValue({
       setPermissionRequestHandler: setPermissionRequestHandlerMock,
       setPermissionCheckHandler: setPermissionCheckHandlerMock,
       setDisplayMediaRequestHandler: setDisplayMediaRequestHandlerMock,
-      on: vi.fn()
+      on: vi.fn(),
+      removeListener: vi.fn()
     })
     const mainWindowOnMock = vi.fn()
     const mainWindow = createMainWindow()
@@ -393,6 +429,28 @@ describe('attachMainWindowServices', () => {
     expect(closedHandler).toBeTypeOf('function')
     closedHandler?.()
     expect(browserManagerUnregisterAllMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('removes the native file-drop relay when the main window closes', () => {
+    const mainWindowOnMock = vi.fn()
+    const mainWindow = createMainWindow({ send: vi.fn() })
+    mainWindow.on = mainWindowOnMock
+
+    attachMainWindowServices(mainWindow as never, createStore(), createRuntime() as never)
+
+    const channel = 'terminal:file-dropped-from-preload'
+    const relayHandler = onMock.mock.calls.find(([event]) => event === channel)?.[1]
+    expect(relayHandler).toBeTypeOf('function')
+    expect(removeAllListenersMock).toHaveBeenCalledWith(channel)
+
+    const closedHandlers = mainWindowOnMock.mock.calls
+      .filter(([event]) => event === 'closed')
+      .map(([, handler]) => handler as () => void)
+    for (const handler of closedHandlers) {
+      handler()
+    }
+
+    expect(removeListenerMock).toHaveBeenCalledWith(channel, relayHandler)
   })
 
   it('forwards runtime notifier events to the renderer', () => {

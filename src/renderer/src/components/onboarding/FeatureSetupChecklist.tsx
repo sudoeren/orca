@@ -31,14 +31,14 @@ const FEATURE_SETUP_ROWS: readonly FeatureSetupRow[] = [
     id: 'computerUse',
     title: 'Computer Use',
     description: 'Agents can inspect app windows and operate local apps when you ask.',
-    setupSummary: 'Registers `orca`, opens permissions, and prepares the skill.',
+    setupSummary: 'Registers the Orca CLI, opens permissions, and prepares the skill.',
     icon: <MonitorCog className="size-4" />
   },
   {
     id: 'orchestration',
     title: 'Agent Orchestration',
     description: 'Agents can message each other, take tasks, and coordinate handoffs.',
-    setupSummary: 'Registers `orca`, enables orchestration, and prepares the skill.',
+    setupSummary: 'Registers the Orca CLI, enables orchestration, and prepares the skill.',
     icon: <Workflow className="size-4" />
   }
 ]
@@ -48,15 +48,7 @@ export function FeatureSetupChecklist({
   onChange
 }: FeatureSetupChecklistProps): React.JSX.Element {
   return (
-    <section className="mt-6 space-y-3">
-      <div className="space-y-1">
-        <h2 className="text-sm font-semibold text-foreground">Set up agent features</h2>
-        <p className="text-[13px] leading-relaxed text-muted-foreground">
-          Pick the capabilities you want ready after onboarding. Selected features run setup on the
-          next click and show a terminal here with the skill command ready for review.
-        </p>
-      </div>
-
+    <section className="mt-6">
       <div className="grid gap-3 md:grid-cols-3">
         {FEATURE_SETUP_ROWS.map((row) => {
           const selected = value[row.id]
@@ -70,7 +62,7 @@ export function FeatureSetupChecklist({
                 'flex min-h-40 flex-col rounded-lg border px-4 py-3 text-left transition-colors',
                 'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2',
                 selected
-                  ? 'border-foreground/40 bg-card text-foreground'
+                  ? 'border-violet-500/60 bg-violet-500/10 text-foreground ring-2 ring-violet-500/30'
                   : 'border-border bg-muted/20 text-muted-foreground hover:bg-muted/40'
               )}
               onClick={() => onChange({ ...value, [row.id]: !selected })}
@@ -91,11 +83,11 @@ export function FeatureSetupChecklist({
                   className={cn(
                     'flex size-5 items-center justify-center rounded-full border transition-colors',
                     selected
-                      ? 'border-primary bg-primary text-primary-foreground'
+                      ? 'border-violet-500 bg-violet-500 text-white'
                       : 'border-border bg-background'
                   )}
                 >
-                  {selected ? <Check className="size-3.5" /> : null}
+                  {selected ? <Check className="size-3" strokeWidth={3} /> : null}
                 </span>
               </span>
               <span className="mt-3 text-sm font-medium text-foreground">{row.title}</span>

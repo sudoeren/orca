@@ -37,7 +37,9 @@ describe('resolveDropdownItems', () => {
       'create_pr',
       'push_create_pr',
       'pull',
+      'fast_forward',
       'sync',
+      'rebase_base',
       'fetch',
       'publish'
     ])
@@ -173,6 +175,10 @@ describe('resolveDropdownItems', () => {
     expect(byKind.pull.title).toBe(
       'Nothing new to pull — remote only has older copies of local commits'
     )
+    expect(byKind.fast_forward.disabled).toBe(true)
+    expect(byKind.fast_forward.title).toBe(
+      'Nothing new to fast-forward — remote only has older copies of local commits'
+    )
     expect(byKind.commit_sync.label).toBe('Commit & Sync')
     expect(byKind.commit_sync.disabled).toBe(true)
     expect(byKind.commit_sync.title).toBe(
@@ -213,6 +219,76 @@ describe('resolveDropdownItems', () => {
     }
   })
 
+  it('shows a destructive abort item only while merge or rebase is in progress', () => {
+    const mergeItems = resolveDropdownItems(
+      inputs({
+        conflictOperation: 'merge',
+        upstreamStatus: { hasUpstream: true, ahead: 0, behind: 0 }
+      })
+    )
+    const rebaseItems = resolveDropdownItems(
+      inputs({
+        conflictOperation: 'rebase',
+        upstreamStatus: { hasUpstream: true, ahead: 0, behind: 0 }
+      })
+    )
+    const mergeByKind = Object.fromEntries(
+      mergeItems.filter((e) => e.kind !== 'separator').map((e) => [e.kind, e])
+    )
+    const rebaseByKind = Object.fromEntries(
+      rebaseItems.filter((e) => e.kind !== 'separator').map((e) => [e.kind, e])
+    )
+
+    expect(mergeByKind.abort_merge).toMatchObject({
+      label: 'Abort merge',
+      title: 'Abort the merge in progress',
+      disabled: false,
+      variant: 'destructive'
+    })
+    expect(rebaseByKind.abort_rebase).toMatchObject({
+      label: 'Abort rebase',
+      title: 'Abort the rebase in progress',
+      disabled: false,
+      variant: 'destructive'
+    })
+    expect(mergeByKind.abort_rebase).toBeUndefined()
+    expect(rebaseByKind.abort_merge).toBeUndefined()
+
+    for (const conflictOperation of ['unknown', 'cherry-pick'] as const) {
+      const items = resolveDropdownItems(inputs({ conflictOperation }))
+      expect(items.some((entry) => entry.kind === 'abort_merge')).toBe(false)
+      expect(items.some((entry) => entry.kind === 'abort_rebase')).toBe(false)
+    }
+  })
+
+  it('disables conflict abort actions while another action is busy', () => {
+    const items = resolveDropdownItems(
+      inputs({
+        conflictOperation: 'merge',
+        isRemoteOperationActive: true,
+        upstreamStatus: { hasUpstream: true, ahead: 0, behind: 0 }
+      })
+    )
+    const rebaseItems = resolveDropdownItems(
+      inputs({
+        conflictOperation: 'rebase',
+        isRemoteOperationActive: true,
+        upstreamStatus: { hasUpstream: true, ahead: 0, behind: 0 }
+      })
+    )
+    const abortMerge = items.find((entry) => entry.kind === 'abort_merge')
+    const abortRebase = rebaseItems.find((entry) => entry.kind === 'abort_rebase')
+
+    expect(abortMerge).toMatchObject({
+      disabled: true,
+      title: 'Operation in progress…'
+    })
+    expect(abortRebase).toMatchObject({
+      disabled: true,
+      title: 'Operation in progress…'
+    })
+  })
+
   it('locks every item while a pull request operation is running', () => {
     const items = resolveDropdownItems(
       inputs({
@@ -251,6 +327,7 @@ describe('resolveDropdownItems', () => {
       'commit_sync',
       'push',
       'pull',
+      'fast_forward',
       'sync',
       'fetch',
       'publish'
@@ -276,11 +353,46 @@ describe('resolveDropdownItems', () => {
     )
     expect(byKind.push.title).toBe('Publish the branch first to push commits')
     expect(byKind.pull.title).toBe('Publish the branch first to pull commits')
+    expect(byKind.fast_forward.title).toBe('Publish the branch first to fast-forward')
     expect(byKind.sync.title).toBe('Publish the branch first to sync commits')
     expect(byKind.fetch.title).toBe('Fetch from remote without merging')
     expect(byKind.fetch.disabled).toBe(false)
     expect(byKind.publish.title).toBe('Publish this branch to origin')
     expect(byKind.publish.disabled).toBe(false)
+  })
+
+  it('enables rebase from base only on a clean tree with a remote base ref', () => {
+    const items = resolveDropdownItems(
+      inputs({
+        upstreamStatus: { hasUpstream: true, ahead: 0, behind: 0 },
+        rebaseBaseRef: 'origin/main'
+      })
+    )
+    const byKind = Object.fromEntries(
+      items.filter((e) => e.kind !== 'separator').map((e) => [e.kind, e])
+    )
+
+    expect(byKind.rebase_base.label).toBe('Rebase from origin/main')
+    expect(byKind.rebase_base.title).toBe(
+      'Rebase current branch with latest commits from origin/main'
+    )
+    expect(byKind.rebase_base.disabled).toBe(false)
+  })
+
+  it('disables rebase from base while local changes are present', () => {
+    const items = resolveDropdownItems(
+      inputs({
+        hasUnstagedChanges: true,
+        upstreamStatus: { hasUpstream: true, ahead: 0, behind: 0 },
+        rebaseBaseRef: 'origin/main'
+      })
+    )
+    const byKind = Object.fromEntries(
+      items.filter((e) => e.kind !== 'separator').map((e) => [e.kind, e])
+    )
+
+    expect(byKind.rebase_base.disabled).toBe(true)
+    expect(byKind.rebase_base.title).toBe('Commit or stash local changes before rebasing')
   })
 
   it('does not show Publish Branch when an unpublished branch has no commits ahead', () => {
@@ -310,6 +422,7 @@ describe('resolveDropdownItems', () => {
     )
     expect(byKind.push.title).toBe('PR is already merged')
     expect(byKind.pull.title).toBe('PR is already merged')
+    expect(byKind.fast_forward.title).toBe('PR is already merged')
     expect(byKind.sync.title).toBe('PR is already merged')
     expect(byKind.publish.label).toBe('PR Status')
     expect(byKind.publish.title).toBe('PR is already merged')
@@ -350,6 +463,27 @@ describe('resolveDropdownItems', () => {
     // Sanity check: plain counterparts still carry counts.
     expect(byKind.push.label).toBe('Push (2)')
     expect(byKind.sync.label).toBe('Sync (↓3 ↑2)')
+  })
+
+  it('enables fast-forward only when the branch is behind with no local commits', () => {
+    const behindOnly = resolveDropdownItems(
+      inputs({ upstreamStatus: { hasUpstream: true, ahead: 0, behind: 2 } })
+    )
+    const diverged = resolveDropdownItems(
+      inputs({ upstreamStatus: { hasUpstream: true, ahead: 1, behind: 2 } })
+    )
+    const behindOnlyByKind = Object.fromEntries(
+      behindOnly.filter((e) => e.kind !== 'separator').map((e) => [e.kind, e])
+    )
+    const divergedByKind = Object.fromEntries(
+      diverged.filter((e) => e.kind !== 'separator').map((e) => [e.kind, e])
+    )
+
+    expect(behindOnlyByKind.fast_forward.label).toBe('Fast-forward (2)')
+    expect(behindOnlyByKind.fast_forward.title).toBe('Fast-forward 2 commits')
+    expect(behindOnlyByKind.fast_forward.disabled).toBe(false)
+    expect(divergedByKind.fast_forward.disabled).toBe(true)
+    expect(divergedByKind.fast_forward.title).toBe('Local commits prevent a fast-forward pull')
   })
 
   it('enables the push-before-PR recovery action when review creation is only blocked by unpushed commits', () => {

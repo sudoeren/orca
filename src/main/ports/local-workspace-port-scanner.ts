@@ -1,7 +1,6 @@
 /* eslint-disable max-lines -- Why: the platform-specific scan paths share parsing,
 attribution, and normalization rules that must stay in lockstep. */
 import { execFile } from 'child_process'
-import { promisify } from 'util'
 import { readFile, readdir, readlink } from 'fs/promises'
 import path from 'path'
 import type {
@@ -10,8 +9,7 @@ import type {
   WorkspacePortProbe,
   WorkspacePortScanResult
 } from '../../shared/workspace-ports'
-
-const execFileAsync = promisify(execFile)
+import { advertisedUrlWatcher, type AdvertisedUrlWatcher } from './advertised-url-watcher'
 
 const COMMAND_TIMEOUT_MS = 4_000
 const MAX_PORTS = 200
@@ -34,12 +32,14 @@ type ProcessMetadata = {
 }
 
 export async function scanWorkspacePorts(
-  worktrees: WorkspacePortProbe[]
+  worktrees: WorkspacePortProbe[],
+  urlWatcher: Pick<AdvertisedUrlWatcher, 'lookup' | 'reconcileScan'> = advertisedUrlWatcher
 ): Promise<WorkspacePortScanResult> {
   try {
     const rawPorts = await scanPlatformListeningPorts()
+    reconcileAdvertisedUrls(rawPorts, worktrees, urlWatcher)
     const ports = rawPorts
-      .map((port) => enrichPort(port, worktrees))
+      .map((port) => enrichPort(port, worktrees, urlWatcher))
       .sort(compareWorkspacePorts)
       .slice(0, MAX_PORTS)
     return { platform: process.platform, scannedAt: Date.now(), ports }
@@ -337,12 +337,50 @@ async function loadWindowsProcessMetadata(
 }
 
 async function runCommand(command: string, args: string[]): Promise<{ stdout: string }> {
-  const { stdout } = await execFileAsync(command, args, {
-    timeout: COMMAND_TIMEOUT_MS,
-    maxBuffer: 2 * 1024 * 1024,
-    windowsHide: true
+  return await new Promise((resolve, reject) => {
+    let settled = false
+    let child: ReturnType<typeof execFile> | undefined
+    const timer = setTimeout(() => {
+      if (settled) {
+        return
+      }
+      settled = true
+      child?.kill()
+      reject(new Error(`${command} timed out after ${COMMAND_TIMEOUT_MS}ms`))
+    }, COMMAND_TIMEOUT_MS)
+
+    const settle = (callback: () => void): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      clearTimeout(timer)
+      callback()
+    }
+
+    // Why: Node's execFile timeout only signals the child; if the callback
+    // never arrives, the workspace port scan would otherwise hang forever.
+    try {
+      child = execFile(
+        command,
+        args,
+        {
+          timeout: COMMAND_TIMEOUT_MS,
+          maxBuffer: 2 * 1024 * 1024,
+          windowsHide: true
+        },
+        (error, stdout) => {
+          if (error) {
+            settle(() => reject(error))
+            return
+          }
+          settle(() => resolve({ stdout: String(stdout) }))
+        }
+      )
+    } catch (error) {
+      settle(() => reject(error))
+    }
   })
-  return { stdout: String(stdout) }
 }
 
 async function readTextIfAvailable(filePath: string): Promise<string | undefined> {
@@ -353,7 +391,11 @@ async function readTextIfAvailable(filePath: string): Promise<string | undefined
   }
 }
 
-function enrichPort(port: RawListeningPort, worktrees: WorkspacePortProbe[]): WorkspacePort {
+function enrichPort(
+  port: RawListeningPort,
+  worktrees: WorkspacePortProbe[],
+  urlWatcher: Pick<AdvertisedUrlWatcher, 'lookup'>
+): WorkspacePort {
   const owner = attributePortToWorkspace(port, worktrees)
   const base = {
     id: `${port.host}:${port.port}:${port.pid ?? 'unknown'}`,
@@ -366,12 +408,45 @@ function enrichPort(port: RawListeningPort, worktrees: WorkspacePortProbe[]): Wo
   }
 
   if (owner) {
-    return { ...base, kind: 'workspace', owner }
+    // Why: only enrich workspace-attributed ports. Container and external
+    // ports may have URLs printed in unrelated terminals — the worktree
+    // scoping is the primary false-positive filter.
+    const advertised = urlWatcher.lookup(owner.worktreeId, port.port, port.pid)
+    return {
+      ...base,
+      protocol: advertised?.protocol ?? base.protocol,
+      kind: 'workspace',
+      owner,
+      ...(advertised ? { advertisedUrl: advertised.origin } : {})
+    }
   }
   if (isContainerProcess(port)) {
     return { ...base, kind: 'container' }
   }
   return { ...base, kind: 'external' }
+}
+
+function reconcileAdvertisedUrls(
+  ports: RawListeningPort[],
+  worktrees: WorkspacePortProbe[],
+  urlWatcher: Pick<AdvertisedUrlWatcher, 'reconcileScan'>
+): void {
+  const observationsByWorktree = new Map<string, { port: number; pid?: number }[]>()
+  for (const worktree of worktrees) {
+    observationsByWorktree.set(worktree.id, [])
+  }
+  for (const port of ports) {
+    const owner = attributePortToWorkspace(port, worktrees)
+    if (!owner) {
+      continue
+    }
+    observationsByWorktree.get(owner.worktreeId)?.push({ port: port.port, pid: port.pid })
+  }
+  for (const [worktreeId, observations] of observationsByWorktree) {
+    // Why: the scanner sees port disappearance and PID changes before a lazy
+    // lookup would otherwise pin a stale banner to a new listener.
+    urlWatcher.reconcileScan([worktreeId], observations)
+  }
 }
 
 function compareWorkspacePorts(a: WorkspacePort, b: WorkspacePort): number {
