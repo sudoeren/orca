@@ -54,6 +54,18 @@ async function getLatestSendableReport(
   )
 }
 
+async function getRequestedCrashReport(
+  store: CrashReportStore,
+  args?: { reportId?: string }
+): Promise<Awaited<ReturnType<CrashReportStore['getLatestPending']>>> {
+  if (args?.reportId) {
+    return store.getById(args.reportId)
+  }
+  // Why: Help > Report Crash can intentionally submit without a report ID.
+  // Do not replace that uncaptured report with a pending crash that appears later.
+  return args ? null : getLatestPendingReport(store)
+}
+
 function formatUnknownError(error: unknown): string {
   return sanitizeCrashReportString(error instanceof Error ? error.message : String(error))
 }
@@ -195,9 +207,7 @@ export function registerCrashReportingHandlers(store: CrashReportStore): void {
   ipcMain.handle(
     'crashReports:copyLatestDiagnostics',
     async (_event, args?: { reportId?: string; notes?: string }) => {
-      const report = args?.reportId
-        ? await store.getById(args.reportId)
-        : await getLatestPendingReport(store)
+      const report = await getRequestedCrashReport(store, args)
       if (!report) {
         clipboard.writeText(buildUncapturedCrashReportText(args?.notes))
         return { ok: true as const }
@@ -211,9 +221,7 @@ export function registerCrashReportingHandlers(store: CrashReportStore): void {
   ipcMain.handle(
     'crashReports:submit',
     async (_event, args: CrashReportSubmitArgs): Promise<CrashReportSubmitResult> => {
-      const report = args.reportId
-        ? await store.getById(args.reportId)
-        : await getLatestPendingReport(store)
+      const report = await getRequestedCrashReport(store, args)
       if (!report) {
         const diagnosticUpload = await collectAndUploadCrashDiagnosticBundle()
         const diagnosticBundle = diagnosticUpload.diagnosticBundle

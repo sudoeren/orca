@@ -141,13 +141,15 @@ describe('registerCrashReportingHandlers', () => {
     )
   })
 
-  it('copies an uncaptured crash report when no stored report exists', async () => {
+  it('copies an uncaptured crash report when the caller intentionally omits reportId', async () => {
+    const pending = report('pending', 'crash-late-pending')
+    const listRecent = vi.fn(async () => [pending])
     registerCrashReportingHandlers({
       getById: vi.fn(async () => null),
       dismiss: vi.fn(),
       markSent: vi.fn(),
       markDismissedSent: vi.fn(),
-      listRecent: vi.fn(async () => []),
+      listRecent,
       record: vi.fn(),
       formatDiagnosticText: vi.fn()
     } as never)
@@ -159,6 +161,10 @@ describe('registerCrashReportingHandlers', () => {
     expect(result).toEqual({ ok: true })
     expect(clipboardWriteTextMock).toHaveBeenCalledWith(expect.stringContaining('not captured'))
     expect(clipboardWriteTextMock).toHaveBeenCalledWith(expect.stringContaining('[redacted-path]'))
+    expect(clipboardWriteTextMock).not.toHaveBeenCalledWith(
+      expect.stringContaining('crash-late-pending')
+    )
+    expect(listRecent).not.toHaveBeenCalled()
   })
 
   it('returns dismissed unsent reports for the manual Help menu entry', async () => {
@@ -217,12 +223,15 @@ describe('registerCrashReportingHandlers', () => {
   })
 
   it('submits an uncaptured Help menu crash report and uploads the diagnostic bundle', async () => {
+    const pending = report('pending', 'crash-late-pending')
+    const markSent = vi.fn()
+    const listRecent = vi.fn(async () => [pending])
     registerCrashReportingHandlers({
       getById: vi.fn(async () => null),
       dismiss: vi.fn(),
-      markSent: vi.fn(),
+      markSent,
       markDismissedSent: vi.fn(),
-      listRecent: vi.fn(async () => []),
+      listRecent,
       record: vi.fn(),
       formatDiagnosticText: vi.fn()
     } as never)
@@ -262,6 +271,8 @@ describe('registerCrashReportingHandlers', () => {
       expect.objectContaining({ feedback: expect.stringContaining('[redacted-path]') })
     )
     expect(showMessageBoxMock).not.toHaveBeenCalled()
+    expect(markSent).not.toHaveBeenCalled()
+    expect(listRecent).not.toHaveBeenCalled()
   })
 
   it('uploads crash logs even if a native confirmation mock would have cancelled', async () => {
