@@ -1,5 +1,13 @@
 import { Image as ImageIcon, RotateCcw, X, ZoomIn, ZoomOut } from 'lucide-react'
-import { type JSX, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  type CSSProperties,
+  type JSX,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState
+} from 'react'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
 import PdfViewer from './PdfViewer'
@@ -7,8 +15,11 @@ import {
   IMAGE_VIEWER_ZOOM_STEP,
   MAX_IMAGE_VIEWER_ZOOM,
   MIN_IMAGE_VIEWER_ZOOM,
+  type ImageViewerImageDimensions,
+  type ImageViewerSurfaceSize,
   clampImageViewerZoom,
   getNextWheelImageViewerZoom,
+  getZoomedImageLayoutSize,
   shouldHandleImageZoomWheel
 } from './image-viewer-zoom'
 
@@ -19,6 +30,24 @@ type ImageViewerProps = {
   filePath: string
   mimeType?: string
   layout?: 'fill' | 'intrinsic'
+}
+
+function getElementSurfaceSize(element: HTMLElement): ImageViewerSurfaceSize {
+  return {
+    width: element.clientWidth,
+    height: element.clientHeight
+  }
+}
+
+function getImageLayoutStyle(size: ImageViewerImageDimensions | null): CSSProperties | undefined {
+  if (!size) {
+    return undefined
+  }
+
+  return {
+    width: `${size.width}px`,
+    height: `${size.height}px`
+  }
 }
 
 export default function ImageViewer({
@@ -32,9 +61,9 @@ export default function ImageViewer({
   const [zoom, setZoom] = useState(1)
   const inlineSurfaceRef = useRef<HTMLDivElement | null>(null)
   const popupSurfaceRef = useRef<HTMLDivElement | null>(null)
-  const [imageDimensions, setImageDimensions] = useState<{ width: number; height: number } | null>(
-    null
-  )
+  const [inlineSurfaceSize, setInlineSurfaceSize] = useState<ImageViewerSurfaceSize | null>(null)
+  const [popupSurfaceSize, setPopupSurfaceSize] = useState<ImageViewerSurfaceSize | null>(null)
+  const [imageDimensions, setImageDimensions] = useState<ImageViewerImageDimensions | null>(null)
 
   const filename = useMemo(() => filePath.split(/[/\\]/).pop() || filePath, [filePath])
   const cleanedContent = useMemo(() => content.replace(/\s/g, ''), [content])
@@ -52,6 +81,34 @@ export default function ImageViewer({
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
   }, [cleanedContent])
   const zoomPercent = Math.round(zoom * 100)
+  const inlineImageLayoutSize = useMemo(
+    () =>
+      isIntrinsicLayout
+        ? null
+        : getZoomedImageLayoutSize({
+            imageDimensions,
+            surfaceSize: inlineSurfaceSize,
+            zoom
+          }),
+    [imageDimensions, inlineSurfaceSize, isIntrinsicLayout, zoom]
+  )
+  const popupImageLayoutSize = useMemo(
+    () =>
+      getZoomedImageLayoutSize({
+        imageDimensions,
+        surfaceSize: popupSurfaceSize,
+        zoom
+      }),
+    [imageDimensions, popupSurfaceSize, zoom]
+  )
+  const inlineImageLayoutStyle = useMemo(
+    () => getImageLayoutStyle(inlineImageLayoutSize),
+    [inlineImageLayoutSize]
+  )
+  const popupImageLayoutStyle = useMemo(
+    () => getImageLayoutStyle(popupImageLayoutSize),
+    [popupImageLayoutSize]
+  )
   const applyZoomChange = useCallback((getNextZoom: (currentZoom: number) => number) => {
     setZoom((currentZoom) => clampImageViewerZoom(getNextZoom(currentZoom)))
   }, [])
@@ -76,9 +133,12 @@ export default function ImageViewer({
       }
       inlineSurfaceRef.current = surface
       if (surface) {
+        setInlineSurfaceSize(getElementSurfaceSize(surface))
         // Why: Chromium exposes trackpad pinch as ctrl-wheel and requires a
         // native non-passive listener to stop browser/app zoom.
         surface.addEventListener('wheel', handleImageSurfaceWheel, { passive: false })
+      } else {
+        setInlineSurfaceSize(null)
       }
     },
     [handleImageSurfaceWheel]
@@ -90,11 +150,54 @@ export default function ImageViewer({
       }
       popupSurfaceRef.current = surface
       if (surface) {
+        setPopupSurfaceSize(getElementSurfaceSize(surface))
         surface.addEventListener('wheel', handleImageSurfaceWheel, { passive: false })
+      } else {
+        setPopupSurfaceSize(null)
       }
     },
     [handleImageSurfaceWheel]
   )
+
+  useEffect(() => {
+    const surface = inlineSurfaceRef.current
+    if (!surface) {
+      setInlineSurfaceSize(null)
+      return
+    }
+
+    const updateSize = () => setInlineSurfaceSize(getElementSurfaceSize(surface))
+    updateSize()
+    if (typeof ResizeObserver === 'undefined') {
+      return
+    }
+
+    const observer = new ResizeObserver(updateSize)
+    observer.observe(surface)
+    return () => observer.disconnect()
+  }, [previewUrl])
+
+  useEffect(() => {
+    if (!isPopupOpen) {
+      setPopupSurfaceSize(null)
+      return
+    }
+
+    const surface = popupSurfaceRef.current
+    if (!surface) {
+      return
+    }
+
+    const updateSize = () => setPopupSurfaceSize(getElementSurfaceSize(surface))
+    updateSize()
+    if (typeof ResizeObserver === 'undefined') {
+      return
+    }
+
+    const observer = new ResizeObserver(updateSize)
+    observer.observe(surface)
+    return () => observer.disconnect()
+  }, [isPopupOpen])
 
   useEffect(() => {
     setZoom(1)
@@ -102,6 +205,7 @@ export default function ImageViewer({
 
   useEffect(() => {
     setImageError(false)
+    setImageDimensions(null)
     if (!cleanedContent || isPdf) {
       setPreviewUrl(null)
       return
@@ -160,10 +264,10 @@ export default function ImageViewer({
         <div
           ref={setInlineSurfaceRef}
           className={cn(
-            'flex justify-center bg-muted/20 p-4 cursor-pointer',
+            'cursor-pointer bg-muted/20',
             isIntrinsicLayout
-              ? 'items-start overflow-visible'
-              : 'flex-1 items-center overflow-auto scrollbar-editor'
+              ? 'flex justify-center overflow-visible p-4'
+              : 'flex-1 overflow-auto scrollbar-editor'
           )}
           onClick={() => setIsPopupOpen(true)}
           title="Open image in popup"
@@ -171,23 +275,37 @@ export default function ImageViewer({
           <div
             className={cn(
               'flex justify-center',
-              isIntrinsicLayout ? 'max-w-full items-start' : 'items-center'
+              isIntrinsicLayout
+                ? 'max-w-full items-start'
+                : 'h-max min-h-full w-max min-w-full items-center p-4'
             )}
-            style={{ transform: `scale(${zoom})`, transformOrigin: 'center center' }}
           >
-            <img
-              src={previewUrl}
-              alt={filename}
-              className={cn(
-                'max-w-full object-contain',
-                isIntrinsicLayout ? 'block h-auto max-h-none' : 'max-h-full'
-              )}
-              onLoad={(event) => {
-                const img = event.currentTarget
-                setImageDimensions({ width: img.naturalWidth, height: img.naturalHeight })
-              }}
-              onError={() => setImageError(true)}
-            />
+            <div
+              className="flex items-center justify-center"
+              style={
+                isIntrinsicLayout
+                  ? { transform: `scale(${zoom})`, transformOrigin: 'center center' }
+                  : inlineImageLayoutStyle
+              }
+            >
+              <img
+                src={previewUrl}
+                alt={filename}
+                className={cn(
+                  'object-contain',
+                  isIntrinsicLayout
+                    ? 'block h-auto max-h-none max-w-full'
+                    : inlineImageLayoutSize
+                      ? 'block h-full w-full'
+                      : 'block max-h-full max-w-full'
+                )}
+                onLoad={(event) => {
+                  const img = event.currentTarget
+                  setImageDimensions({ width: img.naturalWidth, height: img.naturalHeight })
+                }}
+                onError={() => setImageError(true)}
+              />
+            </div>
           </div>
         </div>
         <div className="flex items-center gap-4 border-t px-4 py-2 text-xs text-muted-foreground">
@@ -235,11 +353,11 @@ export default function ImageViewer({
       <Dialog open={isPopupOpen} onOpenChange={setIsPopupOpen}>
         <DialogContent
           showCloseButton={false}
-          className="top-1/2 left-1/2 h-[80vh] w-[70vw] max-w-[70vw] -translate-x-1/2 -translate-y-1/2 gap-0 overflow-hidden border border-border/60 bg-background p-0 shadow-2xl sm:max-w-[70vw]"
+          className="top-1/2 left-1/2 flex h-[80vh] w-[70vw] max-w-[70vw] -translate-x-1/2 -translate-y-1/2 flex-col gap-0 overflow-hidden border border-border/60 bg-background p-0 shadow-2xl sm:max-w-[70vw]"
         >
           <DialogTitle className="sr-only">{filename}</DialogTitle>
           <DialogDescription className="sr-only">Full-size image preview</DialogDescription>
-          <div className="flex items-center justify-between border-b border-border/60 bg-background/95 px-3 py-2">
+          <div className="flex shrink-0 items-center justify-between border-b border-border/60 bg-background/95 px-3 py-2">
             <div className="min-w-0 truncate text-sm font-medium text-foreground">{filename}</div>
             <button
               type="button"
@@ -252,20 +370,22 @@ export default function ImageViewer({
           </div>
           <div
             ref={setPopupSurfaceRef}
-            className="flex h-[calc(100%-4.5rem)] w-full min-h-0 items-center justify-center overflow-auto bg-muted/20 p-4 scrollbar-editor"
+            className="min-h-0 flex-1 overflow-auto bg-muted/20 scrollbar-editor"
           >
-            <div
-              className="flex items-center justify-center"
-              style={{ transform: `scale(${zoom})`, transformOrigin: 'center center' }}
-            >
-              <img
-                src={previewUrl}
-                alt={filename}
-                className="block max-h-full max-w-full object-contain"
-              />
+            <div className="flex h-max min-h-full w-max min-w-full items-center justify-center p-4">
+              <div className="flex items-center justify-center" style={popupImageLayoutStyle}>
+                <img
+                  src={previewUrl}
+                  alt={filename}
+                  className={cn(
+                    'object-contain',
+                    popupImageLayoutSize ? 'block h-full w-full' : 'block max-h-full max-w-full'
+                  )}
+                />
+              </div>
             </div>
           </div>
-          <div className="flex items-center justify-between border-t border-border/60 bg-background/95 px-3 py-2 text-xs text-muted-foreground">
+          <div className="flex shrink-0 items-center justify-between border-t border-border/60 bg-background/95 px-3 py-2 text-xs text-muted-foreground">
             <div>Press Esc to close</div>
             <div className="tabular-nums">{zoomPercent}%</div>
           </div>

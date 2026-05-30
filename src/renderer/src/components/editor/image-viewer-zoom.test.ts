@@ -5,6 +5,7 @@ import {
   clampImageViewerZoom,
   getNextWheelImageViewerZoom,
   getPinchZoomFactor,
+  getZoomedImageLayoutSize,
   shouldHandleImageZoomWheel
 } from './image-viewer-zoom'
 
@@ -50,5 +51,56 @@ describe('image viewer zoom helpers', () => {
   it('stays clamped at min and max zoom for pinch gestures', () => {
     expect(getNextWheelImageViewerZoom(MIN_IMAGE_VIEWER_ZOOM, 100, 0)).toBe(MIN_IMAGE_VIEWER_ZOOM)
     expect(getNextWheelImageViewerZoom(MAX_IMAGE_VIEWER_ZOOM, -100, 0)).toBe(MAX_IMAGE_VIEWER_ZOOM)
+  })
+
+  it('uses fitted image dimensions as the base layout size before zooming', () => {
+    expect(
+      getZoomedImageLayoutSize({
+        imageDimensions: { width: 1000, height: 500 },
+        surfaceSize: { width: 500, height: 500 },
+        zoom: 1
+      })
+    ).toEqual({ width: 468, height: 234 })
+    expect(
+      getZoomedImageLayoutSize({
+        imageDimensions: { width: 1000, height: 500 },
+        surfaceSize: { width: 500, height: 500 },
+        zoom: 2
+      })
+    ).toEqual({ width: 936, height: 468 })
+  })
+
+  it('does not upscale images at 100 percent before applying user zoom', () => {
+    expect(
+      getZoomedImageLayoutSize({
+        imageDimensions: { width: 200, height: 100 },
+        surfaceSize: { width: 800, height: 600 },
+        zoom: 1
+      })
+    ).toEqual({ width: 200, height: 100 })
+    expect(
+      getZoomedImageLayoutSize({
+        imageDimensions: { width: 200, height: 100 },
+        surfaceSize: { width: 800, height: 600 },
+        zoom: 2
+      })
+    ).toEqual({ width: 400, height: 200 })
+  })
+
+  it('returns no layout size until image and surface dimensions are available', () => {
+    expect(
+      getZoomedImageLayoutSize({
+        imageDimensions: null,
+        surfaceSize: { width: 800, height: 600 },
+        zoom: 1
+      })
+    ).toBeNull()
+    expect(
+      getZoomedImageLayoutSize({
+        imageDimensions: { width: 200, height: 100 },
+        surfaceSize: null,
+        zoom: 1
+      })
+    ).toBeNull()
   })
 })
