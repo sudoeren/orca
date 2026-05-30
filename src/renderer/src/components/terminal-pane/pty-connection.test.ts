@@ -23,6 +23,7 @@ async function flushAsyncTicks(count = 6): Promise<void> {
 const toastInfo = vi.fn()
 const LEAF_1 = '11111111-1111-4111-8111-111111111111' as const
 const LEAF_2 = '22222222-2222-4222-8222-222222222222' as const
+const AGENT_TASK_COMPLETE_NOTIFICATION_GRACE_MS = 250
 const AGENT_TASK_COMPLETE_NOTIFICATION_MAX_WAIT_MS = 1_500
 
 function leafIdForPane(paneId: number): string {
@@ -3910,6 +3911,123 @@ describe('connectPanePty', () => {
       terminalTitle: 'codex',
       paneKey: makePaneKey('tab-1', LEAF_1)
     })
+  })
+
+  it('lets delayed hook completion notifications win over concurrent terminal bells', async () => {
+    const { connectPanePty } = await import('./pty-connection')
+    const transport = createMockTransport('pty-hook')
+    transportFactoryQueue.push(transport)
+
+    vi.useFakeTimers()
+    const pane = createPane(1)
+    const manager = createManager(1)
+    const deps = createDeps()
+
+    connectPanePty(pane as never, manager as never, deps as never)
+
+    const statusHandler = createdTransportOptions[0]?.onAgentStatus as
+      | ((payload: {
+          state: 'working' | 'done'
+          prompt: string
+          agentType: 'codex'
+          lastAssistantMessage?: string
+        }) => void)
+      | undefined
+    const bellHandler = createdTransportOptions[0]?.onBell as (() => void) | undefined
+    if (!statusHandler || !bellHandler) {
+      throw new Error('Expected hook status and bell handlers to be registered')
+    }
+
+    statusHandler({
+      state: 'working',
+      prompt: 'finish the implementation',
+      agentType: 'codex'
+    })
+    statusHandler({
+      state: 'done',
+      prompt: 'finish the implementation',
+      agentType: 'codex',
+      lastAssistantMessage: 'Done.'
+    })
+    bellHandler()
+
+    vi.advanceTimersByTime(AGENT_TASK_COMPLETE_NOTIFICATION_GRACE_MS)
+    expect(deps.dispatchNotification).not.toHaveBeenCalledWith(
+      expect.objectContaining({ source: 'terminal-bell' })
+    )
+
+    vi.advanceTimersByTime(
+      AGENT_TASK_COMPLETE_NOTIFICATION_MAX_WAIT_MS - AGENT_TASK_COMPLETE_NOTIFICATION_GRACE_MS
+    )
+    expect(deps.dispatchNotification).not.toHaveBeenCalledWith(
+      expect.objectContaining({ source: 'terminal-bell' })
+    )
+    vi.advanceTimersByTime(AGENT_TASK_COMPLETE_NOTIFICATION_GRACE_MS)
+    expect(deps.dispatchNotification).toHaveBeenCalledWith({
+      source: 'agent-task-complete',
+      terminalTitle: 'codex',
+      paneKey: makePaneKey('tab-1', LEAF_1)
+    })
+    expect(deps.dispatchNotification).not.toHaveBeenCalledWith(
+      expect.objectContaining({ source: 'terminal-bell' })
+    )
+  })
+
+  it('restores a suppressed terminal bell when a delayed hook completion resumes work', async () => {
+    const { connectPanePty } = await import('./pty-connection')
+    const transport = createMockTransport('pty-hook')
+    transportFactoryQueue.push(transport)
+
+    vi.useFakeTimers()
+    const pane = createPane(1)
+    const manager = createManager(1)
+    const deps = createDeps()
+
+    connectPanePty(pane as never, manager as never, deps as never)
+
+    const statusHandler = createdTransportOptions[0]?.onAgentStatus as
+      | ((payload: {
+          state: 'working' | 'done'
+          prompt: string
+          agentType: 'codex'
+          lastAssistantMessage?: string
+        }) => void)
+      | undefined
+    const bellHandler = createdTransportOptions[0]?.onBell as (() => void) | undefined
+    if (!statusHandler || !bellHandler) {
+      throw new Error('Expected hook status and bell handlers to be registered')
+    }
+
+    statusHandler({
+      state: 'working',
+      prompt: 'finish the implementation',
+      agentType: 'codex'
+    })
+    statusHandler({
+      state: 'done',
+      prompt: 'finish the implementation',
+      agentType: 'codex',
+      lastAssistantMessage: 'Done.'
+    })
+    bellHandler()
+    vi.advanceTimersByTime(AGENT_TASK_COMPLETE_NOTIFICATION_GRACE_MS)
+    expect(deps.dispatchNotification).not.toHaveBeenCalledWith(
+      expect.objectContaining({ source: 'terminal-bell' })
+    )
+
+    statusHandler({
+      state: 'working',
+      prompt: 'finish the implementation',
+      agentType: 'codex'
+    })
+    vi.advanceTimersByTime(AGENT_TASK_COMPLETE_NOTIFICATION_GRACE_MS)
+
+    expect(deps.dispatchNotification).toHaveBeenCalledWith(
+      expect.objectContaining({ source: 'terminal-bell' })
+    )
+    expect(deps.dispatchNotification).not.toHaveBeenCalledWith(
+      expect.objectContaining({ source: 'agent-task-complete' })
+    )
   })
 
   it('restores a suppressed terminal bell when the pending agent completion is canceled', async () => {

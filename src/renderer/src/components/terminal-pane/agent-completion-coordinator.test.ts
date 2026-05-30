@@ -314,7 +314,10 @@ describe('agent completion coordinator', () => {
     vi.advanceTimersByTime(HOOK_DONE_QUIET_MS)
 
     expect(dispatchCompletion).toHaveBeenCalledTimes(1)
-    expect(dispatchCompletion).toHaveBeenCalledWith('codex')
+    expect(dispatchCompletion).toHaveBeenCalledWith('codex', {
+      source: 'hook',
+      quietedHookDone: true
+    })
   })
 
   it('ignores stale working title state after a hook completion already notified', () => {
@@ -575,6 +578,7 @@ describe('agent completion coordinator', () => {
       prompt: 'run the goal',
       agentType: 'codex'
     })
+    expect(coordinator.hasPendingHookDoneCompletion()).toBe(true)
     vi.advanceTimersByTime(HOOK_DONE_QUIET_MS - 1)
     expect(dispatchCompletion).not.toHaveBeenCalled()
 
@@ -583,6 +587,7 @@ describe('agent completion coordinator', () => {
       prompt: 'run the goal',
       agentType: 'codex'
     })
+    expect(coordinator.hasPendingHookDoneCompletion()).toBe(false)
     vi.advanceTimersByTime(HOOK_DONE_QUIET_MS)
     expect(dispatchCompletion).not.toHaveBeenCalled()
 
@@ -594,7 +599,10 @@ describe('agent completion coordinator', () => {
     vi.advanceTimersByTime(HOOK_DONE_QUIET_MS)
 
     expect(dispatchCompletion).toHaveBeenCalledTimes(1)
-    expect(dispatchCompletion).toHaveBeenCalledWith('codex')
+    expect(dispatchCompletion).toHaveBeenCalledWith('codex', {
+      source: 'hook',
+      quietedHookDone: true
+    })
   })
 
   it.each([

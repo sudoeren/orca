@@ -113,7 +113,11 @@ export function createAgentCompletionCoordinator(
     return `${source}:${currentTurn}:${processSession}`
   }
 
-  function dispatchCompletion(source: CompletionSource, title: string): void {
+  function dispatchCompletion(
+    source: CompletionSource,
+    title: string,
+    optionsOverride: { quietedHookDone?: boolean } = {}
+  ): void {
     if (source !== 'hook' && pendingHookDoneTimer !== null) {
       return
     }
@@ -133,7 +137,14 @@ export function createAgentCompletionCoordinator(
     lastCompletedTurn = currentTurn
     lastCompletionSource = source
     workingStatusObserved = false
-    options.dispatchCompletion(title)
+    if (optionsOverride.quietedHookDone === true) {
+      options.dispatchCompletion(title, {
+        source,
+        quietedHookDone: true
+      })
+    } else {
+      options.dispatchCompletion(title)
+    }
   }
 
   function scheduleHookDoneCompletion(title: string): void {
@@ -148,7 +159,7 @@ export function createAgentCompletionCoordinator(
       const pendingTitle = pendingHookDoneTitle
       pendingHookDoneTitle = null
       if (pendingTitle) {
-        dispatchCompletion('hook', pendingTitle)
+        dispatchCompletion('hook', pendingTitle, { quietedHookDone: true })
       }
     }, HOOK_DONE_QUIET_MS)
   }
@@ -443,6 +454,10 @@ export function createAgentCompletionCoordinator(
     scheduleNextPoll()
   }
 
+  function hasPendingHookDoneCompletion(): boolean {
+    return pendingHookDoneTimer !== null
+  }
+
   function resetCompletionState(options: { requireFreshWorking?: boolean } = {}): void {
     clearPendingHookDone()
     dropPendingTitle()
@@ -472,6 +487,7 @@ export function createAgentCompletionCoordinator(
     observeTitleWorking,
     observeHookStatus,
     startProcessTracking,
+    hasPendingHookDoneCompletion,
     resetCompletionState,
     dispose
   }
