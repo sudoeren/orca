@@ -31,6 +31,7 @@ type PendingRequest = {
 
 export type NotificationHandler = (method: string, params: Record<string, unknown>) => void
 export type MethodNotificationHandler = (params: Record<string, unknown>) => void
+export type RequestHandler = (params: Record<string, unknown>) => Promise<unknown> | unknown
 
 const REQUEST_TIMEOUT_MS = 30_000
 
@@ -44,6 +45,7 @@ export class SshChannelMultiplexer {
   private lastReceivedAt = Date.now()
   private pendingRequests = new Map<number, PendingRequest>()
   private notificationHandlers: NotificationHandler[] = []
+  private requestHandlers = new Map<string, RequestHandler>()
   // Why: per-method dispatch map keeps streaming consumers (fs.streamChunk,
   // fs.streamEnd, fs.streamError) from accreting string-match logic in the
   // generic notification listener that already serves fs.changed.
@@ -108,6 +110,15 @@ export class SshChannelMultiplexer {
       current.delete(handler)
       if (current.size === 0) {
         this.methodNotificationHandlers.delete(method)
+      }
+    }
+  }
+
+  onRequest(method: string, handler: RequestHandler): () => void {
+    this.requestHandlers.set(method, handler)
+    return () => {
+      if (this.requestHandlers.get(method) === handler) {
+        this.requestHandlers.delete(method)
       }
     }
   }
@@ -329,10 +340,41 @@ export class SshChannelMultiplexer {
   private handleMessage(msg: JsonRpcMessage): void {
     if ('id' in msg && ('result' in msg || 'error' in msg)) {
       this.handleResponse(msg as JsonRpcResponse)
+    } else if ('id' in msg && 'method' in msg) {
+      void this.handleRequest(msg as JsonRpcRequest)
     } else if ('method' in msg && !('id' in msg)) {
       this.handleNotification(msg as JsonRpcNotification)
     }
-    // Requests from relay to client are not expected in Phase 2
+  }
+
+  private async handleRequest(msg: JsonRpcRequest): Promise<void> {
+    const handler = this.requestHandlers.get(msg.method)
+    if (!handler) {
+      this.sendMessage({
+        jsonrpc: '2.0',
+        id: msg.id,
+        error: { code: -32601, message: `Method not found: ${msg.method}` }
+      })
+      return
+    }
+
+    try {
+      const result = await handler(msg.params ?? {})
+      this.sendMessage({
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: result ?? null
+      })
+    } catch (err) {
+      this.sendMessage({
+        jsonrpc: '2.0',
+        id: msg.id,
+        error: {
+          code: (err as { code?: number }).code ?? -32000,
+          message: err instanceof Error ? err.message : String(err)
+        }
+      })
+    }
   }
 
   private handleResponse(msg: JsonRpcResponse): void {

@@ -56,6 +56,8 @@ import {
   clearMigrationUnsupportedPtysForPaneKey
 } from '../agent-hooks/migration-unsupported-pty-state'
 import { parseWslPath } from '../wsl'
+import { mergePersistedWindowsPath } from '../pty/windows-environment-path'
+import { addOrcaWslInteropEnv } from '../pty/wsl-orca-env'
 
 // ─── Provider Registry ──────────────────────────────────────────────
 // Routes PTY operations by connectionId. null = local provider.
@@ -268,7 +270,7 @@ export type BuildPtyHostEnvOptions = {
 }
 
 function readInheritedPath(baseEnv: Record<string, string>): string {
-  return baseEnv.PATH ?? process.env.PATH ?? process.env.Path ?? ''
+  return baseEnv.PATH ?? baseEnv.Path ?? process.env.PATH ?? process.env.Path ?? ''
 }
 
 function isWslShellName(shellPath: string | undefined): boolean {
@@ -370,6 +372,8 @@ export function buildPtyHostEnv(
   baseEnv: Record<string, string>,
   opts: BuildPtyHostEnvOptions
 ): Record<string, string> {
+  mergePersistedWindowsPath(baseEnv)
+
   // Why: the Local path passes a baseEnv that already includes process.env
   // (LocalPtyProvider.spawn merges it before calling buildSpawnEnv). The
   // daemon path passes only args.env since process.env propagates to the
@@ -788,6 +792,9 @@ export function registerPtyHandlers(
         }
         if (preAllocatedHandle) {
           env.ORCA_TERMINAL_HANDLE = preAllocatedHandle
+        }
+        if (ctx?.isWsl === true) {
+          addOrcaWslInteropEnv(env)
         }
         return env
       },

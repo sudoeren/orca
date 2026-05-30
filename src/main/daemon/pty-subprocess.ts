@@ -23,6 +23,7 @@ import { isHostCodexHomeForWsl } from '../pty/codex-home-wsl-env'
 import { removeInheritedNoColor } from '../pty/terminal-color-env'
 import { parseWslPath } from '../wsl'
 import { getWslContextFromSessionId } from './wsl-session-context'
+import { addOrcaWslInteropEnv } from '../pty/wsl-orca-env'
 
 const PANE_IDENTITY_ENV_KEYS = ['ORCA_PANE_KEY', 'ORCA_TAB_ID', 'ORCA_WORKTREE_ID'] as const
 
@@ -256,6 +257,9 @@ export function createPtySubprocess(opts: PtySubprocessOptions): SubprocessHandl
       // Why: Orca's selected Codex runtime home is host-local. WSL Codex must
       // use its Linux-side ~/.codex instead of inheriting a Windows path.
       delete env.CODEX_HOME
+    }
+    if (pathWin32.basename(shellPath).toLowerCase() === 'wsl.exe') {
+      addOrcaWslInteropEnv(env)
     }
   } else {
     // Why: any Orca-injected overlay env that user rc files can clobber
