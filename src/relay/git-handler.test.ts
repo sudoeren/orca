@@ -20,14 +20,14 @@ import {
 
 describe('GitHandler', () => {
   let dispatcher: MockDispatcher
+  let handler: GitHandler
   let tmpDir: string
 
   beforeEach(() => {
     tmpDir = mkdtempSync(path.join(tmpdir(), 'relay-git-'))
     dispatcher = createMockDispatcher()
     const ctx = new RelayContext()
-    // eslint-disable-next-line no-new
-    new GitHandler(dispatcher as unknown as RelayDispatcher, ctx)
+    handler = new GitHandler(dispatcher as unknown as RelayDispatcher, ctx)
   })
 
   afterEach(async () => {
@@ -448,6 +448,37 @@ describe('GitHandler', () => {
       await expect(fs.access(path.join(tmpDir, 'new.txt'))).rejects.toThrow()
     })
 
+    it('treats untracked discard paths with Git glob characters as literal paths', async () => {
+      gitInit(tmpDir)
+      writeFileSync(path.join(tmpDir, '.gitignore'), 'ignored.log\n')
+      gitCommit(tmpDir, 'initial')
+      writeFileSync(path.join(tmpDir, '*.log'), 'selected')
+      writeFileSync(path.join(tmpDir, 'keep.log'), 'unrelated')
+      writeFileSync(path.join(tmpDir, 'ignored.log'), 'ignored')
+
+      await dispatcher.callRequest('git.discard', { worktreePath: tmpDir, filePath: '*.log' })
+
+      await expect(fs.access(path.join(tmpDir, '*.log'))).rejects.toThrow()
+      await expect(fs.access(path.join(tmpDir, 'keep.log'))).resolves.toBeUndefined()
+      await expect(fs.access(path.join(tmpDir, 'ignored.log'))).resolves.toBeUndefined()
+    })
+
+    it('treats tracked discard paths with Git glob characters as literal paths', async () => {
+      gitInit(tmpDir)
+      writeFileSync(path.join(tmpDir, '*.log'), 'selected')
+      writeFileSync(path.join(tmpDir, 'keep.log'), 'keep')
+      gitCommit(tmpDir, 'track log fixtures')
+      writeFileSync(path.join(tmpDir, '*.log'), 'selected modified')
+      writeFileSync(path.join(tmpDir, 'keep.log'), 'keep modified')
+
+      await dispatcher.callRequest('git.discard', { worktreePath: tmpDir, filePath: '*.log' })
+
+      await expect(fs.readFile(path.join(tmpDir, '*.log'), 'utf-8')).resolves.toBe('selected')
+      await expect(fs.readFile(path.join(tmpDir, 'keep.log'), 'utf-8')).resolves.toBe(
+        'keep modified'
+      )
+    })
+
     it('bulk discards tracked and untracked files', async () => {
       gitInit(tmpDir)
       writeFileSync(path.join(tmpDir, 'a.txt'), 'a')
@@ -465,6 +496,32 @@ describe('GitHandler', () => {
       await expect(fs.readFile(path.join(tmpDir, 'a.txt'), 'utf-8')).resolves.toBe('a')
       await expect(fs.readFile(path.join(tmpDir, 'b.txt'), 'utf-8')).resolves.toBe('b')
       await expect(fs.access(path.join(tmpDir, 'new.txt'))).rejects.toThrow()
+    })
+
+    it('handles large tracked path lists during bulk discard classification', async () => {
+      const trackedStdout = Array.from({ length: 150_000 }, (_, index) => `docs/file-${index}.ts`)
+        .join('\0')
+        .concat('\0')
+      const gitMock = vi
+        .spyOn(
+          handler as unknown as {
+            git: (args: string[], cwd: string) => Promise<{ stdout: string; stderr: string }>
+          },
+          'git'
+        )
+        .mockResolvedValueOnce({ stdout: trackedStdout, stderr: '' })
+        .mockResolvedValueOnce({ stdout: '', stderr: '' })
+
+      await dispatcher.callRequest('git.bulkDiscard', {
+        worktreePath: tmpDir,
+        filePaths: ['docs']
+      })
+
+      expect(gitMock).toHaveBeenNthCalledWith(
+        2,
+        ['restore', '--worktree', '--source=HEAD', '--', ':(literal)docs'],
+        tmpDir
+      )
     })
 
     it('rejects path traversal', async () => {

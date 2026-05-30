@@ -21,7 +21,8 @@ import {
   getDefaultOnboardingState,
   getDefaultSettings,
   getDefaultUIState,
-  getDefaultWorkspaceSession
+  getDefaultWorkspaceSession,
+  normalizeAgentActivityDisplayMode
 } from '../../../shared/constants'
 import { legacyBaseRefSearchResult } from '../../../shared/base-ref-search-result'
 import { createE2EConfig } from '../../../shared/e2e-config'
@@ -1785,6 +1786,7 @@ function createAgentHooksApi(): NonNullable<Partial<PreloadApi>['agentHooks']> {
   const status = (
     agent:
       | 'claude'
+      | 'openclaude'
       | 'codex'
       | 'gemini'
       | 'antigravity'
@@ -1805,6 +1807,7 @@ function createAgentHooksApi(): NonNullable<Partial<PreloadApi>['agentHooks']> {
     } as const)
   return {
     claudeStatus: () => status('claude'),
+    openClaudeStatus: () => status('openclaude'),
     codexStatus: () => status('codex'),
     geminiStatus: () => status('gemini'),
     antigravityStatus: () => status('antigravity'),
@@ -1958,6 +1961,7 @@ function createPtyApi(): NonNullable<Partial<PreloadApi>['pty']> {
     signal: () => {},
     kill: () => Promise.resolve(),
     ackColdRestore: () => {},
+    pauseOutput: () => {},
     hasChildProcesses: () => Promise.resolve(false),
     getForegroundProcess: () => Promise.resolve(null),
     getCwd: () => Promise.resolve('~'),
@@ -2262,7 +2266,10 @@ function mergeWebUIState(
 ): PersistedUIState {
   return {
     ...base,
-    ...updates
+    ...updates,
+    agentActivityDisplayMode: normalizeAgentActivityDisplayMode(
+      updates.agentActivityDisplayMode ?? base.agentActivityDisplayMode
+    )
   }
 }
 

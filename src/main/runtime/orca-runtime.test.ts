@@ -837,6 +837,60 @@ describe('OrcaRuntimeService', () => {
     expect(shown.ptyId).toBe('pty-1')
   })
 
+  it('routes PTY output through the PTY leaf index in large terminal graphs', () => {
+    const runtime = new OrcaRuntimeService(store)
+    const liveLeafCount = 2773
+    const targetIndex = liveLeafCount - 17
+    const tabs = Array.from({ length: liveLeafCount }, (_, index) => ({
+      tabId: `tab-${index}`,
+      worktreeId: `repo-1::/tmp/worktree-${index}`,
+      title: `Terminal ${index}`,
+      activeLeafId: 'pane:1',
+      layout: null
+    }))
+    const leaves = Array.from({ length: liveLeafCount }, (_, index) => ({
+      tabId: `tab-${index}`,
+      worktreeId: `repo-1::/tmp/worktree-${index}`,
+      leafId: 'pane:1',
+      paneRuntimeId: 1,
+      ptyId: `pty-${index}`
+    }))
+
+    runtime.attachWindow(1)
+    runtime.syncWindowGraph(1, { tabs, leaves })
+
+    const runtimePrivate = runtime as unknown as {
+      leaves: Map<string, unknown>
+      leavesByPtyId: Map<string, { preview?: string; lastOutputAt?: number | null }[]>
+    }
+    const originalLeaves = runtimePrivate.leaves
+    runtimePrivate.leaves = new Proxy(originalLeaves, {
+      get(target, prop) {
+        if (
+          prop === 'values' ||
+          prop === 'entries' ||
+          prop === 'keys' ||
+          prop === Symbol.iterator
+        ) {
+          return () => {
+            throw new Error('onPtyData should use the PTY leaf index')
+          }
+        }
+        const value = Reflect.get(target, prop, target)
+        return typeof value === 'function' ? value.bind(target) : value
+      }
+    }) as Map<string, unknown>
+
+    runtime.onPtyData(`pty-${targetIndex}`, 'hello indexed\n', 123)
+
+    const [targetLeaf] = runtimePrivate.leavesByPtyId.get(`pty-${targetIndex}`) ?? []
+    expect(targetLeaf).toMatchObject({
+      preview: 'hello indexed',
+      lastOutputAt: 123
+    })
+    expect(runtime.getStatus().liveLeafCount).toBe(liveLeafCount)
+  })
+
   it('resolves branch selectors when worktrees store refs/heads-prefixed branches', async () => {
     vi.mocked(listWorktrees).mockResolvedValueOnce([
       {
@@ -5883,6 +5937,21 @@ describe('OrcaRuntimeService', () => {
     await waitPromise
   })
 
+  it('removes message waiter abort listeners after message arrival', async () => {
+    const runtime = new OrcaRuntimeService(store)
+    const controller = new AbortController()
+    const removeListenerSpy = vi.spyOn(controller.signal, 'removeEventListener')
+
+    const waitPromise = runtime.waitForMessage('term_abc', {
+      timeoutMs: 5000,
+      signal: controller.signal
+    })
+    runtime.notifyMessageArrived('term_abc')
+    await waitPromise
+
+    expect(removeListenerSpy).toHaveBeenCalledWith('abort', expect.any(Function))
+  })
+
   it('resolves message waiters on timeout when no message arrives', async () => {
     const runtime = new OrcaRuntimeService(store)
 
@@ -5891,6 +5960,30 @@ describe('OrcaRuntimeService', () => {
     const elapsed = Date.now() - start
     expect(elapsed).toBeGreaterThanOrEqual(90)
     expect(elapsed).toBeLessThan(500)
+  })
+
+  it('rejects leaf PTY waits when the request signal aborts', async () => {
+    vi.useFakeTimers()
+    try {
+      const runtime = new OrcaRuntimeService(store)
+      const controller = new AbortController()
+
+      const waitPromise = runtime
+        .waitForLeafPtyId('missing-handle', 60_000, controller.signal)
+        .then(() => 'resolved')
+        .catch((error: Error) => error.message)
+
+      controller.abort()
+      const outcomePromise = Promise.race([
+        waitPromise,
+        new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), 0))
+      ])
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(await outcomePromise).toBe('request_aborted')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('fails terminal waits closed when the handle goes stale during reload', async () => {

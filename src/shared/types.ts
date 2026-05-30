@@ -1571,6 +1571,7 @@ export type ClaudeManagedAccountRuntimeSelection = {
  *  flow and for the default-agent setting. Extend this union as new agents are added. */
 export type TuiAgent =
   | 'claude' // Claude Code
+  | 'openclaude' // OpenClaude
   | 'codex' // OpenAI Codex
   | 'autohand' // Autohand Code CLI
   | 'opencode' // OpenCode
@@ -2210,6 +2211,8 @@ export type WorktreeCardProperty =
   // view options.
   | 'inline-agents'
 
+export type AgentActivityDisplayMode = 'compact' | 'full'
+
 export type StatusBarItem =
   | 'claude'
   | 'codex'
@@ -2258,6 +2261,7 @@ export type PersistedUIState = {
   uiZoomLevel: number
   editorFontZoomLevel: number
   worktreeCardProperties: WorktreeCardProperty[]
+  agentActivityDisplayMode?: AgentActivityDisplayMode
   workspaceStatuses?: WorkspaceStatusDefinition[]
   workspaceBoardOpacity?: number
   workspaceBoardCompact?: boolean

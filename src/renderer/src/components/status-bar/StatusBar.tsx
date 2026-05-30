@@ -44,6 +44,7 @@ import { UpdateStatusSegment } from './UpdateStatusSegment'
 import { ResourceUsageStatusSegment } from './ResourceUsageStatusSegment'
 import { PortsStatusSegment } from './PortsStatusSegment'
 import { isStatusBarItemAvailable } from './status-bar-agent-gating'
+import { isProviderConfigured } from './status-bar-provider-visibility'
 import { shouldOpenStatusBarContextMenu } from './status-bar-context-menu-policy'
 import { PetStatusSegment } from './PetStatusSegment'
 import { TOGGLE_FLOATING_TERMINAL_EVENT } from '@/lib/floating-terminal'
@@ -588,6 +589,7 @@ function ClaudeSwitcherMenu({
     activeAccountIdsByRuntime: { host: null, wsl: {} }
   })
   const [isSwitching, setIsSwitching] = useState(false)
+  const mountedRef = useRef(true)
   const openSettingsPage = useAppStore((s) => s.openSettingsPage)
   const openSettingsTarget = useAppStore((s) => s.openSettingsTarget)
   const fetchSettings = useAppStore((s) => s.fetchSettings)
@@ -609,9 +611,18 @@ function ClaudeSwitcherMenu({
   })
   const accountState = getClaudeStatusAccountsFromSettings(settings) ?? accounts
 
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
+
   const loadAccounts = useCallback(async () => {
     const next = await window.api.claudeAccounts.list()
-    setAccounts(next)
+    if (mountedRef.current) {
+      setAccounts(next)
+    }
   }, [])
 
   useEffect(() => {
@@ -648,13 +659,19 @@ function ClaudeSwitcherMenu({
         wslDistro: target.wslDistro
       })
       recordFeatureInteraction('claude-account-switching')
-      setAccounts(next)
+      if (mountedRef.current) {
+        setAccounts(next)
+      }
       await fetchSettings()
-      setAccountsExpanded(false)
+      if (mountedRef.current) {
+        setAccountsExpanded(false)
+      }
     } catch (error) {
       console.error('Failed to switch Claude account from status bar:', error)
     } finally {
-      setIsSwitching(false)
+      if (mountedRef.current) {
+        setIsSwitching(false)
+      }
     }
   }
 
@@ -1046,6 +1063,7 @@ function CodexSwitcherMenu({
   })
   const [isSwitching, setIsSwitching] = useState(false)
   const [reauthenticatingAccountId, setReauthenticatingAccountId] = useState<string | null>(null)
+  const mountedRef = useRef(true)
   const accountsExpandedRef = useRef(accountsExpanded)
   // Why: Radix item selection is separate from the nested button click, so
   // propagation stops alone do not prevent the row switch action.
@@ -1079,7 +1097,16 @@ function CodexSwitcherMenu({
 
   const loadAccounts = useCallback(async () => {
     const next = await window.api.codexAccounts.list()
-    setAccounts(next)
+    if (mountedRef.current) {
+      setAccounts(next)
+    }
+  }, [])
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
   }, [])
 
   useEffect(() => {
@@ -1112,7 +1139,9 @@ function CodexSwitcherMenu({
         wslDistro: target.wslDistro
       })
       recordFeatureInteraction('codex-account-switching')
-      setAccounts(next)
+      if (mountedRef.current) {
+        setAccounts(next)
+      }
       await fetchSettings()
       const nextActiveAccountId = getCodexStatusActiveId(next, target)
       if (previousActiveAccountId !== nextActiveAccountId) {
@@ -1124,12 +1153,16 @@ function CodexSwitcherMenu({
         // for live Codex terminals. Keeping the switcher open and collapsing
         // back to the summary row lets the follow-up "restart open tabs"
         // prompt appear in the same flow instead of feeling detached.
-        setAccountsExpanded(false)
+        if (mountedRef.current) {
+          setAccountsExpanded(false)
+        }
       }
     } catch (error) {
       console.error('Failed to switch Codex account from status bar:', error)
     } finally {
-      setIsSwitching(false)
+      if (mountedRef.current) {
+        setIsSwitching(false)
+      }
     }
   }
 
@@ -1141,15 +1174,19 @@ function CodexSwitcherMenu({
     try {
       const next = await window.api.codexAccounts.reauthenticate({ accountId })
       recordFeatureInteraction('codex-account-switching')
-      setAccounts(next)
+      if (mountedRef.current) {
+        setAccounts(next)
+      }
       await fetchSettings()
-      if (accountsExpandedRef.current) {
+      if (mountedRef.current && accountsExpandedRef.current) {
         await fetchInactiveCodexAccountUsage()
       }
     } catch (error) {
       console.error('Failed to re-authenticate Codex account from status bar:', error)
     } finally {
-      setReauthenticatingAccountId(null)
+      if (mountedRef.current) {
+        setReauthenticatingAccountId(null)
+      }
     }
   }
 
@@ -1175,8 +1212,12 @@ function CodexSwitcherMenu({
     }
   }, [])
 
-  useEffect(() => {
-    if (accountsExpanded) {
+  const handleAccountsExpandedToggle = useCallback((): void => {
+    const nextExpanded = !accountsExpanded
+    setAccountsExpanded(nextExpanded)
+    if (nextExpanded) {
+      // Why: inactive-account usage is needed only for the explicit switcher
+      // expansion, so fetch it on that event instead of one render later.
       void fetchInactiveCodexAccountUsage()
     }
   }, [accountsExpanded, fetchInactiveCodexAccountUsage])
@@ -1221,7 +1262,7 @@ function CodexSwitcherMenu({
       <DropdownMenuItem
         onSelect={(event) => {
           event.preventDefault()
-          setAccountsExpanded((prev) => !prev)
+          handleAccountsExpandedToggle()
         }}
       >
         <div className="flex min-w-0 flex-1 flex-col gap-0.5 py-0.5 text-[12px]">
@@ -1432,12 +1473,20 @@ function StatusBarInner({ floatingTerminalOpen }: StatusBarProps): React.JSX.Ele
   const petEnabled = useAppStore((s) => s.settings?.experimentalPet === true)
   const toggleStatusBarItem = useAppStore((s) => s.toggleStatusBarItem)
   const containerRef = useRef<HTMLDivElement>(null)
+  const mountedRef = useRef(true)
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [menuOpen, setMenuOpen] = useState(false)
   const [menuPoint, setMenuPoint] = useState({ x: 0, y: 0 })
 
   const [containerWidth, setContainerWidth] = useState(900)
   const resizeObserverRef = useRef<ResizeObserver | null>(null)
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
 
   useEffect(() => {
     const closeMenu = (): void => setMenuOpen(false)
@@ -1482,7 +1531,9 @@ function StatusBarInner({ floatingTerminalOpen }: StatusBarProps): React.JSX.Ele
       // appears (and a removed CLI's bar hides) without restarting Orca.
       await Promise.all([refreshRateLimits(), refreshDetectedAgents()])
     } finally {
-      setIsRefreshing(false)
+      if (mountedRef.current) {
+        setIsRefreshing(false)
+      }
     }
   }, [isRefreshing, refreshRateLimits, refreshDetectedAgents])
 
@@ -1492,31 +1543,27 @@ function StatusBarInner({ floatingTerminalOpen }: StatusBarProps): React.JSX.Ele
 
   const { claude, codex, gemini, opencodeGo } = rateLimits
 
-  // Why: hiding `unavailable` providers makes the status bar appear to lose a
-  // provider at random after refreshes or wake/resume. Keeping the slot visible
-  // preserves layout stability and makes it obvious that the provider is still
-  // configured but currently unavailable. Detection-gating (see
-  // status-bar-agent-gating) hides the per-CLI bars when the agent isn't
-  // installed on PATH — this is what stops a fresh install from showing
-  // "Gemini Usage" when Gemini isn't installed.
+  // Why: a provider only earns a bar once it's configured (isProviderConfigured
+  // drops the `unavailable` state — Gemini OAuth off, OpenCode Go cookie unset,
+  // Claude on API-key billing). A configured provider that fails transiently
+  // (`error`) keeps its slot so the bar doesn't flap on refresh hiccups.
+  // Detection-gating (see status-bar-agent-gating) additionally hides per-CLI
+  // bars when the agent isn't installed on PATH.
   const showClaude =
-    !!claude &&
+    isProviderConfigured(claude) &&
     statusBarItems.includes('claude') &&
     isStatusBarItemAvailable('claude', detectedAgentIds)
   const showCodex =
-    !!codex &&
+    isProviderConfigured(codex) &&
     statusBarItems.includes('codex') &&
     isStatusBarItemAvailable('codex', detectedAgentIds)
-  // Why: hide only when the state hasn't loaded yet (null), not when unavailable.
-  // Gemini shows if credentials exist; OpenCode Go shows always so users can see
-  // the provider and know to configure the cookie in Settings.
   const showGemini =
-    gemini !== null &&
+    isProviderConfigured(gemini) &&
     statusBarItems.includes('gemini') &&
     isStatusBarItemAvailable('gemini', detectedAgentIds)
   // Why: OpenCode Go is a web/cookie-auth provider, not a CLI on PATH, so
   // detection-gating doesn't apply.
-  const showOpencodeGo = opencodeGo !== null && statusBarItems.includes('opencode-go')
+  const showOpencodeGo = isProviderConfigured(opencodeGo) && statusBarItems.includes('opencode-go')
   const showSsh = statusBarItems.includes('ssh')
   const showResourceUsage = statusBarItems.includes('resource-usage')
   const showPorts = statusBarItems.includes('ports')

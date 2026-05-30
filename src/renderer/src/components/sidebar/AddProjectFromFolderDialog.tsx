@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import React, { useCallback, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { FolderPlus, Loader2 } from 'lucide-react'
 import {
@@ -10,6 +10,7 @@ import {
   DialogTitle
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import { useMountedRef } from '@/hooks/useMountedRef'
 import { useAppStore } from '@/store'
 import { activateAndRevealWorktree } from '@/lib/worktree-activation'
 import { track } from '@/lib/telemetry'
@@ -41,8 +42,10 @@ const AddProjectFromFolderDialog = React.memo(function AddProjectFromFolderDialo
   const [addedRepo, setAddedRepo] = useState<Repo | null>(null)
   const [isAdding, setIsAdding] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const mountedRef = useMountedRef()
 
   const isOpen = activeModal === 'confirm-add-project-from-folder'
+  const [previousOpen, setPreviousOpen] = useState(isOpen)
   const folderPath = typeof modalData.folderPath === 'string' ? modalData.folderPath : ''
   const connectionId = typeof modalData.connectionId === 'string' ? modalData.connectionId : ''
   const repoId = addedRepo?.id ?? ''
@@ -77,13 +80,16 @@ const AddProjectFromFolderDialog = React.memo(function AddProjectFromFolderDialo
   )
   const primaryBranchName = getProjectAddedPrimaryBranchName(primaryWorktree)
 
-  useEffect(() => {
+  if (isOpen !== previousOpen) {
+    setPreviousOpen(isOpen)
     if (!isOpen) {
+      // Why: closed modal state is fully local; clear it before commit so the
+      // next open never paints stale progress or errors.
       setAddedRepo(null)
       setIsAdding(false)
       setError(null)
     }
-  }, [isOpen])
+  }
 
   const openNonGitConfirmation = useCallback(() => {
     closeModal()
@@ -120,11 +126,17 @@ const AddProjectFromFolderDialog = React.memo(function AddProjectFromFolderDialo
         } else {
           useAppStore.setState({ repos: [...state.repos, repo] })
         }
+        if (!mountedRef.current) {
+          return
+        }
         toast.success('Remote project added', { description: repo.displayName })
       } else {
         repo = await addRepoPath(folderPath)
       }
 
+      if (!mountedRef.current) {
+        return
+      }
       if (!repo) {
         return
       }
@@ -137,14 +149,28 @@ const AddProjectFromFolderDialog = React.memo(function AddProjectFromFolderDialo
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       if (message.includes(NON_GIT_REPO_ERROR)) {
-        openNonGitConfirmation()
+        if (mountedRef.current) {
+          openNonGitConfirmation()
+        }
         return
       }
-      setError(message)
+      if (mountedRef.current) {
+        setError(message)
+      }
     } finally {
-      setIsAdding(false)
+      if (mountedRef.current) {
+        setIsAdding(false)
+      }
     }
-  }, [addRepoPath, connectionId, fetchWorktrees, folderPath, isAdding, openNonGitConfirmation])
+  }, [
+    addRepoPath,
+    connectionId,
+    fetchWorktrees,
+    folderPath,
+    isAdding,
+    mountedRef,
+    openNonGitConfirmation
+  ])
 
   const handleStartPrimaryWorktree = useCallback(() => {
     if (!primaryWorktree) {
@@ -165,14 +191,14 @@ const AddProjectFromFolderDialog = React.memo(function AddProjectFromFolderDialo
     track('add_repo_setup_step_action', { action: 'open_existing' })
     if (!otherWorktreesVisible) {
       const updated = await updateRepo(repoId, { externalWorktreeVisibility: 'show' })
-      if (updated && addedRepo) {
+      if (updated && addedRepo && mountedRef.current) {
         setAddedRepo({ ...addedRepo, externalWorktreeVisibility: 'show' })
       }
     }
     closeModal()
     await fetchWorktrees(repoId)
     finalizeImportedRepoAfterSkip(useAppStore.getState(), repoId)
-  }, [addedRepo, closeModal, fetchWorktrees, otherWorktreesVisible, repoId, updateRepo])
+  }, [addedRepo, closeModal, fetchWorktrees, mountedRef, otherWorktreesVisible, repoId, updateRepo])
 
   const handleCreateWorktree = useCallback(
     (name?: string) => {

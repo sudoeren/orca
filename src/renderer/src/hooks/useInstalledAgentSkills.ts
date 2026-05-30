@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { DiscoveredSkill, SkillDiscoveryResult, SkillSourceKind } from '../../../shared/skills'
+import { useMountedRef } from './useMountedRef'
 
 const INSTALLED_AGENT_SKILLS_CHANGED_EVENT = 'orca:installed-agent-skills-changed'
 export const GLOBAL_AGENT_SKILL_SOURCE_KINDS = [
@@ -120,14 +121,7 @@ export function useInstalledAgentSkill(
   const [error, setError] = useState<string | null>(null)
   // Why: skill scans can outlive transient settings/onboarding panels; keep
   // the module cache update but skip React state writes after unmount.
-  const mountedRef = useRef(true)
-
-  useEffect(() => {
-    mountedRef.current = true
-    return () => {
-      mountedRef.current = false
-    }
-  }, [])
+  const mountedRef = useMountedRef()
 
   const refresh = useCallback(
     async (force = true): Promise<void> => {
@@ -160,7 +154,7 @@ export function useInstalledAgentSkill(
         }
       }
     },
-    [enabled]
+    [enabled, mountedRef]
   )
 
   useEffect(() => {

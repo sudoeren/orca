@@ -28,6 +28,7 @@ import {
   DialogTitle
 } from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
+import { useMountedRef } from '@/hooks/useMountedRef'
 import { activateAndRevealWorktree } from '@/lib/worktree-activation'
 import { activateTabAndFocusPane } from '@/lib/activate-tab-and-focus-pane'
 import { installWindowVisibilityInterval } from '@/lib/window-visibility-interval'
@@ -452,7 +453,7 @@ function WorktreeRow({
         <button
           type="button"
           onClick={onNavigate}
-          aria-label={`Open workspace ${rowLabel}`}
+          aria-label={`Resume workspace ${rowLabel}`}
           className="flex-1 min-w-0 py-2 pr-2 pl-1 text-left flex items-center gap-1.5"
           disabled={!isNavigable}
         >
@@ -695,6 +696,7 @@ export function ResourceUsageStatusSegment({
   // somewhere stable for keyboard users.
   const popoverBodyRef = useRef<HTMLDivElement | null>(null)
   const popoverBodyFocusFrameRef = useRef<number | null>(null)
+  const mountedRef = useMountedRef()
 
   const cancelPopoverBodyFocusFrame = useCallback((): void => {
     if (popoverBodyFocusFrameRef.current === null) {
@@ -719,18 +721,25 @@ export function ResourceUsageStatusSegment({
 
   const refreshSessions = useCallback(async () => {
     if (runtimeEnvironmentActive) {
-      setSessions([])
-      setSessionsError(false)
+      if (mountedRef.current) {
+        setSessions([])
+        setSessionsError(false)
+      }
       return
     }
     try {
       const result = await window.api.pty.listSessions()
+      if (!mountedRef.current) {
+        return
+      }
       setSessions(result)
       setSessionsError(false)
     } catch {
-      setSessionsError(true)
+      if (mountedRef.current) {
+        setSessionsError(true)
+      }
     }
-  }, [runtimeEnvironmentActive])
+  }, [mountedRef, runtimeEnvironmentActive])
 
   const daemonActions = useDaemonActions({
     onRestartSettled: () => {
@@ -1065,21 +1074,23 @@ export function ResourceUsageStatusSegment({
     } catch {
       /* already dead — fall through */
     } finally {
-      setKilling(false)
-      setKillConfirm(null)
-      // Why: after the killed row unmounts, focus would otherwise drop to
-      // <body>. Park focus on the popover body so keyboard users land back
-      // in the list rather than outside the popover.
-      cancelPopoverBodyFocusFrame()
-      if (popoverBodyRef.current) {
-        popoverBodyFocusFrameRef.current = requestAnimationFrame(() => {
-          popoverBodyFocusFrameRef.current = null
-          popoverBodyRef.current?.focus()
-        })
+      if (mountedRef.current) {
+        setKilling(false)
+        setKillConfirm(null)
+        // Why: after the killed row unmounts, focus would otherwise drop to
+        // <body>. Park focus on the popover body so keyboard users land back
+        // in the list rather than outside the popover.
+        cancelPopoverBodyFocusFrame()
+        if (popoverBodyRef.current) {
+          popoverBodyFocusFrameRef.current = requestAnimationFrame(() => {
+            popoverBodyFocusFrameRef.current = null
+            popoverBodyRef.current?.focus()
+          })
+        }
+        void refreshSessions()
       }
-      void refreshSessions()
     }
-  }, [cancelPopoverBodyFocusFrame, killConfirm, refreshSessions])
+  }, [cancelPopoverBodyFocusFrame, killConfirm, mountedRef, refreshSessions])
 
   const openSpaceResults = useCallback((): void => {
     setOpen(false)

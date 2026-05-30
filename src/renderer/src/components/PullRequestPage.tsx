@@ -69,6 +69,7 @@ import { detectLanguage } from '@/lib/language-detect'
 import { cn } from '@/lib/utils'
 import { setWithLRU } from '@/lib/scroll-cache'
 import { DiffSectionItem } from '@/components/editor/DiffSectionItem'
+import { useMountedRef } from '@/hooks/useMountedRef'
 import type { DecoratedDiffComment } from '@/components/diff-comments/useDiffCommentDecorator'
 import {
   CombinedDiffFileTree,
@@ -687,6 +688,9 @@ function PRReviewersPanel({
               prNumber: item.number,
               reviewers: logins
             })
+      if (!reviewerPanelMountedRef.current) {
+        return
+      }
       if (!result.ok) {
         toast.error(result.error ?? 'Failed to request reviewer')
         return
@@ -702,9 +706,13 @@ function PRReviewersPanel({
       setReviewerInput('')
       toast.success(logins.length === 1 ? 'Reviewer requested' : 'Reviewers requested')
     } catch {
-      toast.error('Failed to request reviewer')
+      if (reviewerPanelMountedRef.current) {
+        toast.error('Failed to request reviewer')
+      }
     } finally {
-      setSubmitting(false)
+      if (reviewerPanelMountedRef.current) {
+        setSubmitting(false)
+      }
     }
   }
 
@@ -740,6 +748,9 @@ function PRReviewersPanel({
               prNumber: item.number,
               reviewers: logins
             })
+      if (!reviewerPanelMountedRef.current) {
+        return
+      }
       if (!result.ok) {
         toast.error(result.error ?? 'Failed to remove reviewer')
         return
@@ -754,9 +765,13 @@ function PRReviewersPanel({
       setReviewerInput('')
       toast.success(logins.length === 1 ? 'Reviewer removed' : 'Reviewers removed')
     } catch {
-      toast.error('Failed to remove reviewer')
+      if (reviewerPanelMountedRef.current) {
+        toast.error('Failed to remove reviewer')
+      }
     } finally {
-      setSubmitting(false)
+      if (reviewerPanelMountedRef.current) {
+        setSubmitting(false)
+      }
     }
   }
 
@@ -3241,6 +3256,14 @@ function CommentReplyForm({
   const [body, setBody] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const mountedRef = useRef(true)
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
 
   useEffect(() => {
     textareaRef.current?.focus()
@@ -3254,11 +3277,16 @@ function CommentReplyForm({
     setSubmitting(true)
     try {
       const ok = await onSubmit(trimmed)
+      if (!mountedRef.current) {
+        return
+      }
       if (ok) {
         setBody('')
       }
     } finally {
-      setSubmitting(false)
+      if (mountedRef.current) {
+        setSubmitting(false)
+      }
     }
   }, [body, onSubmit, submitting])
 
@@ -3482,6 +3510,7 @@ function ChecksTab({
   const [detailsByCheckKey, setDetailsByCheckKey] = useState<Record<string, CheckDetailsLoadState>>(
     {}
   )
+  const mountedRef = useMountedRef()
   const list = useMemo(() => localChecks ?? checks ?? [], [checks, localChecks])
   const prRepo = useMemo(() => parseOwnerRepoFromItemUrl(item.url), [item.url])
   const sorted = [...list].sort(
@@ -3673,6 +3702,9 @@ function ChecksTab({
           prRepo
         })
         .then((details) => {
+          if (!mountedRef.current) {
+            return
+          }
           setDetailsByCheckKey((current) => ({
             ...current,
             [key]: {
@@ -3683,6 +3715,9 @@ function ChecksTab({
           }))
         })
         .catch((err) => {
+          if (!mountedRef.current) {
+            return
+          }
           setDetailsByCheckKey((current) => ({
             ...current,
             [key]: {
@@ -3693,7 +3728,7 @@ function ChecksTab({
           }))
         })
     },
-    [detailsByCheckKey, prRepo, repoId, repoPath]
+    [detailsByCheckKey, mountedRef, prRepo, repoId, repoPath]
   )
 
   const refreshAction = (
@@ -4903,6 +4938,14 @@ function GHCommentComposer({
   const [body, setBody] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const mountedRef = useRef(true)
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
 
   const autoGrow = useCallback(() => {
     const el = textareaRef.current
@@ -4927,6 +4970,9 @@ function GHCommentComposer({
         body: trimmed,
         type: itemType
       })
+      if (!mountedRef.current) {
+        return
+      }
       if (result.ok) {
         setBody('')
         requestAnimationFrame(autoGrow)
@@ -4937,9 +4983,13 @@ function GHCommentComposer({
         toast.error(result.error ?? 'Failed to add comment')
       }
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to add comment')
+      if (mountedRef.current) {
+        toast.error(err instanceof Error ? err.message : 'Failed to add comment')
+      }
     } finally {
-      setSubmitting(false)
+      if (mountedRef.current) {
+        setSubmitting(false)
+      }
     }
   }, [autoGrow, body, repoPath, repoId, issueNumber, itemType, onCommentAdded])
 
@@ -5533,12 +5583,14 @@ export default function PullRequestPage({
                   type="button"
                   size="sm"
                   onClick={handleOpenOrUsePR}
-                  className="gap-1.5 whitespace-nowrap"
+                  className="gap-1.5 whitespace-nowrap font-semibold"
                   aria-label={
-                    attachedWorkspace ? 'Open workspace attached to PR' : 'Start workspace from PR'
+                    attachedWorkspace
+                      ? 'Resume workspace attached to PR'
+                      : 'Start workspace from PR'
                   }
                 >
-                  {attachedWorkspace ? 'Open workspace' : 'Start workspace from PR'}
+                  {attachedWorkspace ? 'Resume workspace' : 'Start workspace from PR'}
                   <ArrowRight className="size-3.5" />
                 </Button>
                 <DropdownMenuTrigger asChild>

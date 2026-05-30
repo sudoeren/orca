@@ -11,6 +11,7 @@ import TabBar from '@/components/tab-bar/TabBar'
 import { resolveGroupTabFromVisibleId } from '@/components/tab-group/tab-group-visible-id'
 import TerminalPane from '@/components/terminal-pane/TerminalPane'
 import { Button } from '@/components/ui/button'
+import { useMountedRef } from '@/hooks/useMountedRef'
 import { useShortcutKeys } from '@/hooks/useShortcutLabel'
 import {
   Dialog,
@@ -138,9 +139,10 @@ export function FloatingTerminalPanel({
   const normalizedInitialBoundsRef = useRef(false)
   const pendingEditorCloseQueueRef = useRef<string[]>([])
   const saveDialogFileIdRef = useRef<string | null>(null)
-  const panelRef = useRef<HTMLDivElement>(null)
+  const panelRef = useRef<HTMLDivElement | null>(null)
   const shortcutFocusFrameRef = useRef<number | null>(null)
   const shortcutFocusTimeoutRef = useRef<number | null>(null)
+  const mountedRef = useMountedRef()
   const dragRef = useRef<{
     pointerId: number
     startX: number
@@ -410,11 +412,15 @@ export function FloatingTerminalPanel({
     }
     try {
       const status = await window.api.cli.getInstallStatus()
-      setShowOrchestrationSetup(!isOrcaCliAvailableOnPath(status))
+      if (mountedRef.current) {
+        setShowOrchestrationSetup(!isOrcaCliAvailableOnPath(status))
+      }
     } catch {
-      setShowOrchestrationSetup(true)
+      if (mountedRef.current) {
+        setShowOrchestrationSetup(true)
+      }
     }
-  }, [])
+  }, [mountedRef])
 
   useEffect(() => {
     if (open) {
@@ -719,7 +725,17 @@ export function FloatingTerminalPanel({
     }
   }, [])
 
-  useEffect(() => cancelShortcutFocusFrame, [cancelShortcutFocusFrame])
+  const setPanelNode = useCallback(
+    (node: HTMLDivElement | null): void => {
+      // Why: the deferred shortcut focus targets this panel and must stop
+      // when the panel root leaves the DOM.
+      if (!node) {
+        cancelShortcutFocusFrame()
+      }
+      panelRef.current = node
+    },
+    [cancelShortcutFocusFrame]
+  )
 
   const focusPanelForShortcutsAfterClose = useCallback(() => {
     if (typeof window === 'undefined') {
@@ -1061,7 +1077,7 @@ export function FloatingTerminalPanel({
 
   return (
     <div
-      ref={panelRef}
+      ref={setPanelNode}
       data-floating-terminal-panel
       aria-hidden={!open}
       tabIndex={-1}

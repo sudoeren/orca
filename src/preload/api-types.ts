@@ -819,6 +819,7 @@ export type PreloadApi = {
     signal: (id: string, signal: string) => void
     kill: (id: string, opts?: { keepHistory?: boolean }) => Promise<void>
     ackColdRestore: (id: string) => void
+    pauseOutput: (id: string, paused: boolean) => void
     hasChildProcesses: (id: string) => Promise<boolean>
     getForegroundProcess: (id: string) => Promise<string | null>
     getCwd: (id: string) => Promise<string>
@@ -1381,6 +1382,7 @@ export type PreloadApi = {
   }
   agentHooks: {
     claudeStatus: () => Promise<AgentHookInstallStatus>
+    openClaudeStatus: () => Promise<AgentHookInstallStatus>
     codexStatus: () => Promise<AgentHookInstallStatus>
     geminiStatus: () => Promise<AgentHookInstallStatus>
     antigravityStatus: () => Promise<AgentHookInstallStatus>

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { GlobalSettings } from '../../../../shared/types'
 import { getDefaultVoiceSettings } from '../../../../shared/constants'
 import type { SpeechModelManifest, SpeechModelState } from '../../../../shared/speech-types'
@@ -34,11 +34,10 @@ export function VoicePane({ settings, updateSettings }: VoicePaneProps): React.J
   const [permissionPending, setPermissionPending] = useState(false)
   const mountedRef = useRef(true)
 
-  useEffect(() => {
-    mountedRef.current = true
-    return () => {
-      mountedRef.current = false
-    }
+  const handlePaneRef = useCallback((node: HTMLDivElement | null): void => {
+    // Why: the microphone permission prompt can resolve after Settings closes;
+    // the pane ref gives that completion a stale-write guard without an Effect.
+    mountedRef.current = node !== null
   }, [])
 
   useEffect(() => {
@@ -116,7 +115,7 @@ export function VoicePane({ settings, updateSettings }: VoicePaneProps): React.J
   const selectedIsReady = selectedModelState?.status === 'ready'
 
   return (
-    <div className="space-y-1">
+    <div ref={handlePaneRef} className="space-y-1">
       <div className="flex items-center justify-between gap-4 py-2">
         <div className="space-y-0.5">
           <Label>Enable Voice Dictation</Label>

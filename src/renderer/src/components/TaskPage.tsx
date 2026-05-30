@@ -1232,7 +1232,16 @@ function PRReviewCell({
     reviewerInputFocusFrameRef.current = null
   }, [])
 
-  useEffect(() => cancelReviewerInputFocusFrame, [cancelReviewerInputFocusFrame])
+  const setReviewerInputNode = useCallback(
+    (node: HTMLInputElement | null): void => {
+      // Why: the queued picker focus is only valid while this input is mounted.
+      if (!node) {
+        cancelReviewerInputFocusFrame()
+      }
+      reviewerInputRef.current = node
+    },
+    [cancelReviewerInputFocusFrame]
+  )
 
   useEffect(() => {
     setLocalReviewRequests(item.reviewRequests ?? [])
@@ -1509,7 +1518,7 @@ function PRReviewCell({
         </div>
         <div className="border-b border-border/70 p-3">
           <Input
-            ref={reviewerInputRef}
+            ref={setReviewerInputNode}
             value={reviewerInput}
             onChange={(event) => setReviewerInput(event.target.value)}
             placeholder="Type or choose a user"
@@ -3170,6 +3179,14 @@ export default function TaskPage(): React.JSX.Element {
     'idle'
   )
   const [linearConnectError, setLinearConnectError] = useState<string | null>(null)
+  const linearConnectMountedRef = useRef(true)
+
+  useEffect(() => {
+    linearConnectMountedRef.current = true
+    return () => {
+      linearConnectMountedRef.current = false
+    }
+  }, [])
 
   const activeGithubTaskKind = getGitHubTaskKind(activeTaskPreset, appliedTaskSearch)
   const selectedGitHubRepoExternalLink = useMemo(() => {
@@ -4259,6 +4276,9 @@ export default function TaskPage(): React.JSX.Element {
     setLinearConnectError(null)
     try {
       const result = await connectLinear(key)
+      if (!linearConnectMountedRef.current) {
+        return
+      }
       if (result.ok) {
         setLinearApiKeyDraft('')
         setLinearConnectState('idle')
@@ -4268,8 +4288,10 @@ export default function TaskPage(): React.JSX.Element {
         setLinearConnectError(result.error)
       }
     } catch (error) {
-      setLinearConnectState('error')
-      setLinearConnectError(error instanceof Error ? error.message : 'Connection failed')
+      if (linearConnectMountedRef.current) {
+        setLinearConnectState('error')
+        setLinearConnectError(error instanceof Error ? error.message : 'Connection failed')
+      }
     }
   }, [connectLinear, linearApiKeyDraft])
 
@@ -5308,29 +5330,34 @@ export default function TaskPage(): React.JSX.Element {
                                 <ButtonGroup>
                                   <Button
                                     type="button"
-                                    variant="outline"
+                                    variant={attachedWorkspace ? 'default' : 'outline'}
                                     size="xs"
                                     onClick={(event) => {
                                       event.stopPropagation()
                                       handleOpenOrUseGitHubPR(item)
                                     }}
-                                    className="bg-background/80"
+                                    className={cn(
+                                      'min-w-[72px] gap-1 font-semibold',
+                                      attachedWorkspace ? 'shadow-xs' : 'bg-background/80'
+                                    )}
                                     aria-label={
                                       attachedWorkspace
-                                        ? 'Open workspace attached to PR'
+                                        ? 'Resume workspace attached to PR'
                                         : 'Start workspace from PR'
                                     }
                                   >
-                                    {attachedWorkspace ? 'Open' : 'Start'}
+                                    {attachedWorkspace ? 'Resume' : 'Start'}
                                     <ArrowRight className="size-3" />
                                   </Button>
                                   <DropdownMenuTrigger asChild>
                                     <Button
                                       type="button"
-                                      variant="outline"
+                                      variant={attachedWorkspace ? 'default' : 'outline'}
                                       size="icon-xs"
                                       onClick={(event) => event.stopPropagation()}
-                                      className="bg-background/80"
+                                      className={cn(
+                                        attachedWorkspace ? 'shadow-xs' : 'bg-background/80'
+                                      )}
                                       aria-label="More PR actions"
                                     >
                                       <ChevronDown className="size-3" />

@@ -76,6 +76,7 @@ import { isLocalPathOpenBlocked, showLocalPathOpenBlockedToast } from '@/lib/loc
 import { markdownPreviewUrlTransform } from './markdown-preview-url-transform'
 import { settingsForRuntimeOwner } from '@/runtime/runtime-rpc-client'
 import { statRuntimePath } from '@/runtime/runtime-file-client'
+import { useMountedRef } from '@/hooks/useMountedRef'
 import { buildMarkdownTableOfContents } from './markdown-table-of-contents'
 import { MarkdownTableOfContentsPanel } from './MarkdownTableOfContentsPanel'
 import { isMarkdownComment } from '@/lib/diff-comment-compat'
@@ -198,6 +199,14 @@ function cancelMarkdownPreviewEditorRevealFrames(frameIds: MutableRefObject<numb
     cancelAnimationFrame(frameId)
   }
   frameIds.current = []
+}
+
+function clearMarkdownPreviewTimeout(timeoutRef: MutableRefObject<number | null>): void {
+  if (timeoutRef.current === null) {
+    return
+  }
+  window.clearTimeout(timeoutRef.current)
+  timeoutRef.current = null
 }
 
 function requestMarkdownPreviewEditorRevealFrame(
@@ -554,7 +563,13 @@ export default function MarkdownPreview({
   )
 
   useEffect(() => {
-    return () => cancelMarkdownPreviewEditorRevealFrames(pendingEditorRevealFrameIdsRef)
+    return () => {
+      // Why: review-note reveal/copy timers are event-owned, but the final
+      // cancellation belongs to the preview surface unmount.
+      cancelMarkdownPreviewEditorRevealFrames(pendingEditorRevealFrameIdsRef)
+      clearMarkdownPreviewTimeout(attentionReviewCommentTimeoutRef)
+      clearMarkdownPreviewTimeout(reviewNotesCopiedResetTimerRef)
+    }
   }, [])
 
   // Why: each split pane needs its own markdown preview viewport even when the
@@ -824,14 +839,6 @@ export default function MarkdownPreview({
       // Best-effort clipboard action; failures usually mean the window is not focused.
     }
   }, [clearReviewNotesCopiedResetTimer, markdownReviewNotes.length, markdownReviewPrompt])
-
-  useEffect(() => {
-    return () => {
-      if (attentionReviewCommentTimeoutRef.current !== null) {
-        window.clearTimeout(attentionReviewCommentTimeoutRef.current)
-      }
-    }
-  }, [])
 
   const pulseRenderedMarkdownReviewNote = useCallback((commentId: string): void => {
     if (attentionReviewCommentTimeoutRef.current !== null) {
@@ -1713,6 +1720,7 @@ function MarkdownAnnotationComposer({
   const [body, setBody] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
+  const mountedRef = useMountedRef()
 
   useEffect(() => {
     textareaRef.current?.focus()
@@ -1727,11 +1735,16 @@ function MarkdownAnnotationComposer({
     setSubmitting(true)
     try {
       const ok = await onSubmit(trimmed)
+      if (!mountedRef.current) {
+        return
+      }
       if (ok) {
         setBody('')
       }
     } finally {
-      setSubmitting(false)
+      if (mountedRef.current) {
+        setSubmitting(false)
+      }
     }
   }
 
