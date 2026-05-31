@@ -83,6 +83,7 @@ const ptySizes = new Map<string, { cols: number; rows: number }>()
 // is PTY-scoped and must be cleared by every teardown path, including SSH and
 // daemon shutdowns that do not flow through the local provider exit listener.
 const lastInputAtByPty = new Map<string, number>()
+const interactiveOutputCharsByPty = new Map<string, number>()
 // Why: hidden renderer panes restore from main-owned snapshots, so ordinary
 // PTY bytes do not need to wake the renderer while a pane is hidden.
 const rendererPausedOutputPtys = new Set<string>()
@@ -737,6 +738,7 @@ export function clearProviderPtyState(id: string): void {
   piTitlebarExtensionService.clearPty(id)
   ptySizes.delete(id)
   lastInputAtByPty.delete(id)
+  interactiveOutputCharsByPty.delete(id)
   rendererPausedOutputPtys.delete(id)
   rendererPausedMode2031ScanTailByPty.delete(id)
   const paneKey = ptyPaneKey.get(id)
@@ -947,6 +949,7 @@ export function registerPtyHandlers(
   const INTERACTIVE_OUTPUT_WINDOW_MS = 100
   const INTERACTIVE_OUTPUT_MAX_CHARS = 1024
   const INTERACTIVE_REDRAW_MAX_CHARS = PTY_BATCH_FLUSH_CHUNK_CHARS
+  const INTERACTIVE_OUTPUT_BUDGET_CHARS = 32 * 1024
   const BACKGROUND_OUTPUT_INPUT_QUIET_MS = 50
   const BACKGROUND_OUTPUT_MAX_INPUT_HOLD_MS = 250
   let lastRendererInputAt = Number.NEGATIVE_INFINITY
@@ -961,6 +964,25 @@ export function registerPtyHandlers(
     // control redraws are still latency-sensitive, while plain command output
     // should stay on the throughput batch path.
     return data.length <= INTERACTIVE_REDRAW_MAX_CHARS && data.includes('\x1b[')
+  }
+
+  function shouldSendInteractiveOutputNow(id: string, data: string, now: number): boolean {
+    const lastInputAt = lastInputAtByPty.get(id)
+    if (lastInputAt === undefined || now - lastInputAt > INTERACTIVE_OUTPUT_WINDOW_MS) {
+      interactiveOutputCharsByPty.delete(id)
+      return false
+    }
+    if (!isLikelyInteractiveRedraw(data)) {
+      interactiveOutputCharsByPty.set(id, INTERACTIVE_OUTPUT_BUDGET_CHARS)
+      return false
+    }
+    const usedChars = interactiveOutputCharsByPty.get(id) ?? 0
+    if (usedChars + data.length > INTERACTIVE_OUTPUT_BUDGET_CHARS) {
+      interactiveOutputCharsByPty.set(id, INTERACTIVE_OUTPUT_BUDGET_CHARS)
+      return false
+    }
+    interactiveOutputCharsByPty.set(id, usedChars + data.length)
+    return true
   }
 
   function getChunkStartSeq(endSeq: number | undefined, data: string): number | undefined {
@@ -1185,11 +1207,11 @@ export function registerPtyHandlers(
       const existing = pendingData.get(payload.id)
       const pending = appendPendingPtyData(existing, payload.data, startSeq)
       const nextData = pending.data
-      const lastInputAt = lastInputAtByPty.get(payload.id)
-      const isInteractiveOutput =
-        isLikelyInteractiveRedraw(nextData) &&
-        lastInputAt !== undefined &&
-        performance.now() - lastInputAt <= INTERACTIVE_OUTPUT_WINDOW_MS
+      const isInteractiveOutput = shouldSendInteractiveOutputNow(
+        payload.id,
+        nextData,
+        performance.now()
+      )
       if (isInteractiveOutput) {
         pendingData.delete(payload.id)
         clearFlushTimerIfIdle()
@@ -1229,6 +1251,7 @@ export function registerPtyHandlers(
           pendingData.delete(payload.id)
         }
         lastInputAtByPty.delete(payload.id)
+        interactiveOutputCharsByPty.delete(payload.id)
         if (lastRendererInputPtyId === payload.id) {
           lastRendererInputPtyId = null
         }
@@ -2209,6 +2232,7 @@ export function registerPtyHandlers(
       lastRendererInputAt = now
       lastRendererInputPtyId = args.id
       lastInputAtByPty.set(args.id, now)
+      interactiveOutputCharsByPty.set(args.id, 0)
       provider.write(args.id, args.data)
       return true
     } catch {
@@ -2236,6 +2260,7 @@ export function registerPtyHandlers(
       lastRendererInputAt = now
       lastRendererInputPtyId = args.id
       lastInputAtByPty.set(args.id, now)
+      interactiveOutputCharsByPty.set(args.id, 0)
       provider.write(args.id, args.data)
       return true
     } catch {

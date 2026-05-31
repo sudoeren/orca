@@ -84,6 +84,9 @@ const HIDDEN_STARTUP_RENDERER_QUERY_WINDOW_MS = 10_000
 const STARTUP_COMMAND_EXTENSION_RE = /\.(?:exe|cmd|bat|ps1)$/i
 const TERMINAL_RENDERER_RISK_SCAN_TAIL_CHARS = 256
 const REATTACH_IDLE_AGENT_CURSOR_RESET_DELAY_MS = 250
+const FOREGROUND_THROUGHPUT_IMMEDIATE_CHARS = 2048
+const FOREGROUND_INTERACTIVE_REDRAW_CHARS = 16 * 1024
+const FOREGROUND_INTERACTIVE_REDRAW_WINDOW_MS = 150
 // Why: this is only shown if renderer backlog overflowed and main-owned
 // terminal state is unavailable, so the user has an explicit loss signal.
 const HIDDEN_OUTPUT_RESTORE_UNAVAILABLE_WARNING =
@@ -1076,6 +1079,10 @@ export function connectPanePty(
   const activeRuntimeEnvironmentId = state.settings?.activeRuntimeEnvironmentId?.trim() || null
   const runtimeEnvironmentId = remoteRuntimeOwnerForTransport ?? activeRuntimeEnvironmentId
   const shouldDeliverStartupViaTerminalPaste = paneStartup?.delivery === 'terminal-paste'
+  let lastTerminalInputAt = Number.NEGATIVE_INFINITY
+  const markTerminalInputSent = (): void => {
+    lastTerminalInputAt = performance.now()
+  }
   const transportOptions = {
     cwd: deps.cwd,
     env: paneEnv,
@@ -1180,6 +1187,7 @@ export function connectPanePty(
     const acknowledgedIntent = intent ?? inferIntentFromExactTerminalInput(data)
     if (acknowledgedIntent && transport.sendInputAccepted) {
       clearPendingTerminalInputIntent()
+      markTerminalInputSent()
       const writePromise = transport
         .sendInputAccepted(data)
         .then((accepted) => {
@@ -1197,12 +1205,14 @@ export function connectPanePty(
     }
     if (intent) {
       if (transport.sendInput(data)) {
+        markTerminalInputSent()
         observeAcceptedTerminalInput(data, intent)
       }
       clearPendingTerminalInputIntent()
       return
     }
     if (transport.sendInput(data)) {
+      markTerminalInputSent()
       observeAcceptedTerminalInput(data)
       observeSentTerminalInputIntent(data)
     } else {
@@ -1581,6 +1591,58 @@ export function connectPanePty(
       recordTerminalOutput(pane.terminal)
     }
 
+    function isLatencySensitiveForegroundOutput(data: string): boolean {
+      if (data.length <= FOREGROUND_THROUGHPUT_IMMEDIATE_CHARS) {
+        return true
+      }
+      const recentInput =
+        performance.now() - lastTerminalInputAt <= FOREGROUND_INTERACTIVE_REDRAW_WINDOW_MS
+      return (
+        recentInput && data.length <= FOREGROUND_INTERACTIVE_REDRAW_CHARS && data.includes('\x1b[')
+      )
+    }
+
+    function containsNonAsciiOutput(data: string): boolean {
+      for (let index = 0; index < data.length; index++) {
+        if (data.charCodeAt(index) > 0x7f) {
+          return true
+        }
+      }
+      return false
+    }
+
+    function containsWindowsRewriteControl(data: string): boolean {
+      if (data.includes('\r') || data.includes('\b')) {
+        return true
+      }
+      let escapeIndex = data.indexOf('\x1b[')
+      while (escapeIndex !== -1) {
+        for (let index = escapeIndex + 2; index < data.length; index++) {
+          const char = data[index]
+          if (char >= '0' && char <= '9') {
+            continue
+          }
+          if (char === ';' || char === '?') {
+            continue
+          }
+          if (char === 'J' || char === 'K') {
+            return true
+          }
+          break
+        }
+        escapeIndex = data.indexOf('\x1b[', escapeIndex + 2)
+      }
+      return false
+    }
+
+    function shouldForceForegroundRenderRefresh(data: string): boolean {
+      return (
+        shouldSuppressForegroundCursor &&
+        containsNonAsciiOutput(data) &&
+        containsWindowsRewriteControl(data)
+      )
+    }
+
     function writePtyOutputToXterm(data: string, foreground: boolean): void {
       const parseHiddenStartupOutput =
         !foreground &&
@@ -1604,7 +1666,11 @@ export function connectPanePty(
       writeTerminalOutput(pane.terminal, data, {
         foreground: foreground || parseHiddenStartupOutput,
         beforeWrite: beforeTerminalOutputWrite,
-        onBackgroundBacklogDropped: markHiddenOutputRestoreNeeded
+        onBackgroundBacklogDropped: markHiddenOutputRestoreNeeded,
+        latencySensitive:
+          !foreground || parseHiddenStartupOutput ? true : isLatencySensitiveForegroundOutput(data),
+        forceForegroundRefresh:
+          (foreground || parseHiddenStartupOutput) && shouldForceForegroundRenderRefresh(data)
       })
     }
 
