@@ -1,7 +1,7 @@
 /* oxlint-disable max-lines */
 import { execSync } from 'child_process'
 import { existsSync, statSync } from 'fs'
-import { join, basename } from 'path'
+import { basename } from 'path'
 import { gitExecFileSync, gitExecFileAsync } from './runner'
 import type { BaseRefSearchResult } from '../../shared/types'
 import { buildHostedRemoteFileUrl, parseHostedRemote } from './hosted-remote-url'
@@ -53,25 +53,23 @@ export function isGitRepo(path: string): boolean {
     if (!existsSync(path) || !statSync(path).isDirectory()) {
       return false
     }
-    // .git dir or file (for worktrees) or bare repo
-    if (existsSync(join(path, '.git'))) {
-      return true
-    }
-    // Might be a bare repo — ask git
-    const result = gitExecFileSync(['rev-parse', '--is-inside-work-tree'], {
+    const insideWorkTree = gitExecFileSync(['rev-parse', '--is-inside-work-tree'], {
       cwd: path
     }).trim()
-    return result === 'true'
-  } catch {
-    // Also check if it's a bare repo
-    try {
-      const result = gitExecFileSync(['rev-parse', '--is-bare-repository'], {
-        cwd: path
-      }).trim()
-      return result === 'true'
-    } catch {
-      return false
+    if (insideWorkTree === 'true') {
+      return true
     }
+  } catch {
+    // Fall through to the bare-repo probe below.
+  }
+
+  try {
+    const bareRepo = gitExecFileSync(['rev-parse', '--is-bare-repository'], {
+      cwd: path
+    }).trim()
+    return bareRepo === 'true'
+  } catch {
+    return false
   }
 }
 
