@@ -643,6 +643,31 @@ describe('CliInstaller', () => {
     }
   )
 
+  it('resolves packaged Windows command path to resources/bin/orca.cmd', async () => {
+    const fixture = await makeFixture()
+    const localAppDataPath = fixture.root
+    const resourcesPath = join(fixture.root, 'resources')
+    await mkdir(join(resourcesPath, 'bin'), { recursive: true })
+    await writeFile(join(resourcesPath, 'bin', 'orca.cmd'), '@echo off\n', 'utf8')
+
+    const installer = new CliInstaller({
+      platform: 'win32',
+      isPackaged: true,
+      resourcesPath,
+      localAppDataPath,
+      userDataPath: fixture.userDataPath,
+      execPath: join(localAppDataPath, 'Programs', 'Orca', 'Orca.exe'),
+      appPath: fixture.appPath,
+      userPathReader: async () => null,
+      userPathWriter: async () => {}
+    })
+
+    const status = await installer.getStatus()
+    expect(status.commandPath).toBe(
+      join(localAppDataPath, 'Programs', 'Orca', 'resources', 'bin', 'orca.cmd')
+    )
+  })
+
   // Why: the arm64 fallback must apply for packaged builds, not just dev launchers.
   it.skipIf(process.platform === 'win32')(
     'resolves to ~/.local/bin/orca on arm64 even when isPackaged is true',

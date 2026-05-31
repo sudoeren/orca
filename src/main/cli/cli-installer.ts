@@ -280,7 +280,7 @@ export class CliInstaller {
     }
 
     if (this.platform === 'win32') {
-      return join(this.localAppDataPath, 'Programs', 'Orca', 'bin', 'orca.cmd')
+      return join(this.localAppDataPath, 'Programs', 'Orca', 'resources', 'bin', 'orca.cmd')
     }
 
     return null
