@@ -402,6 +402,9 @@ export function CreatePullRequestDialog({
               placeholder="Description (optional)"
               className="w-full resize-none rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:ring-1 focus-visible:ring-ring"
             />
+            <p className="text-xs text-muted-foreground">
+              Supports Markdown formatting. Use Generate with AI to auto-fill from your changes.
+            </p>
           </div>
 
           <label className="flex items-center gap-2 rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground transition-colors hover:bg-accent hover:text-accent-foreground">
