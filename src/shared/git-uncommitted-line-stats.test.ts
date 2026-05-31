@@ -45,6 +45,13 @@ describe('parseNumstat', () => {
     expect(plain.get('new.ts')).toEqual({ added: 2, removed: 1 })
   })
 
+  it('decodes Git C-quoted paths before keying stats', () => {
+    expect(parseNumstat('1\t1\t"tab\\tfile.txt"\n').get('tab\tfile.txt')).toEqual({
+      added: 1,
+      removed: 1
+    })
+  })
+
   it('ignores blank lines', () => {
     expect(parseNumstat('').size).toBe(0)
   })

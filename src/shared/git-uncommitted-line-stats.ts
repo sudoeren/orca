@@ -1,6 +1,7 @@
 import { lstat, readFile } from 'fs/promises'
 import * as path from 'path'
 import { isBinaryBuffer } from './binary-buffer'
+import { decodeGitCQuotedPath } from './git-cquoted-path'
 
 export type GitLineStats = { added?: number; removed?: number }
 
@@ -35,13 +36,14 @@ function parseNumstatCount(value: string): number | undefined {
 // `dir/{old => new}/file`; normalize to the post-rename path so it keys to the
 // porcelain status entry, which always reports the new path.
 function normalizeNumstatPath(rawPath: string): string {
-  const braced = /^(.*)\{(.+) => (.+)\}(.*)$/.exec(rawPath)
+  const decodedPath = decodeGitCQuotedPath(rawPath)
+  const braced = /^(.*)\{(.+) => (.+)\}(.*)$/.exec(decodedPath)
   if (braced) {
     return `${braced[1]}${braced[3]}${braced[4]}`
   }
   const marker = ' => '
-  const markerIndex = rawPath.lastIndexOf(marker)
-  return markerIndex === -1 ? rawPath : rawPath.slice(markerIndex + marker.length)
+  const markerIndex = decodedPath.lastIndexOf(marker)
+  return markerIndex === -1 ? decodedPath : decodedPath.slice(markerIndex + marker.length)
 }
 
 export function parseNumstat(stdout: string): Map<string, GitLineStats> {

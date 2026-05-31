@@ -28,6 +28,7 @@ import {
   parseNumstat,
   type GitLineStats
 } from '../../shared/git-uncommitted-line-stats'
+import { decodeGitCQuotedPath } from '../../shared/git-cquoted-path'
 import { gitExecFileAsync, gitExecFileAsyncBuffer, gitOptionalLocksDisabledEnv } from './runner'
 import {
   removeSafeUntrackedDiscardTarget,
@@ -130,8 +131,8 @@ export async function getStatus(
           // space-delimited fields and the old path after the tab. Preserving
           // spaces here keeps row actions and numstat counts keyed correctly.
           const tabParts = line.split('\t')
-          const path = tabParts[0].split(' ').slice(9).join(' ')
-          const oldPath = tabParts.slice(1).join('\t')
+          const path = decodeGitCQuotedPath(tabParts[0].split(' ').slice(9).join(' '))
+          const oldPath = decodeGitCQuotedPath(tabParts.slice(1).join('\t'))
           if (indexStatus !== '.') {
             entries.push({ path, status: parseStatusChar(indexStatus), area: 'staged', oldPath })
           }
@@ -145,7 +146,7 @@ export async function getStatus(
           }
         } else {
           // Regular change entry
-          const path = parts.slice(8).join(' ')
+          const path = decodeGitCQuotedPath(parts.slice(8).join(' '))
           if (indexStatus !== '.') {
             entries.push({ path, status: parseStatusChar(indexStatus), area: 'staged' })
           }
@@ -155,10 +156,10 @@ export async function getStatus(
         }
       } else if (line.startsWith('? ')) {
         // Untracked file
-        const path = line.slice(2)
+        const path = decodeGitCQuotedPath(line.slice(2))
         entries.push({ path, status: 'untracked', area: 'untracked' })
       } else if (line.startsWith('! ')) {
-        ignoredPaths.push(line.slice(2))
+        ignoredPaths.push(decodeGitCQuotedPath(line.slice(2)))
       } else if (line.startsWith('u ')) {
         const unmergedEntry = await parseUnmergedEntry(worktreePath, line)
         if (unmergedEntry) {
@@ -337,7 +338,7 @@ async function parseUnmergedEntry(
   const modeStage1 = parts[3]
   const modeStage2 = parts[4]
   const modeStage3 = parts[5]
-  const filePath = parts.slice(10).join(' ')
+  const filePath = decodeGitCQuotedPath(parts.slice(10).join(' '))
   if (!filePath) {
     return null
   }
@@ -830,15 +831,15 @@ function parseBranchChangeLine(line: string): GitBranchChangeEntry | null {
   const status = parseBranchStatusChar(rawStatus[0] ?? 'M')
 
   if (rawStatus.startsWith('R') || rawStatus.startsWith('C')) {
-    const oldPath = parts[1]
-    const path = parts[2]
+    const oldPath = decodeGitCQuotedPath(parts[1] ?? '')
+    const path = decodeGitCQuotedPath(parts[2] ?? '')
     if (!path) {
       return null
     }
     return { path, oldPath, status }
   }
 
-  const path = parts[1]
+  const path = decodeGitCQuotedPath(parts[1] ?? '')
   if (!path) {
     return null
   }
