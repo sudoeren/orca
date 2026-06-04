@@ -1451,12 +1451,25 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
                     ([fileId]) => fileId !== replacedPreview.id
                   )
                 )
+          const frontmatterVisibilityKeys = new Set([replacedPreview.id])
+          if (replacedPreview.markdownPreviewSourceFileId) {
+            frontmatterVisibilityKeys.add(replacedPreview.markdownPreviewSourceFileId)
+          }
+          const frontmatterKeysToRemove = [...frontmatterVisibilityKeys].filter(
+            (key) =>
+              key in s.markdownFrontmatterVisible &&
+              !s.openFiles.some(
+                (file, index) =>
+                  index !== existingPreviewIdx &&
+                  (file.id === key || file.markdownPreviewSourceFileId === key)
+              )
+          )
           const nextMarkdownFrontmatterVisible =
-            replacedPreview.id === id
+            replacedPreview.id === id || frontmatterKeysToRemove.length === 0
               ? s.markdownFrontmatterVisible
               : Object.fromEntries(
                   Object.entries(s.markdownFrontmatterVisible).filter(
-                    ([fileId]) => fileId !== replacedPreview.id
+                    ([fileId]) => !frontmatterKeysToRemove.includes(fileId)
                   )
                 )
           // Why: editorCursorLine entries accumulate per file; clean up the
@@ -1727,11 +1740,22 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
       delete newMarkdownViewMode[fileId]
       const newEditorViewMode = { ...s.editorViewMode }
       delete newEditorViewMode[fileId]
+      const frontmatterVisibilityKeys = new Set([fileId])
+      if (closedFile?.markdownPreviewSourceFileId) {
+        frontmatterVisibilityKeys.add(closedFile.markdownPreviewSourceFileId)
+      }
+      const keysToRemove = [...frontmatterVisibilityKeys].filter(
+        (key) =>
+          key in s.markdownFrontmatterVisible &&
+          !newFiles.some((file) => file.id === key || file.markdownPreviewSourceFileId === key)
+      )
       const newMarkdownFrontmatterVisible =
-        fileId in s.markdownFrontmatterVisible
+        keysToRemove.length > 0
           ? (() => {
               const next = { ...s.markdownFrontmatterVisible }
-              delete next[fileId]
+              for (const key of keysToRemove) {
+                delete next[key]
+              }
               return next
             })()
           : s.markdownFrontmatterVisible
@@ -1946,6 +1970,7 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
           activeTabType: 'terminal',
           markdownViewMode: {},
           editorViewMode: {},
+          markdownFrontmatterVisible: {},
           pendingEditorReveal: null
         }
       }
@@ -1960,6 +1985,11 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
       )
       const newEditorViewMode = Object.fromEntries(
         Object.entries(s.editorViewMode).filter(([fileId]) => remainingFileIds.has(fileId))
+      )
+      const newMarkdownFrontmatterVisible = Object.fromEntries(
+        Object.entries(s.markdownFrontmatterVisible).filter(([fileId]) =>
+          remainingFileIds.has(fileId)
+        )
       )
       const newEditorCursorLine = Object.fromEntries(
         Object.entries(s.editorCursorLine).filter(([fileId]) => remainingFileIds.has(fileId))
@@ -2026,6 +2056,7 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
         activeTabType: browserTabsForWorktree.length > 0 ? 'browser' : 'terminal',
         markdownViewMode: newMarkdownViewMode,
         editorViewMode: newEditorViewMode,
+        markdownFrontmatterVisible: newMarkdownFrontmatterVisible,
         activeFileIdByWorktree: newActiveFileIdByWorktree,
         activeTabTypeByWorktree: newActiveTabTypeByWorktree,
         tabBarOrderByWorktree: nextTabBarOrderByWorktree,
@@ -3484,6 +3515,7 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
       const openFilesByWorktree = session.openFilesByWorktree ?? {}
       const persistedActiveFileIdByWorktree = session.activeFileIdByWorktree ?? {}
       const persistedActiveTabTypeByWorktree = session.activeTabTypeByWorktree ?? {}
+      const persistedMarkdownFrontmatterVisible = session.markdownFrontmatterVisible ?? {}
 
       // Why: worktrees may have been deleted between sessions. Filter out
       // files for worktrees that no longer exist, mirroring the validation
@@ -3620,10 +3652,30 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
       // browser or terminal instead of showing an empty editor surface.
       const nextActiveTabType =
         nextActiveFileId || activeTabType !== 'editor' ? activeTabType : 'terminal'
+      const openFileIds = new Set(openFiles.map((file) => file.id))
+      const visibleFrontmatterEntries = new Map<string, boolean>()
+      for (const [persistedFileId, visible] of Object.entries(
+        persistedMarkdownFrontmatterVisible
+      )) {
+        if (!visible) {
+          continue
+        }
+        if (openFileIds.has(persistedFileId)) {
+          visibleFrontmatterEntries.set(persistedFileId, true)
+        }
+        for (const migrations of Object.values(editorFileIdMigrationsByWorktree)) {
+          const migratedFileId = migrations.get(persistedFileId)
+          if (migratedFileId && openFileIds.has(migratedFileId)) {
+            visibleFrontmatterEntries.set(migratedFileId, true)
+          }
+        }
+      }
+      const markdownFrontmatterVisible = Object.fromEntries(visibleFrontmatterEntries)
 
       return {
         openFiles,
         editorDrafts,
+        markdownFrontmatterVisible,
         activeFileId: nextActiveFileId,
         activeFileIdByWorktree: filteredActiveFileIdByWorktree,
         activeTabType: nextActiveTabType,

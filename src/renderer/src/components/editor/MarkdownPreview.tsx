@@ -22,7 +22,6 @@ import rehypeRaw from 'rehype-raw'
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import rehypeSlug from 'rehype-slug'
 import { extractFrontMatter } from './markdown-frontmatter'
-import { SettingsSwitch } from '@/components/settings/SettingsFormControls'
 import {
   Check,
   ChevronDown,
@@ -468,7 +467,6 @@ export default function MarkdownPreview({
   const openMarkdownPreview = useAppStore((s) => s.openMarkdownPreview)
   const setMarkdownViewMode = useAppStore((s) => s.setMarkdownViewMode)
   const frontmatterVisibleByFile = useAppStore((s) => s.markdownFrontmatterVisible)
-  const setMarkdownFrontmatterVisible = useAppStore((s) => s.setMarkdownFrontmatterVisible)
   const setPendingEditorReveal = useAppStore((s) => s.setPendingEditorReveal)
   const addDiffComment = useAppStore((s) => s.addDiffComment)
   const deleteDiffComment = useAppStore((s) => s.deleteDiffComment)
@@ -562,11 +560,9 @@ export default function MarkdownPreview({
       .replace(/\r?\n(?:---|\+\+\+)\r?\n?$/, '')
       .trim()
   }, [frontMatter])
-  // Why: front matter is hidden by default (#4468). The per-file opt-in is
-  // keyed by the source file so preview tabs of the same file stay in sync
-  // and the choice survives across sessions. When sourceFileId is missing the
-  // per-file toggle cannot be persisted, so we fall back to the old
-  // always-visible behavior to keep the preview useful in that rare path.
+  // Why: front matter is hidden by default (#4468) and controlled from the
+  // markdown preview actions menu, keeping metadata out of the reading surface
+  // unless the user explicitly asks for it.
   const toggleableSourceFileId: string | null = sourceFileId ?? null
   const frontmatterVisible = toggleableSourceFileId
     ? (frontmatterVisibleByFile[toggleableSourceFileId] ?? false)
@@ -1749,35 +1745,17 @@ export default function MarkdownPreview({
           </div>
         ) : null}
         <div ref={bodyRef} className="markdown-body">
-          {/* Why: remarkFrontmatter silently strips front-matter from rendered
-        output. We extract it ourselves and render it as a styled code block so
-        the user can see the metadata in preview mode. The header + visibility
-        switch is shown when the file has front matter and can be toggled
-        (#4468); the YAML/TOML body itself is only rendered when the per-file
-        toggle is on. When the source file id is unavailable the toggle is
-        omitted and the body stays visible, matching the pre-#4468 behavior. */}
-          {frontMatter ? (
+          {/* Why: remarkFrontmatter strips front matter from normal markdown
+        output. When the user opts in from the preview actions menu, render the
+        raw metadata as a compact read-only block above the document body. */}
+          {frontMatter && frontmatterVisible ? (
             <div className="mb-4 rounded border border-border/60 bg-muted/40 px-3 py-2">
-              <div className="mb-1 flex items-center justify-between gap-2 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-                <span>Front Matter</span>
-                {toggleableSourceFileId ? (
-                  <span className="flex items-center gap-2 normal-case tracking-normal text-xs font-normal">
-                    <span className="opacity-70">{frontmatterVisible ? 'Visible' : 'Hidden'}</span>
-                    <SettingsSwitch
-                      checked={frontmatterVisible}
-                      onChange={() =>
-                        setMarkdownFrontmatterVisible(toggleableSourceFileId, !frontmatterVisible)
-                      }
-                      ariaLabel="Show front matter"
-                    />
-                  </span>
-                ) : null}
+              <div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                Front Matter
               </div>
-              {frontmatterVisible ? (
-                <pre className="max-h-48 overflow-auto whitespace-pre-wrap text-xs text-muted-foreground font-mono scrollbar-editor">
-                  {frontMatterInner}
-                </pre>
-              ) : null}
+              <pre className="max-h-48 overflow-auto whitespace-pre-wrap text-xs text-muted-foreground font-mono scrollbar-editor">
+                {frontMatterInner}
+              </pre>
             </div>
           ) : null}
           <Markdown
