@@ -854,7 +854,7 @@ export class CodexHookService {
       const current = Array.isArray(nextHooks[eventName]) ? nextHooks[eventName] : []
       const cleaned = removeManagedCommands(current, isManagedCommand)
       const definition: HookDefinition = {
-        hooks: [{ type: 'command', command }]
+        hooks: [{ type: 'command', command, timeout: 10 }]
       }
       nextHooks[eventName] = [definition, ...cleaned]
       // Why: the status hook must run before user hooks so a slow
@@ -942,7 +942,7 @@ export class CodexHookService {
         const current = Array.isArray(nextHooks[eventName]) ? nextHooks[eventName] : []
         const cleaned = removeManagedCommands(current, isManagedCommand)
         const definition: HookDefinition = {
-          hooks: [{ type: 'command', command }]
+          hooks: [{ type: 'command', command, timeout: 10 }]
         }
         nextHooks[eventName] = [...cleaned, definition]
         trustEntries.push({
