@@ -12,6 +12,11 @@ export type DaemonPidFile = {
   startedAtMs: number | null
   entryPath?: string
   appVersion?: string
+  // Why: issue #4365 — a long-lived dev daemon can outlive the node-pty
+  // spawn-helper path it loaded against. Persisting the helper path the
+  // daemon was forked with lets the next health probe detect when a
+  // `pnpm install` / worktree delete / rebuild silently invalidated it.
+  nodePtyHelperPath?: string | null
 }
 
 export type DaemonProcessHandle = {

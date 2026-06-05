@@ -24,8 +24,10 @@ const {
   getMacDaemonSystemResolverHealthMock,
   getDaemonLaunchIdentityMock,
   isDaemonStaleForCurrentBundleMock,
+  isDaemonStaleForCurrentNodePtyHelperMock,
   killStaleDaemonMock,
   getProcessStartedAtMsMock,
+  getLoadedNodePtyHelperSnapshotMock,
   daemonClientMock,
   spawnerInstances,
   adapterInstances,
@@ -69,8 +71,14 @@ const {
   const getMacDaemonSystemResolverHealthMock = vi.fn(() => 'healthy')
   const getDaemonLaunchIdentityMock = vi.fn(() => 'match')
   const isDaemonStaleForCurrentBundleMock = vi.fn(() => false)
+  // Why: tests don't actually need node-pty helper staleness behavior; stub
+  // the new function to false so it never short-circuits the existing flows.
+  const isDaemonStaleForCurrentNodePtyHelperMock = vi.fn(() => false)
   const killStaleDaemonMock = vi.fn(async () => true)
   const getProcessStartedAtMsMock = vi.fn(() => 1_000_000)
+  // Why: capture a stable fake helper path so pid-file write assertions can
+  // verify the snapshot was recorded at fork time without touching disk.
+  const getLoadedNodePtyHelperSnapshotMock = vi.fn(() => '/fake/userData/spawn-helper')
 
   const daemonClientMock = vi.fn().mockImplementation(function MockDaemonClient() {
     return {
@@ -103,8 +111,10 @@ const {
     getMacDaemonSystemResolverHealthMock,
     getDaemonLaunchIdentityMock,
     isDaemonStaleForCurrentBundleMock,
+    isDaemonStaleForCurrentNodePtyHelperMock,
     killStaleDaemonMock,
     getProcessStartedAtMsMock,
+    getLoadedNodePtyHelperSnapshotMock,
     daemonClientMock,
     spawnerInstances,
     adapterInstances,
@@ -173,8 +183,13 @@ vi.mock('./daemon-health', () => ({
   getMacDaemonSystemResolverHealth: getMacDaemonSystemResolverHealthMock,
   healthCheckDaemon: healthCheckDaemonMock,
   isDaemonStaleForCurrentBundle: isDaemonStaleForCurrentBundleMock,
+  isDaemonStaleForCurrentNodePtyHelper: isDaemonStaleForCurrentNodePtyHelperMock,
   killStaleDaemon: killStaleDaemonMock,
   getProcessStartedAtMs: getProcessStartedAtMsMock
+}))
+
+vi.mock('./daemon-node-pty-snapshot', () => ({
+  getLoadedNodePtyHelperSnapshot: getLoadedNodePtyHelperSnapshotMock
 }))
 
 vi.mock('./client', () => ({ DaemonClient: daemonClientMock }))

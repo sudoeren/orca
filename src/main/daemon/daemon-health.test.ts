@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync } from 'fs'
+import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { createServer, connect, type Server } from 'net'
@@ -8,6 +8,7 @@ import { getDaemonPidPath, serializeDaemonPidFile } from './daemon-spawner'
 import {
   getProcessStartedAtMs,
   healthCheckDaemon,
+  isDaemonStaleForCurrentNodePtyHelper,
   killStaleDaemon,
   parseDaemonPidFile,
   startTimeMatches
@@ -123,7 +124,8 @@ describe('parseDaemonPidFile', () => {
       pid: 12345,
       startedAtMs: 1_700_000_000_000,
       entryPath: null,
-      appVersion: null
+      appVersion: null,
+      nodePtyHelperPath: null
     })
   })
 
@@ -138,7 +140,36 @@ describe('parseDaemonPidFile', () => {
       pid: 12345,
       startedAtMs: 1_700_000_000_000,
       entryPath: '/repo/out/main/daemon-entry.js',
-      appVersion: '1.2.3'
+      appVersion: '1.2.3',
+      nodePtyHelperPath: null
+    })
+  })
+
+  it('parses JSON pid files with the node-pty helper snapshot', () => {
+    const serialized = serializeDaemonPidFile({
+      pid: 12345,
+      startedAtMs: 1_700_000_000_000,
+      entryPath: '/repo/out/main/daemon-entry.js',
+      appVersion: '1.2.3',
+      nodePtyHelperPath: '/repo/node_modules/node-pty/build/Release/spawn-helper'
+    })
+    expect(parseDaemonPidFile(serialized)).toEqual({
+      pid: 12345,
+      startedAtMs: 1_700_000_000_000,
+      entryPath: '/repo/out/main/daemon-entry.js',
+      appVersion: '1.2.3',
+      nodePtyHelperPath: '/repo/node_modules/node-pty/build/Release/spawn-helper'
+    })
+  })
+
+  it('rejects a non-string nodePtyHelperPath', () => {
+    const parsed = parseDaemonPidFile('{"pid":12345,"startedAtMs":1,"nodePtyHelperPath":42}')
+    expect(parsed).toEqual({
+      pid: 12345,
+      startedAtMs: 1,
+      entryPath: null,
+      appVersion: null,
+      nodePtyHelperPath: null
     })
   })
 
@@ -149,7 +180,8 @@ describe('parseDaemonPidFile', () => {
       pid: 9999,
       startedAtMs: null,
       entryPath: null,
-      appVersion: null
+      appVersion: null,
+      nodePtyHelperPath: null
     })
   })
 
@@ -161,13 +193,15 @@ describe('parseDaemonPidFile', () => {
       pid: 12345,
       startedAtMs: null,
       entryPath: null,
-      appVersion: null
+      appVersion: null,
+      nodePtyHelperPath: null
     })
     expect(parseDaemonPidFile('  12345\n')).toEqual({
       pid: 12345,
       startedAtMs: null,
       entryPath: null,
-      appVersion: null
+      appVersion: null,
+      nodePtyHelperPath: null
     })
   })
 
@@ -221,6 +255,102 @@ describe('startTimeMatches', () => {
     }
     // Shift expected by 10s — clearly outside the ±1500ms tolerance.
     expect(startTimeMatches(process.pid, actual + 10_000)).toBe(false)
+  })
+})
+
+describe('isDaemonStaleForCurrentNodePtyHelper', () => {
+  let dir: string
+  let socketPath: string
+  let tokenPath: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'daemon-node-pty-snapshot-test-'))
+    socketPath = join(dir, 'daemon.sock')
+    tokenPath = join(dir, 'daemon.token')
+  })
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('returns false on Windows where there is no spawn-helper to compare', () => {
+    if (process.platform !== 'win32') {
+      return
+    }
+    writeFileSync(
+      getDaemonPidPath(dir),
+      serializeDaemonPidFile({
+        pid: process.pid,
+        startedAtMs: 1,
+        nodePtyHelperPath: '/some/path/that/should/not/matter'
+      }),
+      { mode: 0o600 }
+    )
+    expect(isDaemonStaleForCurrentNodePtyHelper(dir, socketPath, tokenPath)).toBe(false)
+  })
+
+  it('returns false when no pid file exists (no live daemon to replace)', () => {
+    if (process.platform === 'win32') {
+      return
+    }
+    expect(isDaemonStaleForCurrentNodePtyHelper(dir, socketPath, tokenPath)).toBe(false)
+  })
+
+  it('returns false when the pid file carries no helper snapshot (legacy daemon)', () => {
+    if (process.platform === 'win32') {
+      return
+    }
+    writeFileSync(
+      getDaemonPidPath(dir),
+      serializeDaemonPidFile({
+        pid: process.pid,
+        startedAtMs: Date.now() - 60_000,
+        entryPath: '/some/entry.js',
+        appVersion: '1.2.3'
+      }),
+      { mode: 0o600 }
+    )
+    expect(isDaemonStaleForCurrentNodePtyHelper(dir, socketPath, tokenPath)).toBe(false)
+  })
+
+  it('returns true when the persisted helper path no longer exists on disk', () => {
+    if (process.platform === 'win32') {
+      return
+    }
+    const missing = join(dir, 'prebuilds', 'spawn-helper')
+    writeFileSync(
+      getDaemonPidPath(dir),
+      serializeDaemonPidFile({
+        pid: process.pid,
+        startedAtMs: Date.now() - 60_000,
+        entryPath: '/some/entry.js',
+        appVersion: '1.2.3',
+        nodePtyHelperPath: missing
+      }),
+      { mode: 0o600 }
+    )
+    expect(existsSync(missing)).toBe(false)
+    expect(isDaemonStaleForCurrentNodePtyHelper(dir, socketPath, tokenPath)).toBe(true)
+  })
+
+  it('returns false when the persisted helper path still exists on disk', () => {
+    if (process.platform === 'win32') {
+      return
+    }
+    const helper = join(dir, 'spawn-helper')
+    writeFileSync(helper, '')
+    writeFileSync(
+      getDaemonPidPath(dir),
+      serializeDaemonPidFile({
+        pid: process.pid,
+        startedAtMs: Date.now() - 60_000,
+        entryPath: '/some/entry.js',
+        appVersion: '1.2.3',
+        nodePtyHelperPath: helper
+      }),
+      { mode: 0o600 }
+    )
+    expect(isDaemonStaleForCurrentNodePtyHelper(dir, socketPath, tokenPath)).toBe(false)
   })
 })
 

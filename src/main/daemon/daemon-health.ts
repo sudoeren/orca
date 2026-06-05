@@ -24,6 +24,7 @@ type ParsedDaemonPid = {
   startedAtMs: number | null
   entryPath: string | null
   appVersion: string | null
+  nodePtyHelperPath: string | null
 }
 
 function canConnectSocket(socketPath: string): Promise<boolean> {
@@ -288,6 +289,7 @@ export function parseDaemonPidFile(contents: string): ParsedDaemonPid | null {
       startedAtMs?: unknown
       entryPath?: unknown
       appVersion?: unknown
+      nodePtyHelperPath?: unknown
     }
     if (typeof parsed.pid === 'number' && Number.isFinite(parsed.pid)) {
       return {
@@ -297,7 +299,9 @@ export function parseDaemonPidFile(contents: string): ParsedDaemonPid | null {
             ? parsed.startedAtMs
             : null,
         entryPath: typeof parsed.entryPath === 'string' ? parsed.entryPath : null,
-        appVersion: typeof parsed.appVersion === 'string' ? parsed.appVersion : null
+        appVersion: typeof parsed.appVersion === 'string' ? parsed.appVersion : null,
+        nodePtyHelperPath:
+          typeof parsed.nodePtyHelperPath === 'string' ? parsed.nodePtyHelperPath : null
       }
     }
   } catch {
@@ -305,7 +309,9 @@ export function parseDaemonPidFile(contents: string): ParsedDaemonPid | null {
   }
 
   const pid = Number(trimmed)
-  return Number.isFinite(pid) ? { pid, startedAtMs: null, entryPath: null, appVersion: null } : null
+  return Number.isFinite(pid)
+    ? { pid, startedAtMs: null, entryPath: null, appVersion: null, nodePtyHelperPath: null }
+    : null
 }
 
 function getLinuxProcessStartedAtMs(pid: number): number | null {
@@ -535,6 +541,39 @@ export function isDaemonStaleForCurrentBundle(
   // marker. Replacing them once prevents archive-preserved mtimes from
   // reusing stale native modules across the first metadata-aware upgrade.
   return true
+}
+
+// Why: a long-lived dev daemon can outlive the node-pty spawn-helper path
+// it loaded against. When `pnpm install` or a worktree delete silently
+// replaces the `prebuilds/<plat>-<arch>/spawn-helper` (or `build/Release`
+// equivalent) with a fresh layout, the running daemon still has the old
+// helper path mapped in node-pty's native module and every `posix_spawnp`
+// will fail with the unhelpful "posix_spawnp failed." while the daemon
+// stays protocol-healthy (#4365). The pid file records the helper path
+// captured at fork time; if it no longer exists on disk, replace the
+// daemon. Windows has no spawn-helper (ConPTY), and legacy daemons that
+// did not persist the snapshot are preserved — fail open so we never kill
+// a daemon we cannot prove is stale.
+export function isDaemonStaleForCurrentNodePtyHelper(
+  runtimeDir: string,
+  socketPath: string,
+  tokenPath: string,
+  protocolVersion = PROTOCOL_VERSION
+): boolean {
+  if (process.platform === 'win32') {
+    return false
+  }
+
+  const parsedPid = readVerifiedDaemonPid(runtimeDir, socketPath, tokenPath, protocolVersion)
+  if (!parsedPid) {
+    return false
+  }
+
+  if (parsedPid.nodePtyHelperPath === null) {
+    return false
+  }
+
+  return !existsSync(parsedPid.nodePtyHelperPath)
 }
 
 export async function killStaleDaemon(

@@ -33,8 +33,10 @@ import {
   getProcessStartedAtMs,
   healthCheckDaemon,
   isDaemonStaleForCurrentBundle,
+  isDaemonStaleForCurrentNodePtyHelper,
   killStaleDaemon
 } from './daemon-health'
+import { getLoadedNodePtyHelperSnapshot } from './daemon-node-pty-snapshot'
 import {
   setLocalPtyProvider,
   unbindLocalProviderListeners,
@@ -188,19 +190,28 @@ function createOutOfProcessLauncher(runtimeDir: string): DaemonLauncher {
         const stalePackagedBundle =
           app.isPackaged &&
           isDaemonStaleForCurrentBundle(runtimeDir, socketPath, tokenPath, app.getVersion())
-        if (identity === 'mismatch' || stalePackagedBundle) {
+        const staleNodePtyHelper = isDaemonStaleForCurrentNodePtyHelper(
+          runtimeDir,
+          socketPath,
+          tokenPath
+        )
+        if (identity === 'mismatch' || stalePackagedBundle || staleNodePtyHelper) {
           // Why: replacing a healthy daemon kills its child PTYs; defer code
           // freshness until no live terminal sessions would be lost.
-          const replacementLabel = stalePackagedBundle
-            ? 'launched before the current app bundle was installed'
-            : 'launched from a different app path'
+          const replacementLabel = staleNodePtyHelper
+            ? 'launched against a node-pty spawn-helper path that no longer exists'
+            : stalePackagedBundle
+              ? 'launched before the current app bundle was installed'
+              : 'launched from a different app path'
           if (await shouldPreserveDaemonWithLiveSessions(socketPath, tokenPath, replacementLabel)) {
             return createPreservedDaemonHandle(runtimeDir)
           }
           console.warn(
-            stalePackagedBundle
-              ? '[daemon] Replacing daemon launched before the current app bundle was installed'
-              : '[daemon] Replacing daemon launched from a different app path'
+            staleNodePtyHelper
+              ? '[daemon] Replacing daemon launched against a stale node-pty spawn-helper path'
+              : stalePackagedBundle
+                ? '[daemon] Replacing daemon launched before the current app bundle was installed'
+                : '[daemon] Replacing daemon launched from a different app path'
           )
           await cleanupDaemonForProtocol(runtimeDir, PROTOCOL_VERSION)
         } else {
@@ -285,7 +296,13 @@ function createOutOfProcessLauncher(runtimeDir: string): DaemonLauncher {
                 pid: child.pid,
                 startedAtMs: getProcessStartedAtMs(child.pid),
                 entryPath,
-                appVersion: app.getVersion()
+                appVersion: app.getVersion(),
+                // Why: capture the node-pty spawn-helper path the daemon is
+                // loaded against right now. The next health probe compares
+                // this against the on-disk candidate set to detect when a
+                // `pnpm install` or worktree delete silently invalidated the
+                // helper the long-lived daemon still has mapped (#4365).
+                nodePtyHelperPath: getLoadedNodePtyHelperSnapshot()
               }),
               { mode: 0o600 }
             )
