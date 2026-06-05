@@ -4300,7 +4300,6 @@ export default function SessionScreen() {
                   placeholder="Type a command…"
                   placeholderTextColor={colors.textMuted}
                   autoCapitalize="none"
-                  autoCorrect={false}
                   returnKeyType="send"
                   editable={canSend}
                   onSubmitEditing={() => void handleSend()}
