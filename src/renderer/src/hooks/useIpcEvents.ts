@@ -65,6 +65,7 @@ import {
   setDriverForBrowserPage
 } from '@/lib/pane-manager/browser-mobile-driver-state'
 import { destroyPersistentWebview } from '@/components/browser-pane/webview-registry'
+import { dispatchBrowserPageZoomEvent } from '@/components/browser-pane/browser-page-zoom'
 import {
   acquireBrowserAutomationVisibility,
   releaseBrowserAutomationVisibility
@@ -213,6 +214,23 @@ function getAuthoritativeDetectedWorktreeIds(state: AppState, repoId: string): S
 
 function getVisibleWorktreeIdsForRepo(state: AppState, repoId: string): Set<string> {
   return new Set((state.worktreesByRepo[repoId] ?? []).map((worktree) => worktree.id))
+}
+
+function resolveActiveBrowserPageId(state: AppState): string | null {
+  const worktreeId = state.activeWorktreeId
+  if (!worktreeId) {
+    return null
+  }
+  const activeWorkspaceId =
+    state.activeBrowserTabIdByWorktree[worktreeId] ?? state.activeBrowserTabId ?? null
+  const browserWorkspaces = state.browserTabsByWorktree[worktreeId] ?? []
+  const workspace =
+    browserWorkspaces.find((candidate) => candidate.id === activeWorkspaceId) ?? null
+  if (!workspace) {
+    return null
+  }
+  const pages = state.browserPagesByWorkspace[workspace.id] ?? []
+  return workspace.activePageId ?? workspace.pageIds?.[0] ?? pages[0]?.id ?? null
 }
 
 type TerminalSplitDirection = 'horizontal' | 'vertical'
@@ -1348,41 +1366,48 @@ export function useIpcEvents(): void {
     )
 
     unsubs.push(
-      window.api.ui.onOpenFileFromMobile(({ worktreeId, filePath, relativePath }) => {
-        const store = useAppStore.getState()
-        const basename = relativePath.split(/[\\/]/).pop() || relativePath
-        store.setActiveWorktree(worktreeId)
-        store.markWorktreeVisited(worktreeId)
-        store.setActiveView('terminal')
-        // Why: mobile only sends a desktop-backed path. The renderer owns
-        // editor tab creation so grouped tab order and markdown bridges update
-        // through the same store path as desktop File Explorer.
-        store.openFile({
-          filePath,
-          relativePath,
-          worktreeId,
-          language: detectLanguage(basename),
-          mode: 'edit'
-        })
-        store.setActiveTabType('editor')
-        store.revealWorktreeInSidebar(worktreeId)
-      })
+      window.api.ui.onOpenFileFromMobile(
+        ({ worktreeId, filePath, relativePath, runtimeEnvironmentId }) => {
+          const store = useAppStore.getState()
+          const basename = relativePath.split(/[\\/]/).pop() || relativePath
+          store.setActiveWorktree(worktreeId)
+          store.markWorktreeVisited(worktreeId)
+          store.setActiveView('terminal')
+          // Why: mobile only sends a desktop-backed path. The renderer owns
+          // editor tab creation so grouped tab order and markdown bridges update
+          // through the same store path as desktop File Explorer.
+          store.openFile({
+            filePath,
+            relativePath,
+            worktreeId,
+            language: detectLanguage(basename),
+            runtimeEnvironmentId,
+            mode: 'edit'
+          })
+          store.setActiveTabType('editor')
+          store.revealWorktreeInSidebar(worktreeId)
+        }
+      )
     )
 
     unsubs.push(
-      window.api.ui.onOpenDiffFromMobile(({ worktreeId, filePath, relativePath, staged }) => {
-        const store = useAppStore.getState()
-        const language = detectLanguage(relativePath)
-        store.setActiveWorktree(worktreeId)
-        store.markWorktreeVisited(worktreeId)
-        store.setActiveView('terminal')
-        // Why: mobile renders diff tabs from diff metadata. The desktop
-        // markdown Changes-mode shortcut is editor-local and would publish
-        // plain markdown content back to mobile.
-        store.openDiff(worktreeId, filePath, relativePath, language, staged)
-        store.setActiveTabType('editor')
-        store.revealWorktreeInSidebar(worktreeId)
-      })
+      window.api.ui.onOpenDiffFromMobile(
+        ({ worktreeId, filePath, relativePath, staged, runtimeEnvironmentId }) => {
+          const store = useAppStore.getState()
+          const language = detectLanguage(relativePath)
+          store.setActiveWorktree(worktreeId)
+          store.markWorktreeVisited(worktreeId)
+          store.setActiveView('terminal')
+          // Why: mobile renders diff tabs from diff metadata. The desktop
+          // markdown Changes-mode shortcut is editor-local and would publish
+          // plain markdown content back to mobile.
+          store.openDiff(worktreeId, filePath, relativePath, language, staged, {
+            runtimeEnvironmentId
+          })
+          store.setActiveTabType('editor')
+          store.revealWorktreeInSidebar(worktreeId)
+        }
+      )
     )
 
     unsubs.push(
@@ -2144,14 +2169,24 @@ export function useIpcEvents(): void {
     // Zoom handling for menu accelerators and keyboard fallback paths.
     unsubs.push(
       window.api.ui.onTerminalZoom((direction) => {
+        const store = useAppStore.getState()
         const { activeView, activeTabType, editorFontZoomLevel, setEditorFontZoomLevel, settings } =
-          useAppStore.getState()
+          store
+        const activeBrowserPageId = resolveActiveBrowserPageId(store)
         const target = resolveZoomTarget({
           activeView,
           activeTabType,
+          activeBrowserPageId,
           activeElement: document.activeElement
         })
         if (target === 'terminal') {
+          return
+        }
+        if (target === 'browser') {
+          if (!activeBrowserPageId) {
+            return
+          }
+          dispatchBrowserPageZoomEvent({ browserPageId: activeBrowserPageId, direction })
           return
         }
         if (target === 'editor') {

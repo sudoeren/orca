@@ -678,6 +678,12 @@ export type AppApi = {
 
 export type PreloadApi = {
   app: AppApi
+  platform: {
+    get: () => {
+      platform: NodeJS.Platform
+      osRelease: string
+    }
+  }
   e2e: {
     getConfig: () => E2EConfig
   }
@@ -2072,6 +2078,7 @@ export type PreloadApi = {
     onFocusBrowserAddressBar: (callback: () => void) => () => void
     onFindInBrowserPage: (callback: () => void) => () => void
     onReloadBrowserPage: (callback: () => void) => () => void
+    onZoomBrowserPage: (callback: (direction: 'in' | 'out' | 'reset') => void) => () => void
     onHardReloadBrowserPage: (callback: () => void) => () => void
     onCloseActiveTab: (callback: () => void) => () => void
     onSwitchTab: (callback: (direction: 1 | -1) => void) => () => void
@@ -2156,7 +2163,12 @@ export type PreloadApi = {
       callback: (data: { worktreeId: string } & RuntimeMobileSessionTabMove) => void
     ) => () => void
     onOpenFileFromMobile: (
-      callback: (data: { worktreeId: string; filePath: string; relativePath: string }) => void
+      callback: (data: {
+        worktreeId: string
+        filePath: string
+        relativePath: string
+        runtimeEnvironmentId: string
+      }) => void
     ) => () => void
     onOpenDiffFromMobile: (
       callback: (data: {
@@ -2164,6 +2176,7 @@ export type PreloadApi = {
         filePath: string
         relativePath: string
         staged: boolean
+        runtimeEnvironmentId: string
       }) => void
     ) => () => void
     onMobileMarkdownRequest: (

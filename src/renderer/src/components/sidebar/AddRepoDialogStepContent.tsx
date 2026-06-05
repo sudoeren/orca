@@ -11,6 +11,7 @@ import type { SshConnectionState, SshTarget } from '../../../../shared/ssh-types
 type AddRepoDialogStepContentProps = {
   step: AddRepoDialogStep
   isRuntimeEnvironmentActive: boolean
+  isSshLikely: boolean
   repoCount: number
   isAdding: boolean
   addProjectBusyLabel: string | null
@@ -56,7 +57,6 @@ type AddRepoDialogStepContentProps = {
   onClone: () => void
   onNestedGroupNameChange: (name: string) => void
   onNestedSelectedPathsChange: Dispatch<SetStateAction<Set<string>>>
-  onNestedBack: () => void
   onImportNestedRepos: (mode: 'group' | 'separate') => void
   onCreateNameChange: (name: string) => void
   onCreateParentChange: (parent: string) => void
@@ -68,6 +68,7 @@ type AddRepoDialogStepContentProps = {
 export function AddRepoDialogStepContent({
   step,
   isRuntimeEnvironmentActive,
+  isSshLikely,
   repoCount,
   isAdding,
   addProjectBusyLabel,
@@ -113,7 +114,6 @@ export function AddRepoDialogStepContent({
   onClone,
   onNestedGroupNameChange,
   onNestedSelectedPathsChange,
-  onNestedBack,
   onImportNestedRepos,
   onCreateNameChange,
   onCreateParentChange,
@@ -139,6 +139,7 @@ export function AddRepoDialogStepContent({
     return (
       <AddRepoLocalStartStep
         repoCount={repoCount}
+        isSshLikely={isSshLikely}
         isAdding={isAdding}
         addProjectBusyLabel={addProjectBusyLabel}
         nestedScanInProgress={nestedScanInProgress}
@@ -194,11 +195,11 @@ export function AddRepoDialogStepContent({
         scan={nestedScan}
         groupName={nestedGroupName}
         selectedPaths={nestedSelectedPaths}
+        isFirstRepoImport={repoCount === 0}
         isAdding={isAdding}
         scanInProgress={nestedScanInProgress}
         onGroupNameChange={onNestedGroupNameChange}
         onSelectedPathsChange={onNestedSelectedPathsChange}
-        onBack={onNestedBack}
         onImport={onImportNestedRepos}
         onStopScan={onStopNestedScan}
       />
