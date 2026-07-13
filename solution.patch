@@ -1,0 +1,340 @@
+diff --git a/src/main/skills/discovery.ts b/src/main/skills/discovery.ts
+index d84f82af4..0f5bbfcf1 100644
+--- a/src/main/skills/discovery.ts
++++ b/src/main/skills/discovery.ts
+@@ -223,7 +223,8 @@ async function scanRoot(root: SkillScanRoot): Promise<DiscoveredSkill[]> {
+         skillFilePath,
+         installed: true,
+         fileCount: await countFiles(directoryPath),
+-        updatedAt: summary.updatedAt
++        updatedAt: summary.updatedAt,
++        priority: root.priority
+       } satisfies DiscoveredSkill
+     })
+   )
+@@ -249,9 +250,12 @@ export async function discoverSkills(args: {
+   )
+   const seen = new Map<string, DiscoveredSkill>()
+   for (const skill of skillGroups.flat()) {
+-    // Why: WSL discovery sets cwd to the WSL home, so home skills can also be
+-    // reached through the synthetic repo root. Keep the global home identity.
+-    if (!seen.has(skill.skillFilePath)) {
++    const existing = seen.get(skill.skillFilePath)
++    if (!existing) {
++      seen.set(skill.skillFilePath, skill)
++    } else if (
++      (skill.priority ?? 5) < (existing.priority ?? 5)
++    ) {
+       seen.set(skill.skillFilePath, skill)
+     }
+   }
+diff --git a/src/main/skills/skill-discovery-sources.ts b/src/main/skills/skill-discovery-sources.ts
+index c1bb1072b..b67eaac55 100644
+--- a/src/main/skills/skill-discovery-sources.ts
++++ b/src/main/skills/skill-discovery-sources.ts
+@@ -1,10 +1,45 @@
+ import { createHash } from 'node:crypto'
+ import { homedir } from 'node:os'
+ import { basename, join } from 'node:path'
+-import type { SkillDiscoverySource, SkillProvider, SkillSourceKind } from '../../shared/skills'
++import type { Priority, SkillDiscoverySource, SkillProvider, SkillSourceKind } from '../../shared/skills'
+ import type { Repo } from '../../shared/types'
+ 
+-export type SkillScanRoot = Omit<SkillDiscoverySource, 'exists' | 'skippedReason'>
++export type SkillScanRoot = Omit<SkillDiscoverySource, 'exists' | 'skippedReason'> & {
++  priority: Priority
++}
++
++export const ALL_PROVIDERS: readonly SkillProvider[] = [
++  'codex',
++  'claude',
++  'agent-skills',
++  'pi',
++  'opencode',
++  'cursor',
++  'windsurf',
++  'warp',
++  'github-copilot'
++] as const
++
++let lastProviderHash: string | null = null
++const rootCache = new Map<string, SkillScanRoot[]>()
++
++export function isCacheStale(): boolean {
++  const currentHash = createHash('sha1')
++    .update(ALL_PROVIDERS.join(','))
++    .digest('hex')
++  if (lastProviderHash !== null && lastProviderHash !== currentHash) {
++    lastProviderHash = currentHash
++    rootCache.clear()
++    return true
++  }
++  lastProviderHash = currentHash
++  return false
++}
++
++export function resetCache(): void {
++  lastProviderHash = null
++  rootCache.clear()
++}
+ 
+ export function stablePathId(pathValue: string): string {
+   return createHash('sha1').update(pathValue).digest('hex').slice(0, 16)
+@@ -17,7 +52,15 @@ function source(
+   sourceKind: SkillSourceKind,
+   providers: SkillProvider[]
+ ): SkillScanRoot {
+-  return { id, label, path, sourceKind, providers }
++  const isGeneric = providers.length === 1 && providers[0] === 'agent-skills'
++  return {
++    id,
++    label,
++    path,
++    sourceKind,
++    providers,
++    priority: isGeneric ? 3 : 1
++  }
+ }
+ 
+ export function buildSkillDiscoverySources(
+@@ -29,6 +72,13 @@ export function buildSkillDiscoverySources(
+ ): SkillScanRoot[] {
+   const home = args.homeDir ?? homedir()
+   const cwd = args.cwd ?? process.cwd()
++
++  const cacheKey = `${home}|${cwd}`
++  const cached = rootCache.get(cacheKey)
++  if (cached !== undefined && !isCacheStale()) {
++    return cached
++  }
++
+   const roots: SkillScanRoot[] = [
+     source('home-codex', 'Codex home', join(home, '.codex', 'skills'), 'home', ['codex']),
+     source('home-agents', 'Agent skills home', join(home, '.agents', 'skills'), 'home', [
+@@ -41,6 +91,36 @@ export function buildSkillDiscoverySources(
+       join(home, '.codex', 'plugins', 'cache'),
+       'plugin',
+       ['codex', 'agent-skills']
++    ),
++    source('home-pi', 'Pi home', join(home, '.pi', 'agent', 'skills'), 'home', ['pi']),
++    source(
++      'home-opencode',
++      'OpenCode home',
++      join(home, '.opencode', 'skills'),
++      'home',
++      ['opencode']
++    ),
++    source(
++      'home-cursor',
++      'Cursor home',
++      join(home, '.cursor', 'skills'),
++      'home',
++      ['cursor']
++    ),
++    source(
++      'home-windsurf',
++      'Windsurf home',
++      join(home, '.windsurf', 'skills'),
++      'home',
++      ['windsurf']
++    ),
++    source('home-warp', 'Warp home', join(home, '.warp', 'skills'), 'home', ['warp']),
++    source(
++      'home-github-copilot',
++      'GitHub Copilot home',
++      join(home, '.github-copilot', 'skills'),
++      'home',
++      ['github-copilot']
+     )
+   ]
+ 
+@@ -73,5 +153,7 @@ export function buildSkillDiscoverySources(
+     )
+   }
+ 
++  rootCache.set(cacheKey, roots)
++  isCacheStale()
+   return roots
+ }
+diff --git a/src/renderer/src/lib/orchestration-skill-coverage.ts b/src/renderer/src/lib/orchestration-skill-coverage.ts
+index 4cabdb095..cce7feadd 100644
+--- a/src/renderer/src/lib/orchestration-skill-coverage.ts
++++ b/src/renderer/src/lib/orchestration-skill-coverage.ts
+@@ -9,11 +9,19 @@ export type OrchestrationSkillLocationId =
+   | 'codex-home'
+   | 'codex-plugin-cache'
+   | 'agents-home'
++  | 'pi-home'
++  | 'opencode-home'
++  | 'cursor-home'
++  | 'windsurf-home'
++  | 'warp-home'
++  | 'github-copilot-home'
+ 
+ export type OrchestrationSkillAgentStatus = {
+   agent: TuiAgent
+   label: string
+   installed: boolean
++  supportedSkillCount?: number
++  totalSupportedSkills?: number
+ }
+ 
+ type OrchestrationSkillLocationDefinition = {
+@@ -21,6 +29,35 @@ type OrchestrationSkillLocationDefinition = {
+   matchesSkill: (skill: DiscoveredSkill) => boolean
+ }
+ 
++const AGENT_CAPABILITY_MATRIX: Partial<Record<TuiAgent, readonly string[]>> = {
++  pi: ['orca-cli', 'orchestration'],
++  opencode: ['orca-cli', 'orchestration', 'deployment'],
++  cursor: ['orca-cli'],
++  windsurf: ['orca-cli', 'orchestration'],
++  warp: ['orca-cli'],
++  'github-copilot': ['orca-cli', 'orchestration', 'deployment', 'review']
++}
++
++export function getSupportedSkillsForAgent(agent: TuiAgent): readonly string[] {
++  return AGENT_CAPABILITY_MATRIX[agent] ?? []
++}
++
++export function getCapabilityCoverage(
++  agent: TuiAgent,
++  installedSkills: readonly string[]
++): { supportedSkillCount: number; totalSupportedSkills: number } {
++  const supported = getSupportedSkillsForAgent(agent)
++  const installed = supported.filter((skill) =>
++    installedSkills.some(
++      (installedSkill) => installedSkill.toLowerCase() === skill.toLowerCase()
++    )
++  )
++  return {
++    supportedSkillCount: installed.length,
++    totalSupportedSkills: supported.length
++  }
++}
++
+ const ORCHESTRATION_SKILL_LOCATIONS: readonly OrchestrationSkillLocationDefinition[] = [
+   {
+     id: 'claude-home',
+@@ -45,6 +82,42 @@ const ORCHESTRATION_SKILL_LOCATIONS: readonly OrchestrationSkillLocationDefiniti
+     matchesSkill: (skill) =>
+       isGlobalOrchestrationSkill(skill) &&
+       pathContainsSegments(skill.rootPath, ['.agents', 'skills'])
++  },
++  {
++    id: 'pi-home',
++    matchesSkill: (skill) =>
++      isGlobalOrchestrationSkill(skill) &&
++      pathContainsSegments(skill.rootPath, ['.pi', 'agent', 'skills'])
++  },
++  {
++    id: 'opencode-home',
++    matchesSkill: (skill) =>
++      isGlobalOrchestrationSkill(skill) &&
++      pathContainsSegments(skill.rootPath, ['.opencode', 'skills'])
++  },
++  {
++    id: 'cursor-home',
++    matchesSkill: (skill) =>
++      isGlobalOrchestrationSkill(skill) &&
++      pathContainsSegments(skill.rootPath, ['.cursor', 'skills'])
++  },
++  {
++    id: 'windsurf-home',
++    matchesSkill: (skill) =>
++      isGlobalOrchestrationSkill(skill) &&
++      pathContainsSegments(skill.rootPath, ['.windsurf', 'skills'])
++  },
++  {
++    id: 'warp-home',
++    matchesSkill: (skill) =>
++      isGlobalOrchestrationSkill(skill) &&
++      pathContainsSegments(skill.rootPath, ['.warp', 'skills'])
++  },
++  {
++    id: 'github-copilot-home',
++    matchesSkill: (skill) =>
++      isGlobalOrchestrationSkill(skill) &&
++      pathContainsSegments(skill.rootPath, ['.github-copilot', 'skills'])
+   }
+ ]
+ 
+@@ -53,7 +126,13 @@ const ORCHESTRATION_SKILL_LOCATION_IDS_BY_AGENT: Partial<
+ > = {
+   claude: ['claude-home', 'agents-home'],
+   openclaude: ['claude-home', 'agents-home'],
+-  codex: ['codex-home', 'codex-plugin-cache', 'agents-home']
++  codex: ['codex-home', 'codex-plugin-cache', 'agents-home'],
++  pi: ['pi-home', 'agents-home'],
++  opencode: ['opencode-home', 'agents-home'],
++  cursor: ['cursor-home', 'agents-home'],
++  windsurf: ['windsurf-home', 'agents-home'],
++  warp: ['warp-home', 'agents-home'],
++  'github-copilot': ['github-copilot-home', 'agents-home']
+ }
+ 
+ function normalizeSkillName(value: string): string {
+@@ -138,9 +217,20 @@ export function getOrchestrationSkillAgentStatuses(
+   skills: readonly DiscoveredSkill[],
+   detectedAgents: readonly TuiAgent[]
+ ): OrchestrationSkillAgentStatus[] {
+-  return sortOrchestrationAgents(detectedAgents).map((agent) => ({
+-    agent,
+-    label: getAgentLabel(agent),
+-    installed: agentHasOrchestrationSkill(agent, skills)
+-  }))
++  const installedSkillNames = skills
++    .filter((s) => s.installed)
++    .map((s) => s.name)
++
++  return sortOrchestrationAgents(detectedAgents).map((agent) => {
++    const installed = agentHasOrchestrationSkill(agent, skills)
++    const capability = getCapabilityCoverage(agent, installedSkillNames)
++    return {
++      agent,
++      label: getAgentLabel(agent),
++      installed,
++      ...(capability.totalSupportedSkills > 0
++        ? { supportedSkillCount: capability.supportedSkillCount, totalSupportedSkills: capability.totalSupportedSkills }
++        : {})
++    }
++  })
+ }
+diff --git a/src/shared/skills.ts b/src/shared/skills.ts
+index 0b386624c..e810e0f29 100644
+--- a/src/shared/skills.ts
++++ b/src/shared/skills.ts
+@@ -1,6 +1,15 @@
+ import type { ProjectExecutionRuntimeResolution } from './project-execution-runtime'
+ 
+-export type SkillProvider = 'codex' | 'claude' | 'agent-skills'
++export type SkillProvider =
++  | 'codex'
++  | 'claude'
++  | 'agent-skills'
++  | 'pi'
++  | 'opencode'
++  | 'cursor'
++  | 'windsurf'
++  | 'warp'
++  | 'github-copilot'
+ 
+ export type SkillSourceKind = 'home' | 'repo' | 'bundled' | 'plugin'
+ 
+@@ -17,6 +26,7 @@ export type DiscoveredSkill = {
+   installed: boolean
+   fileCount: number
+   updatedAt: number | null
++  priority?: Priority
+ }
+ 
+ export type SkillDiscoverySource = {
+@@ -29,6 +39,8 @@ export type SkillDiscoverySource = {
+   skippedReason?: 'missing' | 'remote-repo'
+ }
+ 
++export type Priority = 1 | 2 | 3 | 4 | 5
++
+ export type SkillDiscoveryResult = {
+   skills: DiscoveredSkill[]
+   sources: SkillDiscoverySource[]

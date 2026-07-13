@@ -1,0 +1,383 @@
+diff --git a/src/__tests__/skill-discovery-pi-opencode.test.ts b/src/__tests__/skill-discovery-pi-opencode.test.ts
+new file mode 100644
+index 000000000..4b47e561a
+--- /dev/null
++++ b/src/__tests__/skill-discovery-pi-opencode.test.ts
+@@ -0,0 +1,293 @@
++import { describe, expect, it, beforeEach } from 'vitest'
++import { join } from 'node:path'
++import {
++  buildSkillDiscoverySources,
++  resetCache
++} from '../main/skills/skill-discovery-sources'
++import {
++  agentHasOrchestrationSkill,
++  getOrchestrationSkillAgentStatuses,
++  getSupportedSkillsForAgent
++} from '../renderer/src/lib/orchestration-skill-coverage'
++import type { DiscoveredSkill } from '../shared/skills'
++
++const HOME = '/Users/test'
++
++beforeEach(() => {
++  resetCache()
++})
++
++function skill(overrides: Partial<DiscoveredSkill>): DiscoveredSkill {
++  return {
++    id: 'skill-1',
++    name: 'orchestration',
++    description: null,
++    providers: ['pi'],
++    sourceKind: 'home',
++    sourceLabel: 'Pi home',
++    rootPath: join(HOME, '.pi', 'agent', 'skills'),
++    directoryPath: join(HOME, '.pi', 'agent', 'skills', 'orchestration'),
++    skillFilePath: join(HOME, '.pi', 'agent', 'skills', 'orchestration', 'SKILL.md'),
++    installed: true,
++    fileCount: 1,
++    updatedAt: null,
++    ...overrides
++  }
++}
++
++function pathInDiscovery(pathValue: string): boolean {
++  const roots = buildSkillDiscoverySources({ homeDir: HOME })
++  return roots.some((r) => r.path === pathValue)
++}
++
++function rootForPath(pathValue: string) {
++  const roots = buildSkillDiscoverySources({ homeDir: HOME })
++  return roots.find((r) => r.path === pathValue)
++}
++
++describe('agent skill scan roots', () => {
++  it('scans ~/.pi/agent/skills for Pi skills', () => {
++    expect(pathInDiscovery(join(HOME, '.pi', 'agent', 'skills'))).toBe(true)
++  })
++
++  it('scans ~/.opencode/skills for OpenCode skills', () => {
++    expect(pathInDiscovery(join(HOME, '.opencode', 'skills'))).toBe(true)
++  })
++
++  it('scans ~/.cursor/skills for Cursor skills', () => {
++    expect(pathInDiscovery(join(HOME, '.cursor', 'skills'))).toBe(true)
++  })
++
++  it('scans ~/.windsurf/skills for Windsurf skills', () => {
++    expect(pathInDiscovery(join(HOME, '.windsurf', 'skills'))).toBe(true)
++  })
++
++  it('scans ~/.warp/skills for Warp skills', () => {
++    expect(pathInDiscovery(join(HOME, '.warp', 'skills'))).toBe(true)
++  })
++
++  it('scans ~/.github-copilot/skills for GitHub Copilot skills', () => {
++    expect(pathInDiscovery(join(HOME, '.github-copilot', 'skills'))).toBe(true)
++  })
++})
++
++describe('agent-specific coverage', () => {
++  it('maps Pi skills from ~/.pi/agent/skills to Pi agent', () => {
++    expect(
++      agentHasOrchestrationSkill('pi', [
++        skill({
++          rootPath: join(HOME, '.pi', 'agent', 'skills'),
++          directoryPath: join(HOME, '.pi', 'agent', 'skills', 'orchestration')
++        })
++      ])
++    ).toBe(true)
++  })
++
++  it('maps OpenCode skills from ~/.opencode/skills to OpenCode agent', () => {
++    expect(
++      agentHasOrchestrationSkill('opencode', [
++        skill({
++          providers: ['opencode'],
++          rootPath: join(HOME, '.opencode', 'skills'),
++          directoryPath: join(HOME, '.opencode', 'skills', 'orchestration')
++        })
++      ])
++    ).toBe(true)
++  })
++
++  it('maps Cursor skills from ~/.cursor/skills to Cursor agent', () => {
++    expect(
++      agentHasOrchestrationSkill('cursor', [
++        skill({
++          id: 'skill-cursor',
++          providers: ['cursor'],
++          rootPath: join(HOME, '.cursor', 'skills'),
++          directoryPath: join(HOME, '.cursor', 'skills', 'orchestration')
++        })
++      ])
++    ).toBe(true)
++  })
++
++  it('maps Windsurf skills from ~/.windsurf/skills to Windsurf agent', () => {
++    expect(
++      agentHasOrchestrationSkill('windsurf', [
++        skill({
++          id: 'skill-windsurf',
++          providers: ['windsurf'],
++          rootPath: join(HOME, '.windsurf', 'skills'),
++          directoryPath: join(HOME, '.windsurf', 'skills', 'orchestration')
++        })
++      ])
++    ).toBe(true)
++  })
++
++  it('maps Warp skills from ~/.warp/skills to Warp agent', () => {
++    expect(
++      agentHasOrchestrationSkill('warp', [
++        skill({
++          id: 'skill-warp',
++          providers: ['warp'],
++          rootPath: join(HOME, '.warp', 'skills'),
++          directoryPath: join(HOME, '.warp', 'skills', 'orchestration')
++        })
++      ])
++    ).toBe(true)
++  })
++
++  it('maps GitHub Copilot skills from ~/.github-copilot/skills to GitHub Copilot agent', () => {
++    expect(
++      agentHasOrchestrationSkill('github-copilot', [
++        skill({
++          id: 'skill-ghcp',
++          providers: ['github-copilot'],
++          rootPath: join(HOME, '.github-copilot', 'skills'),
++          directoryPath: join(HOME, '.github-copilot', 'skills', 'orchestration')
++        })
++      ])
++    ).toBe(true)
++  })
++
++  it('maps skills from ~/.agents/skills to all agents as fallback', () => {
++    const skills = [
++      skill({
++        providers: ['agent-skills'],
++        rootPath: join(HOME, '.agents', 'skills'),
++        directoryPath: join(HOME, '.agents', 'skills', 'orchestration')
++      })
++    ]
++    expect(agentHasOrchestrationSkill('pi', skills)).toBe(true)
++    expect(agentHasOrchestrationSkill('opencode', skills)).toBe(true)
++    expect(agentHasOrchestrationSkill('cursor', skills)).toBe(true)
++    expect(agentHasOrchestrationSkill('windsurf', skills)).toBe(true)
++    expect(agentHasOrchestrationSkill('warp', skills)).toBe(true)
++    expect(agentHasOrchestrationSkill('github-copilot', skills)).toBe(true)
++  })
++})
++
++describe('orchestration skill statuses', () => {
++  it('reports agent statuses based on dedicated path skills', () => {
++    const skills = [
++      skill({
++        rootPath: join(HOME, '.pi', 'agent', 'skills'),
++        directoryPath: join(HOME, '.pi', 'agent', 'skills', 'orchestration')
++      }),
++      skill({
++        id: 'skill-2',
++        providers: ['opencode'],
++        rootPath: join(HOME, '.opencode', 'skills'),
++        directoryPath: join(HOME, '.opencode', 'skills', 'orchestration')
++      }),
++      skill({
++        id: 'skill-3',
++        providers: ['cursor'],
++        rootPath: join(HOME, '.cursor', 'skills'),
++        directoryPath: join(HOME, '.cursor', 'skills', 'orchestration')
++      })
++    ]
++    const statuses = getOrchestrationSkillAgentStatuses(skills, ['pi', 'opencode', 'cursor', 'codex'])
++    expect(statuses.find((s) => s.agent === 'pi')?.installed).toBe(true)
++    expect(statuses.find((s) => s.agent === 'opencode')?.installed).toBe(true)
++    expect(statuses.find((s) => s.agent === 'cursor')?.installed).toBe(true)
++    expect(statuses.find((s) => s.agent === 'codex')?.installed).toBe(false)
++  })
++})
++
++describe('skill-to-agent routing', () => {
++  it('routes skill in ~/.pi/agent/skills to Pi but not to unrelated agents', () => {
++    const skills = [
++      skill({
++        rootPath: join(HOME, '.pi', 'agent', 'skills'),
++        directoryPath: join(HOME, '.pi', 'agent', 'skills', 'orchestration')
++      })
++    ]
++    expect(agentHasOrchestrationSkill('pi', skills)).toBe(true)
++    expect(agentHasOrchestrationSkill('cursor', skills)).toBe(false)
++  })
++})
++
++describe('path priority', () => {
++  it('assigns higher priority to agent-specific paths over generic agents path', () => {
++    const piRoot = rootForPath(join(HOME, '.pi', 'agent', 'skills'))
++    const agentsRoot = rootForPath(join(HOME, '.agents', 'skills'))
++    expect(piRoot).toBeDefined()
++    expect(agentsRoot).toBeDefined()
++    expect(piRoot!.priority).toBeLessThan(agentsRoot!.priority)
++  })
++})
++
++describe('cache invalidation', () => {
++  it('rebuilds scan roots after cache reset when discovery is called again', () => {
++    resetCache()
++    const firstCall = buildSkillDiscoverySources({ homeDir: HOME })
++    expect(firstCall.length).toBeGreaterThan(0)
++
++    const firstPaths = firstCall.map((r) => r.path)
++    resetCache()
++
++    const secondCall = buildSkillDiscoverySources({ homeDir: HOME })
++    expect(secondCall.length).toBe(firstCall.length)
++    const secondPaths = secondCall.map((r) => r.path)
++
++    for (const path of firstPaths) {
++      expect(secondPaths).toContain(path)
++    }
++  })
++})
++
++describe('capability matrix', () => {
++  it('reports supported skills for each agent', () => {
++    expect(getSupportedSkillsForAgent('pi')).toEqual(['orca-cli', 'orchestration'])
++    expect(getSupportedSkillsForAgent('opencode')).toEqual(['orca-cli', 'orchestration', 'deployment'])
++    expect(getSupportedSkillsForAgent('cursor')).toEqual(['orca-cli'])
++    expect(getSupportedSkillsForAgent('windsurf')).toEqual(['orca-cli', 'orchestration'])
++    expect(getSupportedSkillsForAgent('warp')).toEqual(['orca-cli'])
++    expect(getSupportedSkillsForAgent('github-copilot')).toEqual([
++      'orca-cli', 'orchestration', 'deployment', 'review'
++    ])
++  })
++
++  it('reports partial coverage in agent statuses', () => {
++    const skills: DiscoveredSkill[] = [
++      skill({
++        name: 'orca-cli',
++        rootPath: join(HOME, '.pi', 'agent', 'skills'),
++        directoryPath: join(HOME, '.pi', 'agent', 'skills', 'orca-cli')
++      }),
++      skill({
++        id: 'skill-2',
++        name: 'orchestration',
++        rootPath: join(HOME, '.pi', 'agent', 'skills'),
++        directoryPath: join(HOME, '.pi', 'agent', 'skills', 'orchestration')
++      }),
++      skill({
++        id: 'skill-3',
++        name: 'orca-cli',
++        providers: ['opencode'],
++        rootPath: join(HOME, '.opencode', 'skills'),
++        directoryPath: join(HOME, '.opencode', 'skills', 'orca-cli')
++      }),
++      skill({
++        id: 'skill-4',
++        name: 'orchestration',
++        providers: ['opencode'],
++        rootPath: join(HOME, '.opencode', 'skills'),
++        directoryPath: join(HOME, '.opencode', 'skills', 'orchestration')
++      })
++    ]
++    const statuses = getOrchestrationSkillAgentStatuses(skills, ['pi', 'opencode', 'cursor'])
++    const piStatus = statuses.find((s) => s.agent === 'pi')
++    expect(piStatus?.installed).toBe(true)
++    expect(piStatus?.supportedSkillCount).toBe(2)
++    expect(piStatus?.totalSupportedSkills).toBe(2)
++
++    const opencodeStatus = statuses.find((s) => s.agent === 'opencode')
++    expect(opencodeStatus?.installed).toBe(true)
++    expect(opencodeStatus?.supportedSkillCount).toBe(2)
++    expect(opencodeStatus?.totalSupportedSkills).toBe(3)
++
++    const cursorStatus = statuses.find((s) => s.agent === 'cursor')
++    expect(cursorStatus?.installed).toBe(false)
++    expect(cursorStatus?.supportedSkillCount).toBe(1)
++    expect(cursorStatus?.totalSupportedSkills).toBe(1)
++  })
++})
+diff --git a/src/__tests__/skill-discovery-sources.test.ts b/src/__tests__/skill-discovery-sources.test.ts
+new file mode 100644
+index 000000000..3b26536de
+--- /dev/null
++++ b/src/__tests__/skill-discovery-sources.test.ts
+@@ -0,0 +1,35 @@
++import { describe, expect, it } from 'vitest'
++import { join } from 'node:path'
++import { buildSkillDiscoverySources } from '../main/skills/skill-discovery-sources'
++
++const HOME = '/Users/test'
++
++describe('skill discovery sources include expected scan roots', () => {
++  it('includes Codex home skill scan root', () => {
++    const roots = buildSkillDiscoverySources({ homeDir: HOME })
++    const root = roots.find((r) => r.id === 'home-codex')
++    expect(root).toBeDefined()
++    expect(root!.path).toBe(join(HOME, '.codex', 'skills'))
++  })
++
++  it('includes Agent skills home scan root', () => {
++    const roots = buildSkillDiscoverySources({ homeDir: HOME })
++    const root = roots.find((r) => r.id === 'home-agents')
++    expect(root).toBeDefined()
++    expect(root!.path).toBe(join(HOME, '.agents', 'skills'))
++  })
++
++  it('includes Claude home skill scan root', () => {
++    const roots = buildSkillDiscoverySources({ homeDir: HOME })
++    const root = roots.find((r) => r.id === 'home-claude')
++    expect(root).toBeDefined()
++    expect(root!.path).toBe(join(HOME, '.claude', 'skills'))
++  })
++
++  it('includes Codex plugin cache scan root', () => {
++    const roots = buildSkillDiscoverySources({ homeDir: HOME })
++    const root = roots.find((r) => r.id === 'codex-plugin-cache')
++    expect(root).toBeDefined()
++    expect(root!.path).toBe(join(HOME, '.codex', 'plugins', 'cache'))
++  })
++})
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 000000000..ba054e0d7
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,37 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
++cd "$SCRIPT_DIR"
++
++OUTPUT_PATH=""
++if [ "${1:-}" = "--output_path" ]; then
++  OUTPUT_PATH="$2"
++  shift 2
++fi
++
++MODE="${1:-new}"
++TEST_LOG="$(mktemp)"
++STATUS=0
++
++run_tests() {
++  regex="$1"
++  shift
++  npx vitest run --config config/vitest.config.ts "$regex" -- "$@" 2>&1 | tee -a "$TEST_LOG"
++  status=${PIPESTATUS[0]}
++  if [ "$status" -ne 0 ]; then STATUS=$status; fi
++}
++
++case "$MODE" in
++  base)
++    run_tests "src/renderer/src/lib/orchestration-skill-coverage"
++    ;;
++  new)
++    run_tests "src/__tests__/skill-discovery-pi-opencode"
++    ;;
++esac
++
++if [ -n "$OUTPUT_PATH" ]; then
++  cat "$TEST_LOG" > "$OUTPUT_PATH" || true
++fi
++exit "$STATUS"

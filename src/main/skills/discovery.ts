@@ -223,7 +223,8 @@ async function scanRoot(root: SkillScanRoot): Promise<DiscoveredSkill[]> {
         skillFilePath,
         installed: true,
         fileCount: await countFiles(directoryPath),
-        updatedAt: summary.updatedAt
+        updatedAt: summary.updatedAt,
+        priority: root.priority
       } satisfies DiscoveredSkill
     })
   )
@@ -249,9 +250,12 @@ export async function discoverSkills(args: {
   )
   const seen = new Map<string, DiscoveredSkill>()
   for (const skill of skillGroups.flat()) {
-    // Why: WSL discovery sets cwd to the WSL home, so home skills can also be
-    // reached through the synthetic repo root. Keep the global home identity.
-    if (!seen.has(skill.skillFilePath)) {
+    const existing = seen.get(skill.skillFilePath)
+    if (!existing) {
+      seen.set(skill.skillFilePath, skill)
+    } else if (
+      (skill.priority ?? 5) < (existing.priority ?? 5)
+    ) {
       seen.set(skill.skillFilePath, skill)
     }
   }

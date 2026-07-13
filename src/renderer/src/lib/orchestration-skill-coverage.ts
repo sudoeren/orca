@@ -9,16 +9,53 @@ export type OrchestrationSkillLocationId =
   | 'codex-home'
   | 'codex-plugin-cache'
   | 'agents-home'
+  | 'pi-home'
+  | 'opencode-home'
+  | 'cursor-home'
+  | 'windsurf-home'
+  | 'warp-home'
+  | 'github-copilot-home'
 
 export type OrchestrationSkillAgentStatus = {
   agent: TuiAgent
   label: string
   installed: boolean
+  supportedSkillCount?: number
+  totalSupportedSkills?: number
 }
 
 type OrchestrationSkillLocationDefinition = {
   id: OrchestrationSkillLocationId
   matchesSkill: (skill: DiscoveredSkill) => boolean
+}
+
+const AGENT_CAPABILITY_MATRIX: Partial<Record<TuiAgent, readonly string[]>> = {
+  pi: ['orca-cli', 'orchestration'],
+  opencode: ['orca-cli', 'orchestration', 'deployment'],
+  cursor: ['orca-cli'],
+  windsurf: ['orca-cli', 'orchestration'],
+  warp: ['orca-cli'],
+  'github-copilot': ['orca-cli', 'orchestration', 'deployment', 'review']
+}
+
+export function getSupportedSkillsForAgent(agent: TuiAgent): readonly string[] {
+  return AGENT_CAPABILITY_MATRIX[agent] ?? []
+}
+
+export function getCapabilityCoverage(
+  agent: TuiAgent,
+  installedSkills: readonly string[]
+): { supportedSkillCount: number; totalSupportedSkills: number } {
+  const supported = getSupportedSkillsForAgent(agent)
+  const installed = supported.filter((skill) =>
+    installedSkills.some(
+      (installedSkill) => installedSkill.toLowerCase() === skill.toLowerCase()
+    )
+  )
+  return {
+    supportedSkillCount: installed.length,
+    totalSupportedSkills: supported.length
+  }
 }
 
 const ORCHESTRATION_SKILL_LOCATIONS: readonly OrchestrationSkillLocationDefinition[] = [
@@ -45,6 +82,42 @@ const ORCHESTRATION_SKILL_LOCATIONS: readonly OrchestrationSkillLocationDefiniti
     matchesSkill: (skill) =>
       isGlobalOrchestrationSkill(skill) &&
       pathContainsSegments(skill.rootPath, ['.agents', 'skills'])
+  },
+  {
+    id: 'pi-home',
+    matchesSkill: (skill) =>
+      isGlobalOrchestrationSkill(skill) &&
+      pathContainsSegments(skill.rootPath, ['.pi', 'agent', 'skills'])
+  },
+  {
+    id: 'opencode-home',
+    matchesSkill: (skill) =>
+      isGlobalOrchestrationSkill(skill) &&
+      pathContainsSegments(skill.rootPath, ['.opencode', 'skills'])
+  },
+  {
+    id: 'cursor-home',
+    matchesSkill: (skill) =>
+      isGlobalOrchestrationSkill(skill) &&
+      pathContainsSegments(skill.rootPath, ['.cursor', 'skills'])
+  },
+  {
+    id: 'windsurf-home',
+    matchesSkill: (skill) =>
+      isGlobalOrchestrationSkill(skill) &&
+      pathContainsSegments(skill.rootPath, ['.windsurf', 'skills'])
+  },
+  {
+    id: 'warp-home',
+    matchesSkill: (skill) =>
+      isGlobalOrchestrationSkill(skill) &&
+      pathContainsSegments(skill.rootPath, ['.warp', 'skills'])
+  },
+  {
+    id: 'github-copilot-home',
+    matchesSkill: (skill) =>
+      isGlobalOrchestrationSkill(skill) &&
+      pathContainsSegments(skill.rootPath, ['.github-copilot', 'skills'])
   }
 ]
 
@@ -53,7 +126,13 @@ const ORCHESTRATION_SKILL_LOCATION_IDS_BY_AGENT: Partial<
 > = {
   claude: ['claude-home', 'agents-home'],
   openclaude: ['claude-home', 'agents-home'],
-  codex: ['codex-home', 'codex-plugin-cache', 'agents-home']
+  codex: ['codex-home', 'codex-plugin-cache', 'agents-home'],
+  pi: ['pi-home', 'agents-home'],
+  opencode: ['opencode-home', 'agents-home'],
+  cursor: ['cursor-home', 'agents-home'],
+  windsurf: ['windsurf-home', 'agents-home'],
+  warp: ['warp-home', 'agents-home'],
+  'github-copilot': ['github-copilot-home', 'agents-home']
 }
 
 function normalizeSkillName(value: string): string {
@@ -138,9 +217,20 @@ export function getOrchestrationSkillAgentStatuses(
   skills: readonly DiscoveredSkill[],
   detectedAgents: readonly TuiAgent[]
 ): OrchestrationSkillAgentStatus[] {
-  return sortOrchestrationAgents(detectedAgents).map((agent) => ({
-    agent,
-    label: getAgentLabel(agent),
-    installed: agentHasOrchestrationSkill(agent, skills)
-  }))
+  const installedSkillNames = skills
+    .filter((s) => s.installed)
+    .map((s) => s.name)
+
+  return sortOrchestrationAgents(detectedAgents).map((agent) => {
+    const installed = agentHasOrchestrationSkill(agent, skills)
+    const capability = getCapabilityCoverage(agent, installedSkillNames)
+    return {
+      agent,
+      label: getAgentLabel(agent),
+      installed,
+      ...(capability.totalSupportedSkills > 0
+        ? { supportedSkillCount: capability.supportedSkillCount, totalSupportedSkills: capability.totalSupportedSkills }
+        : {})
+    }
+  })
 }

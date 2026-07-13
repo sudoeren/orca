@@ -1,6 +1,15 @@
 import type { ProjectExecutionRuntimeResolution } from './project-execution-runtime'
 
-export type SkillProvider = 'codex' | 'claude' | 'agent-skills'
+export type SkillProvider =
+  | 'codex'
+  | 'claude'
+  | 'agent-skills'
+  | 'pi'
+  | 'opencode'
+  | 'cursor'
+  | 'windsurf'
+  | 'warp'
+  | 'github-copilot'
 
 export type SkillSourceKind = 'home' | 'repo' | 'bundled' | 'plugin'
 
@@ -17,6 +26,7 @@ export type DiscoveredSkill = {
   installed: boolean
   fileCount: number
   updatedAt: number | null
+  priority?: Priority
 }
 
 export type SkillDiscoverySource = {
@@ -28,6 +38,8 @@ export type SkillDiscoverySource = {
   exists: boolean
   skippedReason?: 'missing' | 'remote-repo'
 }
+
+export type Priority = 1 | 2 | 3 | 4 | 5
 
 export type SkillDiscoveryResult = {
   skills: DiscoveredSkill[]
